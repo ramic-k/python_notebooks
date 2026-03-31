@@ -42,6 +42,19 @@ class RebinMode:
     log_tof = "log_tof(delta_tof_over_tof)"
     log_lambda = "log_lambda(delta_lambda_over_lambda)"
     inverse_log_lambda = "inverse_log_lambda(delta_lambda_squared_A2)"
+    custom_schedule = "custom_schedule(energy_segments)"
+
+
+class RebinCustomBasis:
+    tof = "tof"
+    lambda_ = "lambda"
+    lambda_squared = "lambda^2"
+
+
+class RebinCustomScale:
+    linear = "linear"
+    log = "log"
+    reverse_log = "reverse_log"
 
 
 raw_dir = {

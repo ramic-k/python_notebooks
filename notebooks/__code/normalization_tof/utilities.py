@@ -25,7 +25,7 @@ try:
 except ModuleNotFoundError:
     TimepixGeometryCorrection = None
 
-from __code.normalization_tof import RebinMode, Roi
+from __code.normalization_tof import RebinCustomBasis, RebinCustomScale, RebinMode, Roi
 from __code._utilities.json import load_json, save_json
 
 MARKERSIZE = 6
@@ -159,30 +159,53 @@ def create_rebin_output_suffix(
     rebin_delta_tof_over_tof: float = None,
     rebin_delta_lambda_over_lambda: float = None,
     rebin_delta_lambda_squared_a2: float = None,
+    rebin_custom_basis: str = None,
+    rebin_custom_scale: str = None,
+    rebin_custom_schedule: list = None,
+    rebin_full_bins_only: bool = False,
 ) -> str:
     if rebin_mode == RebinMode.none:
         return ""
 
+    output_suffix = None
     if rebin_mode == RebinMode.linear_tof:
-        return f"_rebin_lin_deltaTOF_{_format_rebin_value_for_output(rebin_delta_tof_us)}us"
+        output_suffix = f"_rebin_lin_deltaTOF_{_format_rebin_value_for_output(rebin_delta_tof_us)}us"
 
-    if rebin_mode == RebinMode.linear_lambda:
-        return f"_rebin_lin_deltalambda_{_format_rebin_value_for_output(rebin_delta_lambda_a)}A"
+    elif rebin_mode == RebinMode.linear_lambda:
+        output_suffix = f"_rebin_lin_deltalambda_{_format_rebin_value_for_output(rebin_delta_lambda_a)}A"
 
-    if rebin_mode == RebinMode.log_tof:
-        return "_rebin_log_deltatof_over_tof_" + _format_rebin_value_for_output(rebin_delta_tof_over_tof)
+    elif rebin_mode == RebinMode.log_tof:
+        output_suffix = "_rebin_log_deltatof_over_tof_" + _format_rebin_value_for_output(rebin_delta_tof_over_tof)
 
-    if rebin_mode == RebinMode.log_lambda:
-        return "_rebin_log_deltalambdaoverlambda_" + _format_rebin_value_for_output(
+    elif rebin_mode == RebinMode.log_lambda:
+        output_suffix = "_rebin_log_deltalambdaoverlambda_" + _format_rebin_value_for_output(
             rebin_delta_lambda_over_lambda
         )
 
-    if rebin_mode == RebinMode.inverse_log_lambda:
-        return "_rebin_inverse_log_deltalambda2_" + _format_rebin_value_for_output(
+    elif rebin_mode == RebinMode.inverse_log_lambda:
+        output_suffix = "_rebin_inverse_log_deltalambda2_" + _format_rebin_value_for_output(
             rebin_delta_lambda_squared_a2
         ) + "A2"
 
-    raise ValueError(f"Unsupported rebin mode: {rebin_mode}")
+    elif rebin_mode == RebinMode.custom_schedule:
+        basis_token = {
+            RebinCustomBasis.tof: "tof",
+            RebinCustomBasis.lambda_: "lambda",
+            RebinCustomBasis.lambda_squared: "lambda2",
+        }.get(rebin_custom_basis, "axis")
+        scale_token = {
+            RebinCustomScale.linear: "linear",
+            RebinCustomScale.log: "log",
+            RebinCustomScale.reverse_log: "reverse_log",
+        }.get(rebin_custom_scale, "scale")
+        segment_count = 0 if rebin_custom_schedule is None else len(rebin_custom_schedule)
+        output_suffix = f"_rebin_custom_{basis_token}_{scale_token}_{segment_count}segments"
+    else:
+        raise ValueError(f"Unsupported rebin mode: {rebin_mode}")
+
+    if rebin_full_bins_only:
+        output_suffix += "_fullbins"
+    return output_suffix
 
 
 def calculate_time_lambda_energy_arrays(
@@ -225,17 +248,21 @@ def _validate_rebin_axis(axis_values: np.ndarray, rebin_mode: str) -> np.ndarray
     return axis_values
 
 
-def _create_linear_bin_edges(axis_values: np.ndarray, bin_width: float) -> np.ndarray:
+def _create_linear_bin_edges(axis_values: np.ndarray, bin_width: float, full_bins_only: bool = False) -> np.ndarray:
     if bin_width is None or bin_width <= 0:
         raise ValueError("Linear rebinning requires a strictly positive bin width.")
     new_axis = np.arange(axis_values[0], axis_values[-1], bin_width, dtype=np.float64)
     if len(new_axis) == 0:
         new_axis = np.array([axis_values[0]], dtype=np.float64)
-    new_axis = np.append(new_axis, new_axis[-1] + bin_width)
+    next_edge = new_axis[-1] + bin_width
+    if (not full_bins_only) or (next_edge <= axis_values[-1] + 1e-12):
+        new_axis = np.append(new_axis, next_edge)
     return new_axis
 
 
-def _create_log_bin_edges(axis_values: np.ndarray, relative_step: float, rebin_mode: str) -> np.ndarray:
+def _create_log_bin_edges(
+    axis_values: np.ndarray, relative_step: float, rebin_mode: str, full_bins_only: bool = False
+) -> np.ndarray:
     if relative_step is None or relative_step <= 0:
         raise ValueError(f"{rebin_mode} requires a strictly positive logarithmic step.")
     if axis_values[0] <= 0:
@@ -245,26 +272,310 @@ def _create_log_bin_edges(axis_values: np.ndarray, relative_step: float, rebin_m
     parameter_end = float(axis_values[-1])
     new_bin_array = [start_parameter]
     parameter = start_parameter
-    while parameter <= parameter_end:
-        parameter += parameter * relative_step
-        new_bin_array.append(parameter)
-
-    if new_bin_array[-1] <= parameter_end:
-        parameter += parameter * relative_step
-        new_bin_array.append(parameter)
+    while parameter < parameter_end:
+        next_parameter = parameter + parameter * relative_step
+        if next_parameter >= parameter_end:
+            if (not full_bins_only) or np.isclose(next_parameter, parameter_end):
+                new_bin_array.append(float(parameter_end if full_bins_only else next_parameter))
+            break
+        new_bin_array.append(next_parameter)
+        parameter = next_parameter
 
     return np.asarray(new_bin_array, dtype=np.float64)
+
+
+def _create_linear_bin_edges_between(
+    start_value: float, end_value: float, bin_width: float, full_bins_only: bool = False
+) -> np.ndarray:
+    if bin_width is None or bin_width <= 0:
+        raise ValueError("Linear rebinning requires a strictly positive bin width.")
+    if end_value <= start_value:
+        raise ValueError("Segment end must be greater than the segment start.")
+
+    new_bin_array = [float(start_value)]
+    parameter = float(start_value)
+    while parameter + bin_width < end_value:
+        parameter += bin_width
+        new_bin_array.append(parameter)
+
+    next_edge = new_bin_array[-1] + bin_width
+    if (not full_bins_only and new_bin_array[-1] < end_value) or np.isclose(next_edge, end_value):
+        new_bin_array.append(float(end_value if full_bins_only else min(next_edge, end_value)))
+    return np.asarray(new_bin_array, dtype=np.float64)
+
+
+def _create_log_bin_edges_between(
+    start_value: float, end_value: float, relative_step: float, rebin_mode: str, full_bins_only: bool = False
+) -> np.ndarray:
+    if relative_step is None or relative_step <= 0:
+        raise ValueError(f"{rebin_mode} requires a strictly positive logarithmic step.")
+    if start_value <= 0 or end_value <= 0:
+        raise ValueError(f"{rebin_mode} requires strictly positive axis values.")
+    if end_value <= start_value:
+        raise ValueError("Segment end must be greater than the segment start.")
+
+    new_bin_array = [float(start_value)]
+    parameter = float(start_value)
+    while parameter < end_value:
+        next_parameter = parameter + parameter * relative_step
+        if next_parameter >= end_value:
+            if (not full_bins_only) or np.isclose(next_parameter, end_value):
+                new_bin_array.append(float(end_value if full_bins_only else end_value))
+            break
+        new_bin_array.append(float(next_parameter))
+        parameter = next_parameter
+
+    if len(new_bin_array) == 1 and not full_bins_only:
+        new_bin_array.append(float(end_value))
+    return np.asarray(new_bin_array, dtype=np.float64)
+
+
+def _create_reverse_log_bin_edges_between(
+    start_value: float, end_value: float, relative_step: float, rebin_mode: str, full_bins_only: bool = False
+) -> np.ndarray:
+    forward_edges = _create_log_bin_edges_between(
+        start_value, end_value, relative_step, rebin_mode, full_bins_only=full_bins_only
+    )
+    if len(forward_edges) < 2:
+        return forward_edges
+    forward_widths = np.diff(forward_edges)
+    reverse_widths = forward_widths[::-1]
+
+    if (not full_bins_only) and len(reverse_widths) >= 2 and reverse_widths[0] < reverse_widths[1]:
+        reverse_widths[1] = reverse_widths[0] + reverse_widths[1]
+        reverse_widths = reverse_widths[1:]
+
+    new_bin_array = [float(start_value)]
+    parameter = float(start_value)
+    for width in reverse_widths:
+        parameter += float(width)
+        if parameter >= end_value:
+            if not full_bins_only:
+                new_bin_array.append(float(end_value))
+            break
+        new_bin_array.append(parameter)
+
+    if (not full_bins_only) and new_bin_array[-1] < end_value:
+        new_bin_array.append(float(end_value))
+    return np.asarray(new_bin_array, dtype=np.float64)
+
+
+def _normalize_custom_schedule(rebin_custom_schedule: list = None) -> list[dict]:
+    if not rebin_custom_schedule:
+        raise ValueError("custom_schedule requires at least one segment.")
+
+    normalized_schedule = []
+    for segment_index, segment in enumerate(rebin_custom_schedule):
+        if isinstance(segment, dict):
+            end_energy = segment.get("end_energy_eV")
+            step_value = segment.get("step")
+        else:
+            if len(segment) != 2:
+                raise ValueError(
+                    f"Invalid custom segment at index {segment_index}: expected (end_energy_eV, step)."
+                )
+            end_energy, step_value = segment
+
+        if end_energy in ["", None]:
+            normalized_end_energy = None
+        else:
+            normalized_end_energy = float(end_energy)
+
+        normalized_step_value = float(step_value)
+        if normalized_step_value <= 0:
+            raise ValueError(f"Custom segment {segment_index} step must be strictly positive.")
+
+        normalized_schedule.append(
+            {
+                "end_energy_eV": normalized_end_energy,
+                "step": normalized_step_value,
+            }
+        )
+
+    none_indices = [index for index, segment in enumerate(normalized_schedule) if segment["end_energy_eV"] is None]
+    if len(none_indices) > 1:
+        raise ValueError("Custom schedule can contain at most one open-ended segment.")
+    if none_indices and none_indices[0] != len(normalized_schedule) - 1:
+        raise ValueError("The open-ended custom schedule segment must be the final line.")
+
+    specified_end_energies = [
+        segment["end_energy_eV"] for segment in normalized_schedule if segment["end_energy_eV"] is not None
+    ]
+    if any(
+        specified_end_energies[index] >= specified_end_energies[index + 1]
+        for index in range(len(specified_end_energies) - 1)
+    ):
+        raise ValueError("Custom schedule energy boundaries must be provided in strictly increasing order.")
+
+    return normalized_schedule
+
+
+def _interpolate_axis_value_from_energy(
+    energy_array: np.ndarray = None,
+    axis_values: np.ndarray = None,
+    target_energy_eV: float = None,
+) -> float:
+    energy_array = np.asarray(energy_array, dtype=np.float64)
+    axis_values = np.asarray(axis_values, dtype=np.float64)
+
+    sort_index = np.argsort(energy_array)
+    sorted_energy = energy_array[sort_index]
+    sorted_axis = axis_values[sort_index]
+    unique_energy, unique_index = np.unique(sorted_energy, return_index=True)
+    unique_axis = sorted_axis[unique_index]
+
+    if target_energy_eV < unique_energy[0] or target_energy_eV > unique_energy[-1]:
+        raise ValueError(
+            f"Requested custom schedule boundary {target_energy_eV} eV is outside the data range "
+            f"[{unique_energy[0]}, {unique_energy[-1]}] eV."
+        )
+
+    return float(np.interp(target_energy_eV, unique_energy, unique_axis))
+
+
+def _create_edges_for_custom_segment(
+    start_value: float = None,
+    end_value: float = None,
+    step_value: float = None,
+    rebin_custom_scale: str = None,
+    full_bins_only: bool = False,
+) -> np.ndarray:
+    if rebin_custom_scale == RebinCustomScale.linear:
+        return _create_linear_bin_edges_between(start_value, end_value, step_value, full_bins_only=full_bins_only)
+    if rebin_custom_scale == RebinCustomScale.log:
+        return _create_log_bin_edges_between(
+            start_value, end_value, step_value, RebinMode.custom_schedule, full_bins_only=full_bins_only
+        )
+    if rebin_custom_scale == RebinCustomScale.reverse_log:
+        return _create_reverse_log_bin_edges_between(
+            start_value, end_value, step_value, RebinMode.custom_schedule, full_bins_only=full_bins_only
+        )
+
+    raise ValueError(f"Unsupported custom schedule scale: {rebin_custom_scale}")
+
+
+def _build_custom_schedule_bin_edges(
+    tof_array: np.ndarray = None,
+    lambda_array: np.ndarray = None,
+    energy_array: np.ndarray = None,
+    rebin_custom_basis: str = None,
+    rebin_custom_scale: str = None,
+    rebin_custom_schedule: list = None,
+    rebin_full_bins_only: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    normalized_schedule = _normalize_custom_schedule(rebin_custom_schedule)
+
+    def _convert_custom_step(step_value: float) -> float:
+        if rebin_custom_basis == RebinCustomBasis.tof and rebin_custom_scale == RebinCustomScale.linear:
+            return step_value * 1e-6
+        return step_value
+
+    if rebin_custom_basis == RebinCustomBasis.tof:
+        axis_values = _validate_rebin_axis(tof_array, RebinMode.custom_schedule)
+    elif rebin_custom_basis == RebinCustomBasis.lambda_:
+        axis_values = _validate_rebin_axis(lambda_array, RebinMode.custom_schedule)
+    elif rebin_custom_basis == RebinCustomBasis.lambda_squared:
+        axis_values = _validate_rebin_axis(np.square(lambda_array), RebinMode.custom_schedule)
+        if rebin_custom_scale != RebinCustomScale.linear:
+            raise ValueError("lambda^2 custom schedules only support linear steps.")
+    else:
+        raise ValueError(f"Unsupported custom schedule basis: {rebin_custom_basis}")
+
+    axis_start = float(axis_values[0])
+    axis_end = float(axis_values[-1])
+    data_energy_min = float(np.min(energy_array))
+    data_energy_max = float(np.max(energy_array))
+
+    def _energy_to_axis(energy_value: float) -> float:
+        if np.isclose(energy_value, data_energy_max):
+            return axis_start
+        if np.isclose(energy_value, data_energy_min):
+            return axis_end
+        return _interpolate_axis_value_from_energy(
+            energy_array=energy_array,
+            axis_values=axis_values,
+            target_energy_eV=energy_value,
+        )
+
+    interval_specs = []
+    current_low_energy = data_energy_min
+    for segment in normalized_schedule:
+        end_energy = segment["end_energy_eV"]
+        interval_high_energy = data_energy_max if end_energy is None else float(end_energy)
+        if interval_high_energy < data_energy_min or interval_high_energy > data_energy_max:
+            raise ValueError(
+                f"Custom schedule boundary {interval_high_energy} eV is outside the data range "
+                f"[{data_energy_min}, {data_energy_max}] eV."
+            )
+        if interval_high_energy <= current_low_energy:
+            raise ValueError("Custom schedule boundaries must increase from low energy to high energy.")
+
+        interval_specs.append(
+            {
+                "low_energy_eV": current_low_energy,
+                "high_energy_eV": interval_high_energy,
+                "step": segment["step"],
+            }
+        )
+        current_low_energy = interval_high_energy
+        if np.isclose(current_low_energy, data_energy_max):
+            break
+
+    if current_low_energy < data_energy_max:
+        interval_specs.append(
+            {
+                "low_energy_eV": current_low_energy,
+                "high_energy_eV": data_energy_max,
+                "step": normalized_schedule[-1]["step"],
+            }
+        )
+
+    custom_bin_edges = [axis_start]
+    current_start = axis_start
+    for interval_spec in reversed(interval_specs):
+        segment_end = _energy_to_axis(interval_spec["low_energy_eV"])
+        if segment_end <= current_start:
+            continue
+        segment_edges = _create_edges_for_custom_segment(
+            start_value=current_start,
+            end_value=segment_end,
+            step_value=_convert_custom_step(interval_spec["step"]),
+            rebin_custom_scale=rebin_custom_scale,
+            full_bins_only=rebin_full_bins_only,
+        )
+        custom_bin_edges.extend(segment_edges[1:])
+        current_start = custom_bin_edges[-1]
+
+        if current_start >= axis_end:
+            break
+
+    if current_start < axis_end:
+        segment_edges = _create_edges_for_custom_segment(
+            start_value=current_start,
+            end_value=axis_end,
+            step_value=_convert_custom_step(normalized_schedule[0]["step"]),
+            rebin_custom_scale=rebin_custom_scale,
+            full_bins_only=rebin_full_bins_only,
+        )
+        custom_bin_edges.extend(segment_edges[1:])
+
+    return axis_values, np.asarray(custom_bin_edges, dtype=np.float64)
 
 
 def build_rebin_bin_groups(
     rebin_mode: str = RebinMode.none,
     tof_array: np.ndarray = None,
     lambda_array: np.ndarray = None,
+    energy_array: np.ndarray = None,
     rebin_delta_tof_us: float = None,
     rebin_delta_lambda_a: float = None,
     rebin_delta_tof_over_tof: float = None,
     rebin_delta_lambda_over_lambda: float = None,
     rebin_delta_lambda_squared_a2: float = None,
+    rebin_custom_basis: str = None,
+    rebin_custom_scale: str = None,
+    rebin_custom_schedule: list = None,
+    rebin_full_bins_only: bool = False,
 ) -> tuple[list[list[int]], np.ndarray]:
     if tof_array is None:
         return None, None
@@ -275,30 +586,47 @@ def build_rebin_bin_groups(
 
     if rebin_mode == RebinMode.linear_tof:
         axis_values = _validate_rebin_axis(tof_array, rebin_mode)
-        bin_edges = _create_linear_bin_edges(axis_values, rebin_delta_tof_us * 1e-6)
+        bin_edges = _create_linear_bin_edges(
+            axis_values, rebin_delta_tof_us * 1e-6, full_bins_only=rebin_full_bins_only
+        )
     elif rebin_mode == RebinMode.linear_lambda:
         axis_values = _validate_rebin_axis(lambda_array, rebin_mode)
-        bin_edges = _create_linear_bin_edges(axis_values, rebin_delta_lambda_a)
+        bin_edges = _create_linear_bin_edges(
+            axis_values, rebin_delta_lambda_a, full_bins_only=rebin_full_bins_only
+        )
     elif rebin_mode == RebinMode.log_tof:
         axis_values = _validate_rebin_axis(tof_array, rebin_mode)
-        bin_edges = _create_log_bin_edges(axis_values, rebin_delta_tof_over_tof, rebin_mode)
+        bin_edges = _create_log_bin_edges(
+            axis_values, rebin_delta_tof_over_tof, rebin_mode, full_bins_only=rebin_full_bins_only
+        )
     elif rebin_mode == RebinMode.log_lambda:
         axis_values = _validate_rebin_axis(lambda_array, rebin_mode)
-        bin_edges = _create_log_bin_edges(axis_values, rebin_delta_lambda_over_lambda, rebin_mode)
+        bin_edges = _create_log_bin_edges(
+            axis_values, rebin_delta_lambda_over_lambda, rebin_mode, full_bins_only=rebin_full_bins_only
+        )
     elif rebin_mode == RebinMode.inverse_log_lambda:
         axis_values = _validate_rebin_axis(np.square(lambda_array), rebin_mode)
-        bin_edges = _create_linear_bin_edges(axis_values, rebin_delta_lambda_squared_a2)
+        bin_edges = _create_linear_bin_edges(
+            axis_values, rebin_delta_lambda_squared_a2, full_bins_only=rebin_full_bins_only
+        )
+    elif rebin_mode == RebinMode.custom_schedule:
+        axis_values, bin_edges = _build_custom_schedule_bin_edges(
+            tof_array=tof_array,
+            lambda_array=lambda_array,
+            energy_array=energy_array,
+            rebin_custom_basis=rebin_custom_basis,
+            rebin_custom_scale=rebin_custom_scale,
+            rebin_custom_schedule=rebin_custom_schedule,
+            rebin_full_bins_only=rebin_full_bins_only,
+        )
     else:
         raise ValueError(f"Unsupported rebin mode: {rebin_mode}")
 
     bin_groups = [[] for _ in np.arange(len(bin_edges) - 1)]
     for frame_index, axis_value in enumerate(axis_values):
-        result = np.where(axis_value >= bin_edges)[0]
-        if len(result) == 0:
+        group_index = int(np.searchsorted(bin_edges, axis_value, side="right") - 1)
+        if group_index < 0 or group_index >= len(bin_groups):
             continue
-        group_index = result[-1]
-        if group_index >= len(bin_groups):
-            group_index = len(bin_groups) - 1
         bin_groups[group_index].append(frame_index)
 
     return bin_groups, bin_edges
@@ -400,6 +728,10 @@ def maybe_rebin_data_and_axes(
     rebin_delta_tof_over_tof: float = None,
     rebin_delta_lambda_over_lambda: float = None,
     rebin_delta_lambda_squared_a2: float = None,
+    rebin_custom_basis: str = None,
+    rebin_custom_scale: str = None,
+    rebin_custom_schedule: list = None,
+    rebin_full_bins_only: bool = False,
 ) -> dict:
     if (time_spectra is None) and (rebin_mode != RebinMode.none):
         raise ValueError(f"{rebin_mode} requires a valid spectra/time axis.")
@@ -417,6 +749,10 @@ def maybe_rebin_data_and_axes(
         rebin_delta_tof_over_tof=rebin_delta_tof_over_tof,
         rebin_delta_lambda_over_lambda=rebin_delta_lambda_over_lambda,
         rebin_delta_lambda_squared_a2=rebin_delta_lambda_squared_a2,
+        rebin_custom_basis=rebin_custom_basis,
+        rebin_custom_scale=rebin_custom_scale,
+        rebin_custom_schedule=rebin_custom_schedule,
+        rebin_full_bins_only=rebin_full_bins_only,
     )
 
     if tof_array is None:
@@ -438,11 +774,16 @@ def maybe_rebin_data_and_axes(
         rebin_mode=rebin_mode,
         tof_array=tof_array,
         lambda_array=lambda_array,
+        energy_array=energy_array,
         rebin_delta_tof_us=rebin_delta_tof_us,
         rebin_delta_lambda_a=rebin_delta_lambda_a,
         rebin_delta_tof_over_tof=rebin_delta_tof_over_tof,
         rebin_delta_lambda_over_lambda=rebin_delta_lambda_over_lambda,
         rebin_delta_lambda_squared_a2=rebin_delta_lambda_squared_a2,
+        rebin_custom_basis=rebin_custom_basis,
+        rebin_custom_scale=rebin_custom_scale,
+        rebin_custom_schedule=rebin_custom_schedule,
+        rebin_full_bins_only=rebin_full_bins_only,
     )
     bin_metadata = build_rebin_bin_metadata(
         tof_array=tof_array,

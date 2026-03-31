@@ -21,7 +21,7 @@ from PIL import Image
 from skimage.io import imread
 from scipy.ndimage import median_filter
 
-from __code.normalization_tof import RebinMode
+from __code.normalization_tof import RebinCustomBasis, RebinCustomScale, RebinMode
 from __code.normalization_tof.utilities import *
 
 # from enum import Enum
@@ -95,6 +95,10 @@ def normalization_with_list_of_full_path(
     rebin_delta_tof_over_tof: float = None,
     rebin_delta_lambda_over_lambda: float = None,
     rebin_delta_lambda_squared_a2: float = None,
+    rebin_custom_basis: str = None,
+    rebin_custom_scale: str = None,
+    rebin_custom_schedule: list = None,
+    rebin_full_bins_only: bool = False,
     experimental_uncertainties_flag: bool = False) -> NormalizedData:
      
     # """
@@ -201,6 +205,10 @@ def normalization_with_list_of_full_path(
     logging.info(f"{rebin_delta_tof_over_tof = }")
     logging.info(f"{rebin_delta_lambda_over_lambda = }")
     logging.info(f"{rebin_delta_lambda_squared_a2 = }")
+    logging.info(f"{rebin_custom_basis = }")
+    logging.info(f"{rebin_custom_scale = }")
+    logging.info(f"{rebin_custom_schedule = }")
+    logging.info(f"{rebin_full_bins_only = }")
     logging.info(f"{experimental_uncertainties_flag = }")
     logging.info(f"")
     
@@ -227,8 +235,9 @@ def normalization_with_list_of_full_path(
     ob_data_combined_variance = None
     dc_data_combined_variance = None
     detector_model_uncertainty_available = any(
-        getattr(_status_metadata, "all_shutter_counts_found", False)
-        for _status_metadata in [sample_status_metadata, ob_status_metadata, dc_status_metadata]
+        _run_info.get(MasterDictKeys.shutter_counts) not in [None, []]
+        for _master_dict in [sample_master_dict, ob_master_dict, dc_master_dict]
+        for _run_info in _master_dict.values()
     )
     uncertainty_model_label = (
         "TPX1 detector-model uncertainty (iBeatles-style) where shutter counts are available; "
@@ -259,6 +268,10 @@ def normalization_with_list_of_full_path(
             rebin_delta_tof_over_tof=rebin_delta_tof_over_tof,
             rebin_delta_lambda_over_lambda=rebin_delta_lambda_over_lambda,
             rebin_delta_lambda_squared_a2=rebin_delta_lambda_squared_a2,
+            rebin_custom_basis=rebin_custom_basis,
+            rebin_custom_scale=rebin_custom_scale,
+            rebin_custom_schedule=rebin_custom_schedule,
+            rebin_full_bins_only=rebin_full_bins_only,
         )
 
         rebinned_payload["ob_data_combined_for_spectrum"] = (

@@ -21,7 +21,15 @@ from __code._utilities.json import load_json
 
 from __code.ipywe.fileselector import FileSelectorPanel as MyFileSelectorPanel
 from __code.ipywe.myfileselector import FileSelectorPanelWithJumpFolders as MyFileSelectorPanelWithJumpFolders
-from __code.normalization_tof import DetectorType, RebinMode, autoreduce_dir, distance_source_detector_m, raw_dir
+from __code.normalization_tof import (
+    DetectorType,
+    RebinCustomBasis,
+    RebinCustomScale,
+    RebinMode,
+    autoreduce_dir,
+    distance_source_detector_m,
+    raw_dir,
+)
 from __code.normalization_tof.config import DEBUG_DATA, timepix1_config, timepix3_config
 from __code.normalization_tof.normalization_for_timepix1_timepix3 import (
     load_data_using_multithreading,
@@ -969,6 +977,92 @@ class NormalizationTof:
         self.rebin_delta_tof_over_tof_ui.disabled = selected_mode != RebinMode.log_tof
         self.rebin_delta_lambda_over_lambda_ui.disabled = selected_mode != RebinMode.log_lambda
         self.rebin_delta_lambda_squared_a2_ui.disabled = selected_mode != RebinMode.inverse_log_lambda
+        self.rebin_full_bins_only_ui.disabled = selected_mode == RebinMode.none
+        custom_schedule_disabled = selected_mode != RebinMode.custom_schedule
+        self.rebin_custom_basis_ui.disabled = custom_schedule_disabled
+        self.rebin_custom_scale_ui.disabled = custom_schedule_disabled
+        self.rebin_custom_schedule_ui.disabled = custom_schedule_disabled
+        self._update_custom_schedule_help()
+
+    def _get_custom_schedule_scale_options(self):
+        if self.rebin_custom_basis_ui.value == RebinCustomBasis.lambda_squared:
+            return [RebinCustomScale.linear]
+        return [RebinCustomScale.linear, RebinCustomScale.log, RebinCustomScale.reverse_log]
+
+    def _update_custom_schedule_scale_options(self):
+        current_value = getattr(self.rebin_custom_scale_ui, "value", None)
+        options = self._get_custom_schedule_scale_options()
+        self.rebin_custom_scale_ui.options = options
+        if current_value not in options:
+            self.rebin_custom_scale_ui.value = options[0]
+
+    def _update_custom_schedule_help(self):
+        if not hasattr(self, "rebin_custom_schedule_help_ui"):
+            return
+
+        basis = self.rebin_custom_basis_ui.value
+        scale = self.rebin_custom_scale_ui.value
+
+        if basis == RebinCustomBasis.tof:
+            step_label = "delta_us" if scale == RebinCustomScale.linear else "dt/t"
+        elif basis == RebinCustomBasis.lambda_:
+            step_label = "delta_A" if scale == RebinCustomScale.linear else "dl/l"
+        else:
+            step_label = "delta_(A^2)"
+
+        self.rebin_custom_schedule_help_ui.value = (
+            "<span style='font-size: 12px;'>"
+            "Custom schedule format: one segment per line as "
+            f"<code>end_energy_eV, {step_label}</code>. "
+            "Energy boundaries must be listed in strictly increasing order, from the lowest energy upward. "
+            "Leave the final energy blank to continue to the maximum energy in the data."
+            "</span>"
+        )
+
+    def _on_custom_schedule_basis_change(self, change):
+        self._update_custom_schedule_scale_options()
+        self._update_custom_schedule_help()
+
+    def _on_custom_schedule_scale_change(self, change):
+        self._update_custom_schedule_help()
+
+    def _parse_custom_rebin_schedule(self) -> list[dict]:
+        schedule_text = self.rebin_custom_schedule_ui.value
+        if schedule_text is None:
+            raise ValueError("Custom schedule text is empty.")
+
+        parsed_schedule = []
+        for line_index, raw_line in enumerate(schedule_text.splitlines(), start=1):
+            line_without_comment = raw_line.split("#", 1)[0].strip()
+            if not line_without_comment:
+                continue
+
+            parts = [part.strip() for part in line_without_comment.split(",")]
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Invalid custom schedule line {line_index}: expected 'end_energy_eV, step'."
+                )
+
+            end_energy_raw, step_raw = parts
+            try:
+                end_energy_eV = None if end_energy_raw == "" else float(end_energy_raw)
+                step_value = float(step_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid numeric value in custom schedule line {line_index}: {line_without_comment}"
+                ) from exc
+
+            parsed_schedule.append(
+                {
+                    "end_energy_eV": end_energy_eV,
+                    "step": step_value,
+                }
+            )
+
+        if not parsed_schedule:
+            raise ValueError("Custom schedule requires at least one non-empty segment line.")
+
+        return parsed_schedule
 
     def settings(self):
 
@@ -1049,6 +1143,7 @@ class NormalizationTof:
                 RebinMode.log_tof,
                 RebinMode.log_lambda,
                 RebinMode.inverse_log_lambda,
+                RebinMode.custom_schedule,
             ],
             value=RebinMode.none,
             description="Mode:",
@@ -1112,6 +1207,62 @@ class NormalizationTof:
                     self.rebin_delta_lambda_squared_a2_ui,
                 ],
                 layout=widgets.Layout(align_items="center", width="100%"),
+            )
+        )
+        self.rebin_full_bins_only_ui = widgets.Checkbox(
+            description="Full bins only",
+            value=False,
+            disabled=True,
+            layout=widgets.Layout(width="220px"),
+        )
+        display(
+            HTML(
+                "<span style='font-size: 12px;'>"
+                "When enabled, partial bins at segment or range boundaries are dropped instead of being kept as "
+                "odd-sized transition bins."
+                "</span>"
+            )
+        )
+        display(self.rebin_full_bins_only_ui)
+
+        self.rebin_custom_basis_ui = widgets.Dropdown(
+            options=[RebinCustomBasis.tof, RebinCustomBasis.lambda_, RebinCustomBasis.lambda_squared],
+            value=RebinCustomBasis.tof,
+            description="basis:",
+            disabled=True,
+            layout=widgets.Layout(width="240px"),
+        )
+        self.rebin_custom_basis_ui.observe(self._on_custom_schedule_basis_change, names="value")
+
+        self.rebin_custom_scale_ui = widgets.Dropdown(
+            options=[RebinCustomScale.linear, RebinCustomScale.log, RebinCustomScale.reverse_log],
+            value=RebinCustomScale.linear,
+            description="scale:",
+            disabled=True,
+            layout=widgets.Layout(width="260px"),
+        )
+        self.rebin_custom_scale_ui.observe(self._on_custom_schedule_scale_change, names="value")
+
+        self.rebin_custom_schedule_ui = widgets.Textarea(
+            value="0.2, 10\n1.0, 20\n, 50",
+            description="segments:",
+            disabled=True,
+            layout=widgets.Layout(width="520px", height="110px"),
+        )
+        self.rebin_custom_schedule_help_ui = widgets.HTML()
+        self._update_custom_schedule_scale_options()
+        self._update_custom_schedule_help()
+
+        display(
+            widgets.VBox(
+                [
+                    widgets.HBox(
+                        [self.rebin_custom_basis_ui, self.rebin_custom_scale_ui],
+                        layout=widgets.Layout(align_items="center"),
+                    ),
+                    self.rebin_custom_schedule_ui,
+                    self.rebin_custom_schedule_help_ui,
+                ]
             )
         )
 
@@ -1753,6 +1904,13 @@ class NormalizationTof:
 
         spectra_array = self.spectra_array
         rebin_mode = self.rebin_mode_ui.value
+        rebin_custom_schedule = None
+        if rebin_mode == RebinMode.custom_schedule:
+            try:
+                rebin_custom_schedule = self._parse_custom_rebin_schedule()
+            except ValueError as exc:
+                display(HTML(f"<span style='color:red'>{exc}</span>"))
+                raise
 
         self.normalized_dict = normalization_with_list_of_full_path(
             sample_dict=sample_dict,
@@ -1795,6 +1953,14 @@ class NormalizationTof:
                 if rebin_mode == RebinMode.inverse_log_lambda
                 else None
             ),
+            rebin_custom_basis=(
+                self.rebin_custom_basis_ui.value if rebin_mode == RebinMode.custom_schedule else None
+            ),
+            rebin_custom_scale=(
+                self.rebin_custom_scale_ui.value if rebin_mode == RebinMode.custom_schedule else None
+            ),
+            rebin_custom_schedule=rebin_custom_schedule,
+            rebin_full_bins_only=self.rebin_full_bins_only_ui.value if rebin_mode != RebinMode.none else False,
             experimental_uncertainties_flag=self.experimental_uncertainties_flag.value,
         )
         
