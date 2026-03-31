@@ -35,6 +35,15 @@ class DetectorType:
     tpx3 = "tpx3"
 
 
+class RebinMode:
+    none = "No rebin"
+    linear_tof = "linear_tof(delta_us)"
+    linear_lambda = "linear_lambda(delta_A)"
+    log_tof = "log_tof(delta_tof_over_tof)"
+    log_lambda = "log_lambda(delta_lambda_over_lambda)"
+    inverse_log_lambda = "inverse_log_lambda(delta_lambda_squared_A2)"
+
+
 raw_dir = {
     "VENUS": {
         DetectorType.tpx1_legacy: ["/SNS/VENUS/", "images/mcp/images/"],

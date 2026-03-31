@@ -20,9 +20,12 @@ from PIL import Image
 from skimage.io import imread
 from scipy.ndimage import median_filter
 
-from timepix_geometry_correction.correct import TimepixGeometryCorrection
+try:
+    from timepix_geometry_correction.correct import TimepixGeometryCorrection
+except ModuleNotFoundError:
+    TimepixGeometryCorrection = None
 
-from __code.normalization_tof import Roi
+from __code.normalization_tof import RebinMode, Roi
 from __code._utilities.json import load_json, save_json
 
 MARKERSIZE = 6
@@ -111,19 +114,361 @@ def retrieve_list_of_tif(folder: str) -> list:
 
 
 def create_x_axis_file(
-    lambda_array: np.ndarray = None, energy_array: np.ndarray = None, output_folder: str = "./"
+    tof_array: np.ndarray = None,
+    lambda_array: np.ndarray = None,
+    energy_array: np.ndarray = None,
+    bin_metadata: dict = None,
+    output_folder: str = "./",
 ) -> str:
-    """create x axis file with lambda, energy and tof arrays"""
-    x_axis_data = {
-        "file_index": np.arange(len(lambda_array)),
-        "lambda (Angstroms)": lambda_array,
-        "energy (eV)": energy_array,
-    }
+    """Create an x-axis file for normalized or rebinned data."""
+    if bin_metadata:
+        x_axis_data = {
+            "file_index": bin_metadata["active_bin_index_array"],
+            "starting tof (s)": bin_metadata["starting_tof_array"],
+            "ending tof (s)": bin_metadata["ending_tof_array"],
+            "mean tof (s)": bin_metadata["mean_tof_array"],
+            "starting lambda (Angstroms)": bin_metadata["starting_lambda_array"],
+            "ending lambda (Angstroms)": bin_metadata["ending_lambda_array"],
+            "mean lambda (Angstroms)": bin_metadata["mean_lambda_array"],
+            "starting energy (eV)": bin_metadata["starting_energy_array"],
+            "ending energy (eV)": bin_metadata["ending_energy_array"],
+            "mean energy (eV)": bin_metadata["mean_energy_array"],
+        }
+    else:
+        x_axis_data = {
+            "file_index": np.arange(len(lambda_array)),
+            "mean tof (s)": tof_array,
+            "mean lambda (Angstroms)": lambda_array,
+            "mean energy (eV)": energy_array,
+        }
+
     x_axis_file_name = os.path.join(output_folder, "x_axis.txt")
-    pd_dataframe = pd.DataFrame(x_axis_data)
-    pd_dataframe.to_csv(x_axis_file_name, index=False, sep=",")
+    pd.DataFrame(x_axis_data).to_csv(x_axis_file_name, index=False, sep=",")
 
     logging.info(f"X axis file created: {x_axis_file_name}")
+
+
+def _format_rebin_value_for_output(value: float) -> str:
+    return f"{value:g}".replace("-", "m").replace(".", "p")
+
+
+def create_rebin_output_suffix(
+    rebin_mode: str = RebinMode.none,
+    rebin_delta_tof_us: float = None,
+    rebin_delta_lambda_a: float = None,
+    rebin_delta_tof_over_tof: float = None,
+    rebin_delta_lambda_over_lambda: float = None,
+    rebin_delta_lambda_squared_a2: float = None,
+) -> str:
+    if rebin_mode == RebinMode.none:
+        return ""
+
+    if rebin_mode == RebinMode.linear_tof:
+        return f"_rebin_lin_deltaTOF_{_format_rebin_value_for_output(rebin_delta_tof_us)}us"
+
+    if rebin_mode == RebinMode.linear_lambda:
+        return f"_rebin_lin_deltalambda_{_format_rebin_value_for_output(rebin_delta_lambda_a)}A"
+
+    if rebin_mode == RebinMode.log_tof:
+        return "_rebin_log_deltatof_over_tof_" + _format_rebin_value_for_output(rebin_delta_tof_over_tof)
+
+    if rebin_mode == RebinMode.log_lambda:
+        return "_rebin_log_deltalambdaoverlambda_" + _format_rebin_value_for_output(
+            rebin_delta_lambda_over_lambda
+        )
+
+    if rebin_mode == RebinMode.inverse_log_lambda:
+        return "_rebin_inverse_log_deltalambda2_" + _format_rebin_value_for_output(
+            rebin_delta_lambda_squared_a2
+        ) + "A2"
+
+    raise ValueError(f"Unsupported rebin mode: {rebin_mode}")
+
+
+def calculate_time_lambda_energy_arrays(
+    time_spectra: np.ndarray = None,
+    distance_source_detector_m: float = 25.0,
+    detector_delay_us: float = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if time_spectra is None:
+        return None, None, None
+
+    if detector_delay_us is None:
+        detector_delay_us = 0.0
+
+    tof_array = np.asarray(time_spectra, dtype=np.float64)
+    lambda_array = convert_array_from_time_to_lambda(
+        time_array=tof_array,
+        time_unit=TimeUnitOptions.s,
+        distance_source_detector=distance_source_detector_m,
+        distance_source_detector_unit=DistanceUnitOptions.m,
+        detector_offset=detector_delay_us,
+        detector_offset_unit=TimeUnitOptions.us,
+        lambda_unit=DistanceUnitOptions.angstrom,
+    )
+    energy_array = convert_array_from_time_to_energy(
+        time_array=tof_array,
+        time_unit=TimeUnitOptions.s,
+        distance_source_detector=distance_source_detector_m,
+        distance_source_detector_unit=DistanceUnitOptions.m,
+        detector_offset=detector_delay_us,
+        detector_offset_unit=TimeUnitOptions.us,
+        energy_unit=EnergyUnitOptions.eV,
+    )
+    return tof_array, lambda_array, energy_array
+
+
+def _validate_rebin_axis(axis_values: np.ndarray, rebin_mode: str) -> np.ndarray:
+    axis_values = np.asarray(axis_values, dtype=np.float64)
+    if np.any(np.diff(axis_values) < 0):
+        raise ValueError(f"{rebin_mode} rebinning requires a non-decreasing axis.")
+    return axis_values
+
+
+def _create_linear_bin_edges(axis_values: np.ndarray, bin_width: float) -> np.ndarray:
+    if bin_width is None or bin_width <= 0:
+        raise ValueError("Linear rebinning requires a strictly positive bin width.")
+    new_axis = np.arange(axis_values[0], axis_values[-1], bin_width, dtype=np.float64)
+    if len(new_axis) == 0:
+        new_axis = np.array([axis_values[0]], dtype=np.float64)
+    new_axis = np.append(new_axis, new_axis[-1] + bin_width)
+    return new_axis
+
+
+def _create_log_bin_edges(axis_values: np.ndarray, relative_step: float, rebin_mode: str) -> np.ndarray:
+    if relative_step is None or relative_step <= 0:
+        raise ValueError(f"{rebin_mode} requires a strictly positive logarithmic step.")
+    if axis_values[0] <= 0:
+        raise ValueError(f"{rebin_mode} requires strictly positive axis values.")
+
+    start_parameter = float(axis_values[0])
+    parameter_end = float(axis_values[-1])
+    new_bin_array = [start_parameter]
+    parameter = start_parameter
+    while parameter <= parameter_end:
+        parameter += parameter * relative_step
+        new_bin_array.append(parameter)
+
+    if new_bin_array[-1] <= parameter_end:
+        parameter += parameter * relative_step
+        new_bin_array.append(parameter)
+
+    return np.asarray(new_bin_array, dtype=np.float64)
+
+
+def build_rebin_bin_groups(
+    rebin_mode: str = RebinMode.none,
+    tof_array: np.ndarray = None,
+    lambda_array: np.ndarray = None,
+    rebin_delta_tof_us: float = None,
+    rebin_delta_lambda_a: float = None,
+    rebin_delta_tof_over_tof: float = None,
+    rebin_delta_lambda_over_lambda: float = None,
+    rebin_delta_lambda_squared_a2: float = None,
+) -> tuple[list[list[int]], np.ndarray]:
+    if tof_array is None:
+        return None, None
+
+    nbr_frames = len(tof_array)
+    if rebin_mode == RebinMode.none:
+        return [[index] for index in range(nbr_frames)], np.arange(nbr_frames + 1, dtype=np.float64)
+
+    if rebin_mode == RebinMode.linear_tof:
+        axis_values = _validate_rebin_axis(tof_array, rebin_mode)
+        bin_edges = _create_linear_bin_edges(axis_values, rebin_delta_tof_us * 1e-6)
+    elif rebin_mode == RebinMode.linear_lambda:
+        axis_values = _validate_rebin_axis(lambda_array, rebin_mode)
+        bin_edges = _create_linear_bin_edges(axis_values, rebin_delta_lambda_a)
+    elif rebin_mode == RebinMode.log_tof:
+        axis_values = _validate_rebin_axis(tof_array, rebin_mode)
+        bin_edges = _create_log_bin_edges(axis_values, rebin_delta_tof_over_tof, rebin_mode)
+    elif rebin_mode == RebinMode.log_lambda:
+        axis_values = _validate_rebin_axis(lambda_array, rebin_mode)
+        bin_edges = _create_log_bin_edges(axis_values, rebin_delta_lambda_over_lambda, rebin_mode)
+    elif rebin_mode == RebinMode.inverse_log_lambda:
+        axis_values = _validate_rebin_axis(np.square(lambda_array), rebin_mode)
+        bin_edges = _create_linear_bin_edges(axis_values, rebin_delta_lambda_squared_a2)
+    else:
+        raise ValueError(f"Unsupported rebin mode: {rebin_mode}")
+
+    bin_groups = [[] for _ in np.arange(len(bin_edges) - 1)]
+    for frame_index, axis_value in enumerate(axis_values):
+        result = np.where(axis_value >= bin_edges)[0]
+        if len(result) == 0:
+            continue
+        group_index = result[-1]
+        if group_index >= len(bin_groups):
+            group_index = len(bin_groups) - 1
+        bin_groups[group_index].append(frame_index)
+
+    return bin_groups, bin_edges
+
+
+def build_rebin_bin_metadata(
+    tof_array: np.ndarray = None,
+    lambda_array: np.ndarray = None,
+    energy_array: np.ndarray = None,
+    bin_groups: list[list[int]] = None,
+) -> dict:
+    if bin_groups is None:
+        return None
+
+    active_bin_indices = []
+    active_frame_groups = []
+    starting_tof = []
+    ending_tof = []
+    mean_tof = []
+    starting_lambda = []
+    ending_lambda = []
+    mean_lambda = []
+    starting_energy = []
+    ending_energy = []
+    mean_energy = []
+
+    for full_bin_index, frame_group in enumerate(bin_groups):
+        if not frame_group:
+            continue
+
+        frame_group = np.asarray(frame_group, dtype=int)
+        active_bin_indices.append(full_bin_index)
+        active_frame_groups.append(frame_group)
+
+        tof_values = np.asarray(tof_array[frame_group], dtype=np.float64)
+        lambda_values = np.asarray(lambda_array[frame_group], dtype=np.float64)
+        energy_values = np.asarray(energy_array[frame_group], dtype=np.float64)
+
+        starting_tof.append(tof_values[0])
+        ending_tof.append(tof_values[-1])
+        mean_tof.append(np.mean(tof_values))
+
+        starting_lambda.append(lambda_values[0])
+        ending_lambda.append(lambda_values[-1])
+        mean_lambda.append(np.mean(lambda_values))
+
+        starting_energy.append(energy_values[0])
+        ending_energy.append(energy_values[-1])
+        mean_energy.append(np.mean(energy_values))
+
+    return {
+        "active_bin_index_array": np.asarray(active_bin_indices, dtype=int),
+        "list_file_index_array": active_frame_groups,
+        "starting_tof_array": np.asarray(starting_tof, dtype=np.float64),
+        "ending_tof_array": np.asarray(ending_tof, dtype=np.float64),
+        "mean_tof_array": np.asarray(mean_tof, dtype=np.float64),
+        "starting_lambda_array": np.asarray(starting_lambda, dtype=np.float64),
+        "ending_lambda_array": np.asarray(ending_lambda, dtype=np.float64),
+        "mean_lambda_array": np.asarray(mean_lambda, dtype=np.float64),
+        "starting_energy_array": np.asarray(starting_energy, dtype=np.float64),
+        "ending_energy_array": np.asarray(ending_energy, dtype=np.float64),
+        "mean_energy_array": np.asarray(mean_energy, dtype=np.float64),
+    }
+
+
+def rebin_array_from_bin_groups(
+    data: np.ndarray = None, active_frame_groups: list[np.ndarray] = None, reducer: str = "sum"
+) -> np.ndarray:
+    if data is None:
+        return None
+
+    if active_frame_groups is None:
+        return np.asarray(data).copy()
+
+    array_data = np.asarray(data)
+    if reducer == "sum":
+        reduced_chunks = [np.sum(array_data[_group], axis=0) for _group in active_frame_groups]
+    elif reducer == "mean":
+        reduced_chunks = [np.mean(array_data[_group], axis=0) for _group in active_frame_groups]
+    else:
+        raise ValueError(f"Unsupported reducer: {reducer}")
+
+    return np.asarray(reduced_chunks)
+
+
+def maybe_rebin_data_and_axes(
+    sample_data: np.ndarray = None,
+    sample_variance: np.ndarray = None,
+    ob_data_combined: np.ndarray = None,
+    ob_data_combined_variance: np.ndarray = None,
+    dc_data_combined: np.ndarray = None,
+    dc_data_combined_variance: np.ndarray = None,
+    time_spectra: np.ndarray = None,
+    distance_source_detector_m: float = 25.0,
+    detector_delay_us: float = None,
+    rebin_mode: str = RebinMode.none,
+    rebin_delta_tof_us: float = None,
+    rebin_delta_lambda_a: float = None,
+    rebin_delta_tof_over_tof: float = None,
+    rebin_delta_lambda_over_lambda: float = None,
+    rebin_delta_lambda_squared_a2: float = None,
+) -> dict:
+    if (time_spectra is None) and (rebin_mode != RebinMode.none):
+        raise ValueError(f"{rebin_mode} requires a valid spectra/time axis.")
+
+    tof_array, lambda_array, energy_array = calculate_time_lambda_energy_arrays(
+        time_spectra=time_spectra,
+        distance_source_detector_m=distance_source_detector_m,
+        detector_delay_us=detector_delay_us,
+    )
+
+    output_suffix = create_rebin_output_suffix(
+        rebin_mode=rebin_mode,
+        rebin_delta_tof_us=rebin_delta_tof_us,
+        rebin_delta_lambda_a=rebin_delta_lambda_a,
+        rebin_delta_tof_over_tof=rebin_delta_tof_over_tof,
+        rebin_delta_lambda_over_lambda=rebin_delta_lambda_over_lambda,
+        rebin_delta_lambda_squared_a2=rebin_delta_lambda_squared_a2,
+    )
+
+    if tof_array is None:
+        return {
+            "sample_data": sample_data,
+            "sample_variance": sample_variance,
+            "ob_data_combined": ob_data_combined,
+            "ob_data_combined_variance": ob_data_combined_variance,
+            "dc_data_combined": dc_data_combined,
+            "dc_data_combined_variance": dc_data_combined_variance,
+            "tof_array": None,
+            "lambda_array": None,
+            "energy_array": None,
+            "output_suffix": output_suffix,
+            "bin_metadata": None,
+        }
+
+    bin_groups, _ = build_rebin_bin_groups(
+        rebin_mode=rebin_mode,
+        tof_array=tof_array,
+        lambda_array=lambda_array,
+        rebin_delta_tof_us=rebin_delta_tof_us,
+        rebin_delta_lambda_a=rebin_delta_lambda_a,
+        rebin_delta_tof_over_tof=rebin_delta_tof_over_tof,
+        rebin_delta_lambda_over_lambda=rebin_delta_lambda_over_lambda,
+        rebin_delta_lambda_squared_a2=rebin_delta_lambda_squared_a2,
+    )
+    bin_metadata = build_rebin_bin_metadata(
+        tof_array=tof_array,
+        lambda_array=lambda_array,
+        energy_array=energy_array,
+        bin_groups=bin_groups,
+    )
+    active_frame_groups = None if bin_metadata is None else bin_metadata["list_file_index_array"]
+
+    return {
+        "sample_data": rebin_array_from_bin_groups(sample_data, active_frame_groups, reducer="sum"),
+        "sample_variance": rebin_array_from_bin_groups(sample_variance, active_frame_groups, reducer="sum"),
+        "ob_data_combined": rebin_array_from_bin_groups(ob_data_combined, active_frame_groups, reducer="sum"),
+        "ob_data_combined_variance": rebin_array_from_bin_groups(
+            ob_data_combined_variance, active_frame_groups, reducer="sum"
+        ),
+        "dc_data_combined": rebin_array_from_bin_groups(dc_data_combined, active_frame_groups, reducer="sum"),
+        "dc_data_combined_variance": rebin_array_from_bin_groups(
+            dc_data_combined_variance, active_frame_groups, reducer="sum"
+        ),
+        "tof_array": None if bin_metadata is None else bin_metadata["mean_tof_array"],
+        "lambda_array": None if bin_metadata is None else bin_metadata["mean_lambda_array"],
+        "energy_array": None if bin_metadata is None else bin_metadata["mean_energy_array"],
+        "output_suffix": output_suffix,
+        "bin_metadata": bin_metadata,
+    }
 
 
 def load_images(master_dict=None, data_type=DataType.sample, verbose=False):
@@ -143,16 +488,153 @@ def load_images(master_dict=None, data_type=DataType.sample, verbose=False):
             display(HTML(f"{master_dict[_run_number][MasterDictKeys.data].shape = }"))
 
 
+def calculate_roi_profile(data=None, roi=None):
+    if (roi is None) or (data is None):
+        return None
+
+    x0 = roi.left
+    y0 = roi.top
+    width = roi.width
+    height = roi.height
+    return np.asarray(
+        [np.sum(_data[y0 : y0 + height, x0 : x0 + width], dtype=np.float64) for _data in data],
+        dtype=np.float64,
+    )
+
+
+def _extract_primary_shutter_count(shutter_counts=None) -> float:
+    if shutter_counts is None:
+        return None
+
+    shutter_counts_array = np.asarray(shutter_counts, dtype=np.float64)
+    shutter_counts_array = shutter_counts_array[shutter_counts_array > 0]
+    if len(shutter_counts_array) == 0:
+        return None
+    return float(shutter_counts_array[0])
+
+
+def recover_raw_counts_from_corrected_counts(corrected: np.ndarray, shutter_counts: float) -> tuple[np.ndarray, np.ndarray]:
+    n_frames = corrected.shape[0]
+    shutter_counts = float(shutter_counts)
+    raw = np.zeros_like(corrected, dtype=np.float64)
+    occupancy = np.zeros_like(corrected, dtype=np.float64)
+    cumsum_raw = np.zeros(corrected.shape[1:], dtype=np.float64)
+
+    for frame_index in range(n_frames):
+        corrected_frame = corrected[frame_index].astype(np.float64)
+        numerator = corrected_frame * (shutter_counts - cumsum_raw)
+        denominator = shutter_counts + corrected_frame
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw_frame = np.where(
+                (denominator > 0) & (numerator >= 0),
+                numerator / denominator,
+                0.0,
+            )
+        raw[frame_index] = raw_frame
+        cumsum_raw = cumsum_raw + raw_frame
+        occupancy[frame_index] = cumsum_raw / shutter_counts
+
+    return raw, occupancy
+
+
+def calculate_detector_corrected_variance(data=None, shutter_counts=None):
+    if data is None:
+        return None
+
+    primary_shutter_count = _extract_primary_shutter_count(shutter_counts)
+    if primary_shutter_count is None:
+        return None
+
+    corrected = np.asarray(data, dtype=np.float64)
+    _, occupancy = recover_raw_counts_from_corrected_counts(
+        corrected=corrected,
+        shutter_counts=primary_shutter_count,
+    )
+
+    denominator = 1.0 - occupancy
+    with np.errstate(divide="ignore", invalid="ignore"):
+        variance = np.where(denominator > 0, corrected / denominator, 0.0)
+    return np.maximum(variance, 0.0)
+
+
+def calculate_data_variance(data=None, shutter_counts=None, use_experimental_uncertainties: bool = False):
+    if data is None:
+        return None
+
+    if use_experimental_uncertainties:
+        variance = calculate_detector_corrected_variance(data=data, shutter_counts=shutter_counts)
+        if variance is not None:
+            return variance
+
+    return np.asarray(data, dtype=np.float64)
+
+
+def calculate_combined_data_variance(
+    master_dict: dict = None,
+    use_proton_charge: bool = False,
+    use_experimental_uncertainties: bool = False,
+) -> np.ndarray:
+    if not master_dict:
+        return None
+
+    run_numbers = list(master_dict.keys())
+    if use_proton_charge:
+        list_proton_charges = [master_dict[_run_number][MasterDictKeys.proton_charge] for _run_number in run_numbers]
+        sum_proton_charge = np.sum(list_proton_charges)
+        coeff = np.mean(list_proton_charges)
+    else:
+        sum_proton_charge = 1.0
+        coeff = 1.0
+
+    full_variance = []
+    for _run_number in run_numbers:
+        data = np.asarray(master_dict[_run_number][MasterDictKeys.data], dtype=np.float64)
+        variance = calculate_data_variance(
+            data=data,
+            shutter_counts=master_dict[_run_number].get(MasterDictKeys.shutter_counts),
+            use_experimental_uncertainties=use_experimental_uncertainties,
+        )
+        if use_proton_charge:
+            proton_charge = master_dict[_run_number][MasterDictKeys.proton_charge]
+            scale_factor = (proton_charge / sum_proton_charge) / coeff
+        else:
+            scale_factor = 1.0
+        full_variance.append(variance * scale_factor**2)
+
+    return np.sum(np.asarray(full_variance), axis=0)
+
+
+def calculate_dc_combined_variance(dc_master_dict: dict = None) -> np.ndarray:
+    if not dc_master_dict:
+        return None
+
+    full_variance = [
+        np.asarray(dc_master_dict[_dc_run_number][MasterDictKeys.data], dtype=np.float64)
+        for _dc_run_number in dc_master_dict.keys()
+    ]
+    return np.sum(np.asarray(full_variance), axis=0) / (len(full_variance) ** 2)
+
+
+def extract_spectrum_normalization_values(spectrum_profile=None):
+    if spectrum_profile is None:
+        return None
+    if isinstance(spectrum_profile, dict):
+        return spectrum_profile.get("spectrum_normalization")
+    return spectrum_profile
+
+
+def extract_spectrum_normalization_uncertainty(spectrum_profile=None):
+    if isinstance(spectrum_profile, dict):
+        return spectrum_profile.get("spectrum_normalization_uncertainty")
+    return None
+
+
 def  calculate_ob_data_combined_used_by_spectrum_normalization(roi=None, ob_data_combined=None, verbose=False):
 
     logging.info(f"Calculating the ob_data_combined for spectrum normalization")
     if roi is not None:
         logging.info(f"\t{roi =}")
-        x0 = roi.left
-        y0 = roi.top
-        width = roi.width
-        height = roi.height
-        ob_data_combined_for_spectrum = [np.sum(np.sum(_data[y0:y0 + height, x0:x0 + width], axis=0), axis=0) for _data in ob_data_combined]
+        ob_data_combined_for_spectrum = calculate_roi_profile(data=ob_data_combined, roi=roi)
         logging.info(f"\t{np.shape(ob_data_combined_for_spectrum) = }")
         logging.info(f"\t{np.shape(ob_data_combined) = }")
 
@@ -180,6 +662,11 @@ def correct_chips_alignment(data_combined=None, correct_chips_alignment_config=N
     logging.info("Correcting chips alignment ...")
     if verbose:
         display(HTML("Correcting chips alignment ..."))
+
+    if TimepixGeometryCorrection is None:
+        raise ModuleNotFoundError(
+            "timepix_geometry_correction is required when chip alignment correction is enabled."
+        )
 
     logging.info(f"\t{data_combined.shape = }")
 
@@ -417,26 +904,34 @@ def preview_normalized_data(_sample_data, ob_data_combined, dc_data_combined,
         fig5.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
         fig5.show()
 
-        if _spectrum_normalized_data is not None:
+        spectrum_profile = extract_spectrum_normalization_values(_spectrum_normalized_data)
+        spectrum_uncertainty = extract_spectrum_normalization_uncertainty(_spectrum_normalized_data)
+        if spectrum_profile is not None:
 
             fig6 = make_subplots(rows=1, cols=2, 
                                subplot_titles=["Lambda vs ROI Spectrum", "Energy vs ROI Spectrum"],
                                horizontal_spacing=0.15)
             logging.info(f"{np.shape(profile) = }")
 
+            error_y_dict = None
+            if spectrum_uncertainty is not None:
+                error_y_dict = dict(type='data', array=spectrum_uncertainty, visible=True)
+
             # Lambda plot
-            fig6.add_trace(go.Scatter(x=lambda_array, y=_spectrum_normalized_data, 
+            fig6.add_trace(go.Scatter(x=lambda_array, y=spectrum_profile, 
                                     mode='markers',
                                     marker=dict(symbol='star', size=MARKERSIZE, color='red'),
+                                    error_y=error_y_dict,
                                     name="spectrum normalization of ROI"), row=1, col=1)
             fig6.update_xaxes(title_text="Lambda (A)", row=1, col=1)
             fig6.update_yaxes(title_text="Transmission (a.u.)", row=1, col=1)
             logging.info(f"{lambda_array = }")
 
             # Energy plot
-            fig6.add_trace(go.Scatter(x=energy_array, y=_spectrum_normalized_data, 
+            fig6.add_trace(go.Scatter(x=energy_array, y=spectrum_profile, 
                                     mode='markers',
                                     marker=dict(symbol='star', size=MARKERSIZE, color='red'),
+                                    error_y=error_y_dict,
                                     name="spectrum normalization of ROI", showlegend=False), row=1, col=2)
             fig6.update_xaxes(title_text="Energy (eV)", type="log", row=1, col=2)
             fig6.update_yaxes(title_text="Transmission (a.u.)", row=1, col=2)
@@ -473,7 +968,9 @@ def export_sample_images(
     _sample_run_number,
     _sample_data,
     spectra_file_name=None,
-    spectra_array=None
+    spectra_array=None,
+    output_suffix="",
+    bin_metadata: dict = None,
 ):
     logging.info(f"> Exporting sample corrected images to {output_folder} ...")
 
@@ -481,7 +978,7 @@ def export_sample_images(
     logging.info(f"\t{spectra_file_name = }")
     logging.info(f"\t{spectra_array = }")
 
-    sample_output_folder = os.path.join(output_folder, f"sample_{_sample_run_number}")
+    sample_output_folder = os.path.join(output_folder, f"sample_{_sample_run_number}{output_suffix}")
     os.makedirs(sample_output_folder, exist_ok=True)
 
     if export_corrected_stack_of_sample_data:
@@ -490,7 +987,8 @@ def export_sample_images(
         os.makedirs(output_stack_folder, exist_ok=True)
 
         for _index, _data in enumerate(_sample_data):
-            _output_file = os.path.join(output_stack_folder, f"image{_index:04d}.tif")
+            file_index = _index if bin_metadata is None else int(bin_metadata["active_bin_index_array"][_index])
+            _output_file = os.path.join(output_stack_folder, f"image{file_index:04d}.tif")
             make_tiff(data=_data, filename=_output_file)
         logging.info(f"\t -> Exporting sample data to {output_stack_folder} is done!")
 
@@ -530,6 +1028,8 @@ def export_ob_images(
     ob_data_combined,
     spectra_file_name=None,
     spectra_array=None,
+    output_suffix="",
+    bin_metadata: dict = None,
 ):
     """export ob images to the output folder"""
     logging.info(f"> Exporting combined ob images to {output_folder} ...")
@@ -538,10 +1038,10 @@ def export_ob_images(
         str(isolate_run_number_from_full_path(_ob_run_number)) for _ob_run_number in ob_run_numbers
     ]
     if len(list_ob_runs_number_only) == 1:
-        ob_output_folder = os.path.join(output_folder, f"ob_{list_ob_runs_number_only[0]}")
+        ob_output_folder = os.path.join(output_folder, f"ob_{list_ob_runs_number_only[0]}{output_suffix}")
     else:
         str_list_ob_runs = "_".join(list_ob_runs_number_only)
-        ob_output_folder = os.path.join(output_folder, f"ob_{str_list_ob_runs}")
+        ob_output_folder = os.path.join(output_folder, f"ob_{str_list_ob_runs}{output_suffix}")
     os.makedirs(ob_output_folder, exist_ok=True)
 
     output_stack_folder = ""
@@ -562,7 +1062,8 @@ def export_ob_images(
         logging.info(f"\t -> Exporting ob data to {output_stack_folder} ...")
         _list_data = ob_data_combined
         for _index, _data in enumerate(_list_data):
-            _output_file = os.path.join(output_stack_folder, f"image{_index:04d}.tif")
+            file_index = _index if bin_metadata is None else int(bin_metadata["active_bin_index_array"][_index])
+            _output_file = os.path.join(output_stack_folder, f"image{file_index:04d}.tif")
             make_tiff(data=_data, filename=_output_file)
         logging.info(f"\t -> Exporting ob data to {output_stack_folder} is done!")
         
@@ -628,6 +1129,7 @@ def init_master_dict(data_dictionary: dict) -> dict:
             MasterDictKeys.frame_number: None,
             MasterDictKeys.data_path: data_dictionary[_base_name]["full_path"],
             MasterDictKeys.proton_charge: None,
+            MasterDictKeys.shutter_counts: None,
             MasterDictKeys.matching_ob: [],
             MasterDictKeys.list_tif: [],
             MasterDictKeys.list_spectra: None,
@@ -662,7 +1164,7 @@ def update_dict_with_shutter_counts(master_dict: dict) -> tuple[dict, bool]:
         if len(_list_files) == 0:
             logging.info(f"Shutter count file not found for run {run_number}!")
             master_dict[run_number][MasterDictKeys.shutter_counts] = None
-            status_all_shutter_counts_found
+            status_all_shutter_counts_found = False
             continue
         else:
             shutter_count_file = _list_files[0]
@@ -814,11 +1316,11 @@ def create_master_dict(
     logging.info("updating with nexus metadata")
     update_with_nexus_metadata(master_dict)
 
-    # logging.info("updating with shutter counts!")
-    # master_dict, all_shutter_counts_found = update_dict_with_shutter_counts(master_dict)
-    # if not all_shutter_counts_found:
-    #     status_metadata.all_shutter_counts_found = False
-    # logging.info(f"{master_dict = }")
+    logging.info("updating with shutter counts!")
+    master_dict, all_shutter_counts_found = update_dict_with_shutter_counts(master_dict)
+    if not all_shutter_counts_found:
+        status_metadata.all_shutter_counts_found = False
+    logging.info(f"{master_dict = }")
 
     # if all_shutter_counts_found:
     logging.info("updating with spectra values!")
@@ -1371,27 +1873,106 @@ def perform_normalization(_sample_data=None, ob_data_combined=None, dc_data_comb
             'integrated_normalized_data': _integrated_normalized_data}
 
 
-def perform_spectrum_normalization(roi=None, sample_data=None, ob_data_combined_for_spectrum=None, dc_data_combined=None, dc_data_combined_for_spectrum=None):
-    _spectrum_normalized_data = None
-    if roi is not None:
-        x0 = roi.left
-        y0 = roi.top
-        width = roi.width
-        height = roi.height
+def perform_spectrum_normalization(
+    roi=None,
+    sample_data=None,
+    sample_variance=None,
+    ob_data_combined_for_spectrum=None,
+    ob_data_combined_variance_for_spectrum=None,
+    dc_data_combined=None,
+    dc_data_combined_for_spectrum=None,
+    dc_data_combined_variance=None,
+    dc_data_combined_variance_for_spectrum=None,
+):
+    if roi is None:
+        return None
 
-        _sample_data_combined_for_spectrum = [np.sum(np.sum(_data[y0: y0+height, x0: x0+width], axis=0), axis=0) for _data in sample_data]
+    sample_roi_counts = calculate_roi_profile(data=sample_data, roi=roi)
+    if sample_variance is None:
+        sample_roi_variance = np.asarray(sample_roi_counts, dtype=np.float64)
+    else:
+        sample_roi_variance = calculate_roi_profile(data=sample_variance, roi=roi)
 
-        if dc_data_combined is not None:
-            _spectrum_normalized_data = np.divide(np.subtract(_sample_data_combined_for_spectrum, dc_data_combined_for_spectrum), 
-                                                    np.subtract(ob_data_combined_for_spectrum, dc_data_combined_for_spectrum), 
-                                                    out=np.zeros_like(_sample_data_combined_for_spectrum), 
-                                                    where=(ob_data_combined_for_spectrum - dc_data_combined_for_spectrum)!=0)
+    ob_roi_counts = np.asarray(ob_data_combined_for_spectrum, dtype=np.float64)
+    if ob_data_combined_variance_for_spectrum is None:
+        ob_roi_variance = np.asarray(ob_roi_counts, dtype=np.float64)
+    else:
+        ob_roi_variance = np.asarray(ob_data_combined_variance_for_spectrum, dtype=np.float64)
+
+    spectrum_result = {
+        "sample_roi_counts": sample_roi_counts,
+        "sample_roi_uncertainty": np.sqrt(np.clip(sample_roi_variance, 0, None)),
+        "ob_roi_counts": ob_roi_counts,
+        "ob_roi_uncertainty": np.sqrt(np.clip(ob_roi_variance, 0, None)),
+    }
+
+    if dc_data_combined is not None:
+        if dc_data_combined_for_spectrum is None:
+            dc_roi_counts = calculate_roi_profile(data=dc_data_combined, roi=roi)
         else:
-            _spectrum_normalized_data = np.divide(_sample_data_combined_for_spectrum, ob_data_combined_for_spectrum, 
-                                                    out=np.zeros_like(_sample_data_combined_for_spectrum), 
-                                                    where=ob_data_combined_for_spectrum!=0)
-        logging.info(f"{np.shape(_spectrum_normalized_data) = }")
-    return _spectrum_normalized_data
+            dc_roi_counts = np.asarray(dc_data_combined_for_spectrum, dtype=np.float64)
+
+        if dc_data_combined_variance_for_spectrum is None:
+            if dc_data_combined_variance is None:
+                dc_roi_variance = np.asarray(dc_roi_counts, dtype=np.float64)
+            else:
+                dc_roi_variance = calculate_roi_profile(data=dc_data_combined_variance, roi=roi)
+        else:
+            dc_roi_variance = np.asarray(dc_data_combined_variance_for_spectrum, dtype=np.float64)
+
+        numerator = sample_roi_counts - dc_roi_counts
+        denominator = ob_roi_counts - dc_roi_counts
+        numerator_variance = sample_roi_variance + dc_roi_variance
+        denominator_variance = ob_roi_variance + dc_roi_variance
+
+        spectrum_normalization = np.divide(
+            numerator,
+            denominator,
+            out=np.zeros_like(sample_roi_counts, dtype=np.float64),
+            where=denominator != 0,
+        )
+
+        spectrum_normalization_variance = np.zeros_like(sample_roi_counts, dtype=np.float64)
+        valid = denominator != 0
+        spectrum_normalization_variance[valid] = (
+            sample_roi_variance[valid] / (denominator[valid] ** 2)
+            + ((numerator[valid] ** 2) * ob_roi_variance[valid]) / (denominator[valid] ** 4)
+            + (((numerator[valid] - denominator[valid]) ** 2) * dc_roi_variance[valid])
+            / (denominator[valid] ** 4)
+        )
+
+        spectrum_result.update(
+            {
+                "dc_roi_counts": dc_roi_counts,
+                "dc_roi_uncertainty": np.sqrt(np.clip(dc_roi_variance, 0, None)),
+                "sample_minus_dc_roi_counts": numerator,
+                "sample_minus_dc_roi_uncertainty": np.sqrt(np.clip(numerator_variance, 0, None)),
+                "ob_minus_dc_roi_counts": denominator,
+                "ob_minus_dc_roi_uncertainty": np.sqrt(np.clip(denominator_variance, 0, None)),
+            }
+        )
+    else:
+        denominator = ob_roi_counts
+        spectrum_normalization = np.divide(
+            sample_roi_counts,
+            denominator,
+            out=np.zeros_like(sample_roi_counts, dtype=np.float64),
+            where=denominator != 0,
+        )
+
+        spectrum_normalization_variance = np.zeros_like(sample_roi_counts, dtype=np.float64)
+        valid = denominator != 0
+        spectrum_normalization_variance[valid] = (
+            sample_roi_variance[valid] / (denominator[valid] ** 2)
+            + ((sample_roi_counts[valid] ** 2) * ob_roi_variance[valid]) / (denominator[valid] ** 4)
+        )
+
+    spectrum_result["spectrum_normalization"] = spectrum_normalization
+    spectrum_result["spectrum_normalization_uncertainty"] = np.sqrt(
+        np.clip(spectrum_normalization_variance, 0, None)
+    )
+    logging.info(f"{np.shape(spectrum_result['spectrum_normalization']) = }")
+    return spectrum_result
 
 
 def export_normalized_data(ob_master_dict=None, 
@@ -1400,6 +1981,7 @@ def export_normalized_data(ob_master_dict=None,
                 normalized_data=None, 
                 integrated_normalized_data=None,
                 _spectrum_normalized_data=None,
+                tof_array=None,
                 lambda_array=None, 
                 energy_array=None, 
                 output_folder="./", 
@@ -1407,14 +1989,17 @@ def export_normalized_data(ob_master_dict=None,
                 export_corrected_integrated_normalized_data=False,
                 roi=None,
                 spectra_array=None,
-                spectra_file=None,):
+                spectra_file=None,
+                output_suffix="",
+                bin_metadata: dict = None,
+                uncertainty_model_label: str = None):
 
     logging.info("Exporting normalized data ...")
 
     list_ob_runs = list(ob_master_dict.keys())
     str_ob_runs = "_".join([str(_ob_run_number) for _ob_run_number in list_ob_runs])
     full_output_folder = os.path.join(
-        output_folder, f"normalized_sample_{_sample_run_number}_obs_{str_ob_runs}"
+        output_folder, f"normalized_sample_{_sample_run_number}_obs_{str_ob_runs}{output_suffix}"
     )  # issue for WEI here !
     full_output_folder = os.path.abspath(full_output_folder)
     os.makedirs(full_output_folder, exist_ok=True)
@@ -1427,23 +2012,56 @@ def export_normalized_data(ob_master_dict=None,
         width = roi.width
         height = roi.height
         full_file_name = os.path.join(full_output_folder, "spectrum_normalization_profile.txt")
-        pd_dataframe = pd.DataFrame({
-            "file_index": np.arange(len(lambda_array)),
-            "lambda (Angstroms)": lambda_array,
-            "energy (eV)": energy_array,
-            "spectrum normalization": _spectrum_normalized_data
-        })
+        if bin_metadata is not None:
+            bin_index_array = bin_metadata["active_bin_index_array"]
+            mean_tof_micros = bin_metadata["mean_tof_array"] * 1e6
+            mean_lambda = bin_metadata["mean_lambda_array"]
+            mean_energy = bin_metadata["mean_energy_array"]
+        else:
+            bin_index_array = np.arange(len(lambda_array))
+            mean_tof_micros = None if tof_array is None else np.asarray(tof_array, dtype=np.float64) * 1e6
+            mean_lambda = lambda_array
+            mean_energy = energy_array
+
+        pd_dataframe_dict = {
+            "bin index": bin_index_array,
+            "mean_tof (micros)": mean_tof_micros,
+            "mean_lambda (Angstroms)": mean_lambda,
+            "mean_energy (eV)": mean_energy,
+        }
+
+        if isinstance(_spectrum_normalized_data, dict):
+            ordered_columns = [
+                ("sample_roi_counts", "sample ROI counts"),
+                ("sample_roi_uncertainty", "sample ROI uncertainty"),
+                ("ob_roi_counts", "ob ROI counts"),
+                ("ob_roi_uncertainty", "ob ROI uncertainty"),
+                ("dc_roi_counts", "dc ROI counts"),
+                ("dc_roi_uncertainty", "dc ROI uncertainty"),
+                ("sample_minus_dc_roi_counts", "sample minus DC ROI counts"),
+                ("sample_minus_dc_roi_uncertainty", "sample minus DC ROI uncertainty"),
+                ("ob_minus_dc_roi_counts", "OB minus DC ROI counts"),
+                ("ob_minus_dc_roi_uncertainty", "OB minus DC ROI uncertainty"),
+                ("spectrum_normalization", "spectrum normalization"),
+                ("spectrum_normalization_uncertainty", "spectrum normalization uncertainty"),
+            ]
+            for source_key, output_key in ordered_columns:
+                values = _spectrum_normalized_data.get(source_key)
+                if values is not None:
+                    pd_dataframe_dict[output_key] = values
+        else:
+            pd_dataframe_dict["spectrum normalization"] = _spectrum_normalized_data
+
+        pd_dataframe = pd.DataFrame(pd_dataframe_dict)
         pd_dataframe.attrs['roi [left, top, width, height]'] = f"{x0}, {y0}, {width}, {height}"
+        pd_dataframe.attrs['uncertainty model'] = uncertainty_model_label or (
+            "Poisson counting statistics; proton charge treated as an exact scale factor"
+        )
                         
         with open(full_file_name, 'w') as f:
-            # Write metadata as comments
             for key, value in pd_dataframe.attrs.items():
                 f.write(f"# {key}: {value}\n")
-            
-            # Write the DataFrame
-            pd_dataframe.to_csv(f, index=False)              
-        
-        pd_dataframe.to_csv(full_file_name, index=False, sep=",")
+            pd_dataframe.to_csv(f, index=False)
         logging.info(f"\t -> Exporting the spectrum normalization profile to {full_file_name}")
 
     if export_corrected_integrated_normalized_data:
@@ -1459,7 +2077,8 @@ def export_normalized_data(ob_master_dict=None,
         os.makedirs(output_stack_folder, exist_ok=True)
 
         for _index, _data in enumerate(normalized_data[_sample_run_number]):
-            _output_file = os.path.join(output_stack_folder, f"image{_index:04d}.tif")
+            file_index = _index if bin_metadata is None else int(bin_metadata["active_bin_index_array"][_index])
+            _output_file = os.path.join(output_stack_folder, f"image{file_index:04d}.tif")
             make_tiff(data=_data, filename=_output_file)
         logging.info(f"\t -> Exporting normalized data to {output_stack_folder} is done!")
         print(f"Exported normalized tif images are in: {output_stack_folder}!")
@@ -1473,8 +2092,10 @@ def export_normalized_data(ob_master_dict=None,
 
         # create x-axis file
         create_x_axis_file(
+            tof_array=tof_array,
             lambda_array=lambda_array,
             energy_array=energy_array,
+            bin_metadata=bin_metadata,
             output_folder=output_stack_folder,
         )
 

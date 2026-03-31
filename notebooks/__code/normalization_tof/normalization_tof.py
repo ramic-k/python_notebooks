@@ -21,7 +21,7 @@ from __code._utilities.json import load_json
 
 from __code.ipywe.fileselector import FileSelectorPanel as MyFileSelectorPanel
 from __code.ipywe.myfileselector import FileSelectorPanelWithJumpFolders as MyFileSelectorPanelWithJumpFolders
-from __code.normalization_tof import DetectorType, autoreduce_dir, distance_source_detector_m, raw_dir
+from __code.normalization_tof import DetectorType, RebinMode, autoreduce_dir, distance_source_detector_m, raw_dir
 from __code.normalization_tof.config import DEBUG_DATA, timepix1_config, timepix3_config
 from __code.normalization_tof.normalization_for_timepix1_timepix3 import (
     load_data_using_multithreading,
@@ -855,8 +855,11 @@ class NormalizationTof:
             return
         nbr_files = len(list_tiff)
         tof_bin_size_in_s = tof_bin_size * 1e-9  # convert nS to seconds
-        
-        spectra_array = np.arange(0.0001e-7, nbr_files * tof_bin_size_in_s, tof_bin_size_in_s) # do not start at 0 to avoid log binning issues in iBeatles
+
+        # Manual fallback spectra represent the center of each uniform TOF bin.
+        # This keeps lambda/energy conversion finite while avoiding the "near-zero"
+        # first bin that produced pathological TPX3 x-axis values.
+        spectra_array = (np.arange(nbr_files, dtype=np.float64) + 0.5) * tof_bin_size_in_s
         self.spectra_array = spectra_array
 
         display(HTML(f"<span style='color:blue; font-size:16px'>Created spectra arrays with TOF bin size: {tof_bin_size} nS!</span>"))
@@ -959,6 +962,14 @@ class NormalizationTof:
             disable_widgets = True
         self.remove_container_options_flag.disabled = disable_widgets
 
+    def _on_rebin_mode_change(self, change):
+        selected_mode = change["new"]
+        self.rebin_delta_tof_us_ui.disabled = selected_mode != RebinMode.linear_tof
+        self.rebin_delta_lambda_a_ui.disabled = selected_mode != RebinMode.linear_lambda
+        self.rebin_delta_tof_over_tof_ui.disabled = selected_mode != RebinMode.log_tof
+        self.rebin_delta_lambda_over_lambda_ui.disabled = selected_mode != RebinMode.log_lambda
+        self.rebin_delta_lambda_squared_a2_ui.disabled = selected_mode != RebinMode.inverse_log_lambda
+
     def settings(self):
 
         # check here that the user selected a folder for output
@@ -1027,6 +1038,85 @@ class NormalizationTof:
 
         display(HTML("<hr>"))
 
+        display(HTML("<span style='font-size: 16px; color:red'>Rebin TOF axis before normalization</span>"))
+        display(HTML("<span style='font-size: 12px;'>Use this only when you want the normalization to be performed on rebinned sample and OB counts rather than on the original frame-by-frame stack.</span>"))
+
+        self.rebin_mode_ui = widgets.Dropdown(
+            options=[
+                RebinMode.none,
+                RebinMode.linear_tof,
+                RebinMode.linear_lambda,
+                RebinMode.log_tof,
+                RebinMode.log_lambda,
+                RebinMode.inverse_log_lambda,
+            ],
+            value=RebinMode.none,
+            description="Mode:",
+            layout=widgets.Layout(width="420px"),
+        )
+        self.rebin_mode_ui.observe(self._on_rebin_mode_change, names="value")
+        display(self.rebin_mode_ui)
+
+        self.rebin_delta_tof_us_ui = widgets.BoundedFloatText(
+            value=30.0,
+            min=0.001,
+            max=1_000_000.0,
+            step=1.0,
+            description="delta_us:",
+            disabled=True,
+            layout=widgets.Layout(width="220px"),
+        )
+        self.rebin_delta_lambda_a_ui = widgets.BoundedFloatText(
+            value=0.01,
+            min=1e-6,
+            max=100.0,
+            step=0.001,
+            description="delta_A:",
+            disabled=True,
+            layout=widgets.Layout(width="220px"),
+        )
+        self.rebin_delta_tof_over_tof_ui = widgets.BoundedFloatText(
+            value=0.01,
+            min=1e-6,
+            max=10.0,
+            step=0.001,
+            description="dt/t:",
+            disabled=True,
+            layout=widgets.Layout(width="220px"),
+        )
+        self.rebin_delta_lambda_over_lambda_ui = widgets.BoundedFloatText(
+            value=0.01,
+            min=1e-6,
+            max=10.0,
+            step=0.001,
+            description="dl/l:",
+            disabled=True,
+            layout=widgets.Layout(width="220px"),
+        )
+        self.rebin_delta_lambda_squared_a2_ui = widgets.BoundedFloatText(
+            value=0.01,
+            min=1e-8,
+            max=1_000.0,
+            step=0.001,
+            description="d(l^2):",
+            disabled=True,
+            layout=widgets.Layout(width="220px"),
+        )
+        display(
+            widgets.HBox(
+                [
+                    self.rebin_delta_tof_us_ui,
+                    self.rebin_delta_lambda_a_ui,
+                    self.rebin_delta_tof_over_tof_ui,
+                    self.rebin_delta_lambda_over_lambda_ui,
+                    self.rebin_delta_lambda_squared_a2_ui,
+                ],
+                layout=widgets.Layout(align_items="center", width="100%"),
+            )
+        )
+
+        display(HTML("<hr>"))
+
         # normalization options
         display(HTML("<span style='font-size: 16px; color:red'>What to take into account for the normalization</span>"))
 
@@ -1045,12 +1135,10 @@ class NormalizationTof:
                                                    disabled=_disabled)
 
         
-        ## FIXME
-        shutter_counts_value = False
-        # shutter_counts_value = not tpx3_disabled_flag
-        
-        self.shutter_counts_flag = widgets.Checkbox(
-            description="Shutter counts", value=shutter_counts_value, disabled=tpx3_disabled_flag
+        self.experimental_uncertainties_flag = widgets.Checkbox(
+            description="Experimental uncertainties (TPX1 detector model)",
+            value=not tpx3_disabled_flag,
+            disabled=tpx3_disabled_flag,
         )
         self.correct_chips_alignment_flag = widgets.Checkbox(
             description="Correct chips alignment", 
@@ -1062,7 +1150,7 @@ class NormalizationTof:
             [
                 self.proton_charge_flag,
                 # self.monitor_counts_flag,
-                # self.shutter_counts_flag,
+                self.experimental_uncertainties_flag,
                 self.correct_chips_alignment_flag,
             ]
         )
@@ -1664,6 +1752,7 @@ class NormalizationTof:
             correct_chips_alignment_config = None
 
         spectra_array = self.spectra_array
+        rebin_mode = self.rebin_mode_ui.value
 
         self.normalized_dict = normalization_with_list_of_full_path(
             sample_dict=sample_dict,
@@ -1672,8 +1761,6 @@ class NormalizationTof:
             spectra_array=spectra_array,
             output_folder=output_folder,
             proton_charge_flag=self.proton_charge_flag.value,
-            # monitor_counts_flag=self.monitor_counts_flag.value,
-            # shutter_counts_flag=self.shutter_counts_flag.value,
             # replace_ob_zeros_by_nan_flag=self.replace_ob_zeros_by_nan_flag.value,
             replace_ob_zeros_by_local_median_flag=self.replace_ob_zeros_by_local_median_flag.value,
             kernel_size_for_local_median=(self.kernel_size_for_local_median_y.value,
@@ -1691,7 +1778,24 @@ class NormalizationTof:
             combine_samples=self.combine_sample_runs_flag.value,
             roi=self.roi,
             container_roi=self.container_roi,
-            container_roi_file=self.container_roi_file
+            container_roi_file=self.container_roi_file,
+            rebin_mode=rebin_mode,
+            rebin_delta_tof_us=self.rebin_delta_tof_us_ui.value if rebin_mode == RebinMode.linear_tof else None,
+            rebin_delta_lambda_a=(
+                self.rebin_delta_lambda_a_ui.value if rebin_mode == RebinMode.linear_lambda else None
+            ),
+            rebin_delta_tof_over_tof=(
+                self.rebin_delta_tof_over_tof_ui.value if rebin_mode == RebinMode.log_tof else None
+            ),
+            rebin_delta_lambda_over_lambda=(
+                self.rebin_delta_lambda_over_lambda_ui.value if rebin_mode == RebinMode.log_lambda else None
+            ),
+            rebin_delta_lambda_squared_a2=(
+                self.rebin_delta_lambda_squared_a2_ui.value
+                if rebin_mode == RebinMode.inverse_log_lambda
+                else None
+            ),
+            experimental_uncertainties_flag=self.experimental_uncertainties_flag.value,
         )
         
         display(HTML("<span style='color:blue'>Normalization completed</span>"))

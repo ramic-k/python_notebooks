@@ -21,6 +21,7 @@ from PIL import Image
 from skimage.io import imread
 from scipy.ndimage import median_filter
 
+from __code.normalization_tof import RebinMode
 from __code.normalization_tof.utilities import *
 
 # from enum import Enum
@@ -87,7 +88,14 @@ def normalization_with_list_of_full_path(
     export_mode: dict = None,
     roi = None,
     container_roi = None,
-    container_roi_file = None) -> NormalizedData:
+    container_roi_file = None,
+    rebin_mode: str = RebinMode.none,
+    rebin_delta_tof_us: float = None,
+    rebin_delta_lambda_a: float = None,
+    rebin_delta_tof_over_tof: float = None,
+    rebin_delta_lambda_over_lambda: float = None,
+    rebin_delta_lambda_squared_a2: float = None,
+    experimental_uncertainties_flag: bool = False) -> NormalizedData:
      
     # """
     # normalize the sample data with ob data using proton charge and shutter counts
@@ -187,6 +195,13 @@ def normalization_with_list_of_full_path(
     logging.info(f"{correct_chips_alignment_flag = }")
     logging.info(f"{distance_source_detector_m = }")
     logging.info(f"{detector_delay_us = }")
+    logging.info(f"{rebin_mode = }")
+    logging.info(f"{rebin_delta_tof_us = }")
+    logging.info(f"{rebin_delta_lambda_a = }")
+    logging.info(f"{rebin_delta_tof_over_tof = }")
+    logging.info(f"{rebin_delta_lambda_over_lambda = }")
+    logging.info(f"{rebin_delta_lambda_squared_a2 = }")
+    logging.info(f"{experimental_uncertainties_flag = }")
     logging.info(f"")
     
     sample_master_dict, sample_status_metadata = create_master_dict(
@@ -209,6 +224,71 @@ def normalization_with_list_of_full_path(
         spectra_array=spectra_array,
     )
 
+    ob_data_combined_variance = None
+    dc_data_combined_variance = None
+    detector_model_uncertainty_available = any(
+        getattr(_status_metadata, "all_shutter_counts_found", False)
+        for _status_metadata in [sample_status_metadata, ob_status_metadata, dc_status_metadata]
+    )
+    uncertainty_model_label = (
+        "TPX1 detector-model uncertainty (iBeatles-style) where shutter counts are available; "
+        "otherwise Poisson counting statistics. Proton charge propagated as an exact scale factor."
+        if experimental_uncertainties_flag and detector_model_uncertainty_available
+        else "Poisson counting statistics; proton charge treated as an exact scale factor"
+    )
+
+    def prepare_rebinned_payload(
+        current_sample_data,
+        current_sample_variance,
+        current_time_spectra,
+        current_detector_delay_us,
+    ):
+        rebinned_payload = maybe_rebin_data_and_axes(
+            sample_data=current_sample_data,
+            sample_variance=current_sample_variance,
+            ob_data_combined=ob_data_combined,
+            ob_data_combined_variance=ob_data_combined_variance,
+            dc_data_combined=dc_data_combined,
+            dc_data_combined_variance=dc_data_combined_variance,
+            time_spectra=current_time_spectra,
+            distance_source_detector_m=distance_source_detector_m,
+            detector_delay_us=current_detector_delay_us,
+            rebin_mode=rebin_mode,
+            rebin_delta_tof_us=rebin_delta_tof_us,
+            rebin_delta_lambda_a=rebin_delta_lambda_a,
+            rebin_delta_tof_over_tof=rebin_delta_tof_over_tof,
+            rebin_delta_lambda_over_lambda=rebin_delta_lambda_over_lambda,
+            rebin_delta_lambda_squared_a2=rebin_delta_lambda_squared_a2,
+        )
+
+        rebinned_payload["ob_data_combined_for_spectrum"] = (
+            calculate_ob_data_combined_used_by_spectrum_normalization(
+                roi=roi,
+                ob_data_combined=rebinned_payload["ob_data_combined"],
+                verbose=verbose,
+            )
+        )
+        rebinned_payload["ob_data_combined_variance_for_spectrum"] = calculate_roi_profile(
+            data=rebinned_payload["ob_data_combined_variance"],
+            roi=roi,
+        )
+
+        rebinned_payload["dc_data_combined_for_spectrum"] = calculate_roi_profile(
+            data=rebinned_payload["dc_data_combined"],
+            roi=roi,
+        )
+        rebinned_payload["dc_data_combined_variance_for_spectrum"] = calculate_roi_profile(
+            data=rebinned_payload["dc_data_combined_variance"],
+            roi=roi,
+        )
+
+        if rebin_mode == RebinMode.none:
+            rebinned_payload["export_spectra_array"] = spectra_array
+        else:
+            rebinned_payload["export_spectra_array"] = rebinned_payload["tof_array"]
+
+        return rebinned_payload
+
     # load ob images ===============================
     load_images(master_dict=ob_master_dict, data_type=DataType.ob, verbose=verbose)
    
@@ -230,6 +310,11 @@ def normalization_with_list_of_full_path(
                                     kernel_size_for_local_median=kernel_size_for_local_median,
                                     max_iterations=max_iterations,
                                 )
+    ob_data_combined_variance = calculate_combined_data_variance(
+        master_dict=ob_master_dict,
+        use_proton_charge=normalized_by_proton_charge,
+        use_experimental_uncertainties=experimental_uncertainties_flag,
+    )
     logging.info(f"{ob_data_combined.shape = }")
     logging.info(f"{ob_sum_proton_charge = }")
     logging.info(f"number of NaN in ob_data_combined data: {np.sum(np.isnan(ob_data_combined))}")
@@ -240,29 +325,18 @@ def normalization_with_list_of_full_path(
         ob_data_combined = correct_chips_alignment(ob_data_combined, 
                                                    correct_chips_alignment_config, 
                                                    verbose=verbose)
-
-    ob_data_combined_for_spectrum = calculate_ob_data_combined_used_by_spectrum_normalization(roi=roi,
-                                                                                 ob_data_combined=ob_data_combined,
-                                                                                 verbose=verbose)
-
-    # export ob data if requested
-    first_ob_run_number = list(ob_master_dict.keys())[0]
-    if export_corrected_stack_of_ob_data or export_corrected_integrated_ob_data:
-        export_ob_images(
-            ob_master_dict.keys(),
-            output_folder,
-            export_corrected_stack_of_ob_data,
-            export_corrected_integrated_ob_data,
-            ob_data_combined,
-            spectra_file_name=ob_master_dict[first_ob_run_number][MasterDictKeys.spectra_file_name],
-            spectra_array=spectra_array,
+        ob_data_combined_variance = correct_chips_alignment(
+            ob_data_combined_variance,
+            correct_chips_alignment_config,
+            verbose=verbose,
         )
 
     # load dc images ================================
-    dc_master_dict = load_images(master_dict=dc_master_dict, data_type=DataType.dc, verbose=verbose)
+    load_images(master_dict=dc_master_dict, data_type=DataType.dc, verbose=verbose)
 
     # combine all dc images
     dc_data_combined = combine_dc_images(dc_master_dict)
+    dc_data_combined_variance = calculate_dc_combined_variance(dc_master_dict)
     
     if dc_data_combined is not None:
         
@@ -270,20 +344,11 @@ def normalization_with_list_of_full_path(
             dc_data_combined = correct_chips_alignment(dc_data_combined, 
                                                     correct_chips_alignment_config, 
                                                     verbose=verbose)
-
-    if (dc_data_combined is not None) and (roi is not None):
-        dc_data_combined_for_spectrum = [np.sum(np.sum(_data, axis=0), axis=0) for _data in dc_data_combined]
-        logging.info(f"\t{np.shape(dc_data_combined) = }")
-        logging.info(f"\t{np.shape(dc_data_combined_for_spectrum) = }")
-        
-        if correct_chips_alignment_flag:
-            dc_data_combined_for_spectrum = correct_chips_alignment(dc_data_combined_for_spectrum, 
-                                                    correct_chips_alignment_config, 
-                                                    verbose=verbose)
-
-    else:
-        logging.info(f"\tno roi provided! Skipping the normalization of spectrum.")
-        dc_data_combined_for_spectrum = None
+            dc_data_combined_variance = correct_chips_alignment(
+                dc_data_combined_variance,
+                correct_chips_alignment_config,
+                verbose=verbose,
+            )
 
     # load sample images ===============================
     load_images(master_dict=sample_master_dict, data_type=DataType.sample, verbose=verbose)
@@ -309,6 +374,11 @@ def normalization_with_list_of_full_path(
                                     kernel_size_for_local_median=kernel_size_for_local_median,
                                     max_iterations=max_iterations,
                                 )
+        sample_data_combined_variance = calculate_combined_data_variance(
+            master_dict=sample_master_dict,
+            use_proton_charge=normalized_by_proton_charge,
+            use_experimental_uncertainties=experimental_uncertainties_flag,
+        )
 
         logging.info("**********************************")
         list_run_number = list(sample_master_dict.keys())
@@ -326,6 +396,7 @@ def normalization_with_list_of_full_path(
             if verbose:
                 display(HTML(f"Normalizing by proton charge"))
             sample_data_combined /= sample_sum_proton_charge 
+            sample_data_combined_variance /= sample_sum_proton_charge**2
 
         if (container_roi is not None) or (container_roi_file is not None):
                 logging.info(f"Applying container normalization:")
@@ -344,6 +415,34 @@ def normalization_with_list_of_full_path(
                 if verbose and (container_roi_file is not None):
                     display(HTML(f"Container roi file created: {container_roi_file}."))
 
+        current_detector_delay_us = detector_delay_us
+        if current_detector_delay_us is None:
+            current_detector_delay_us = sample_master_dict[list_run_number[0]][MasterDictKeys.detector_delay_us]
+            logging.info(
+                f"detector_delay argument is None, using detector delay from first sample run: {current_detector_delay_us} us"
+            )
+
+        time_spectra = sample_master_dict[list_run_number[0]][MasterDictKeys.list_spectra]
+        rebinned_payload = prepare_rebinned_payload(
+            current_sample_data=sample_data_combined,
+            current_sample_variance=sample_data_combined_variance,
+            current_time_spectra=time_spectra,
+            current_detector_delay_us=current_detector_delay_us,
+        )
+
+        sample_data_combined = rebinned_payload["sample_data"]
+        sample_data_combined_variance = rebinned_payload["sample_variance"]
+        ob_data_for_normalization = rebinned_payload["ob_data_combined"]
+        dc_data_for_normalization = rebinned_payload["dc_data_combined"]
+        ob_data_combined_for_spectrum = rebinned_payload["ob_data_combined_for_spectrum"]
+        ob_data_combined_variance_for_spectrum = rebinned_payload["ob_data_combined_variance_for_spectrum"]
+        dc_data_combined_for_spectrum = rebinned_payload["dc_data_combined_for_spectrum"]
+        dc_data_combined_variance_for_spectrum = rebinned_payload["dc_data_combined_variance_for_spectrum"]
+        time_spectra = rebinned_payload["tof_array"]
+        lambda_array = rebinned_payload["lambda_array"]
+        energy_array = rebinned_payload["energy_array"]
+        output_suffix = rebinned_payload["output_suffix"]
+
         # export sample data after correction if requested
         if export_corrected_stack_of_sample_data or export_corrected_integrated_sample_data:
             export_sample_images(
@@ -353,20 +452,40 @@ def normalization_with_list_of_full_path(
                 str_list_run_number,
                 sample_data_combined,
                 spectra_file_name=sample_master_dict[list_run_number[0]][MasterDictKeys.spectra_file_name],
-                spectra_array=spectra_array,
+                spectra_array=rebinned_payload["export_spectra_array"],
+                output_suffix=output_suffix,
+                bin_metadata=rebinned_payload["bin_metadata"],
             )
 
-        _normalized_dict = perform_normalization(sample_data_combined, ob_data_combined, dc_data_combined)
+        first_ob_run_number = list(ob_master_dict.keys())[0]
+        if export_corrected_stack_of_ob_data or export_corrected_integrated_ob_data:
+            export_ob_images(
+                ob_master_dict.keys(),
+                output_folder,
+                export_corrected_stack_of_ob_data,
+                export_corrected_integrated_ob_data,
+                ob_data_for_normalization,
+                spectra_file_name=ob_master_dict[first_ob_run_number][MasterDictKeys.spectra_file_name],
+                spectra_array=rebinned_payload["export_spectra_array"],
+                output_suffix=output_suffix,
+                bin_metadata=rebinned_payload["bin_metadata"],
+            )
+
+        _normalized_dict = perform_normalization(sample_data_combined, ob_data_for_normalization, dc_data_for_normalization)
         _normalized_data = _normalized_dict['normalized_data']
         _integrated_normalized_data = _normalized_dict['integrated_normalized_data']       
         integrated_normalized_data[str_list_run_number] = _integrated_normalized_data
         normalized_data[str_list_run_number] = _normalized_data
 
         _spectrum_normalized_data = perform_spectrum_normalization(roi=roi, 
-                                                                sample_data=sample_data_combined, 
-                                                                ob_data_combined_for_spectrum=ob_data_combined_for_spectrum, 
-                                                                dc_data_combined=dc_data_combined,
-                                                                dc_data_combined_for_spectrum=dc_data_combined_for_spectrum)
+                                                                sample_data=sample_data_combined,
+                                                                sample_variance=sample_data_combined_variance,
+                                                                ob_data_combined_for_spectrum=ob_data_combined_for_spectrum,
+                                                                ob_data_combined_variance_for_spectrum=ob_data_combined_variance_for_spectrum,
+                                                                dc_data_combined=dc_data_for_normalization,
+                                                                dc_data_combined_for_spectrum=dc_data_combined_for_spectrum,
+                                                                dc_data_combined_variance=rebinned_payload["dc_data_combined_variance"],
+                                                                dc_data_combined_variance_for_spectrum=dc_data_combined_variance_for_spectrum)
         spectrum_normalized_data[str_list_run_number] = _spectrum_normalized_data
 
         # normalized_data[_sample_run_number] = np.array(np.divide(_sample_data, ob_data_combined))
@@ -375,53 +494,7 @@ def normalization_with_list_of_full_path(
         logging.info(f"number of NaN in normalized data: {np.sum(np.isnan(normalized_data[str_list_run_number]))}")
         logging.info(f"number of inf in normalized data: {np.sum(np.isinf(normalized_data[str_list_run_number]))}")
 
-        if detector_delay_us is None:
-            detector_delay_us = sample_master_dict[list_run_number[0]][MasterDictKeys.detector_delay_us]
-            logging.info(f"detector_delay argument is None, using detector delay from first sample run: {detector_delay_us} us")
-        
-        time_spectra = sample_master_dict[list_run_number[0]][MasterDictKeys.list_spectra]
-
         dict_to_return.tof_array = time_spectra
-
-        if time_spectra is None:
-            logging.info("Time spectra is None, cannot convert to lambda or energy arrays")
-            lambda_array = None
-            energy_array = None
-        
-        else:
-
-            logging.info(f"We have a time_spectra!")
-            logging.info(f"time spectra shape: {time_spectra.shape}")
-            
-            if detector_delay_us is None:
-                detector_delay_us = 0.0
-                logging.info(f"detector delay is None, setting it to {detector_delay_us} us")
-
-            logging.info(f"we have a detector delay of {detector_delay_us} us")
-
-            lambda_array = convert_array_from_time_to_lambda(
-                time_array=time_spectra,
-                time_unit=TimeUnitOptions.s,
-                distance_source_detector=distance_source_detector_m,
-                distance_source_detector_unit=DistanceUnitOptions.m,
-                detector_offset=detector_delay_us,
-                detector_offset_unit=TimeUnitOptions.us,
-                lambda_unit=DistanceUnitOptions.angstrom,
-            )
-            logging.info(f"Lambda array shape: {lambda_array.shape}")
-            logging.info(f"{lambda_array = }")
-
-            energy_array = convert_array_from_time_to_energy(
-                time_array=time_spectra,
-                time_unit=TimeUnitOptions.s,
-                distance_source_detector=distance_source_detector_m,
-                distance_source_detector_unit=DistanceUnitOptions.m,
-                detector_offset=detector_delay_us,
-                detector_offset_unit=TimeUnitOptions.us,
-                energy_unit=EnergyUnitOptions.eV,
-            )
-            logging.info(f"Energy array shape: {energy_array.shape}")
-            logging.info(f"{energy_array = }")
 
         dict_to_return.lambda_array = lambda_array
         dict_to_return.energy_array = energy_array
@@ -429,12 +502,12 @@ def normalization_with_list_of_full_path(
         logging.info(f"Preview: {preview = }")
         if preview:
             preview_normalized_data(sample_data_combined, 
-                                    ob_data_combined, 
-                                    dc_data_combined, 
+                                    ob_data_for_normalization, 
+                                    dc_data_for_normalization, 
                                     normalized_data, 
                                     lambda_array,
                                     energy_array, 
-                                    detector_delay_us, 
+                                    current_detector_delay_us, 
                                     str_list_run_number,
                                     combine_samples,
                                     _spectrum_normalized_data,
@@ -449,14 +522,18 @@ def normalization_with_list_of_full_path(
                 normalized_data=normalized_data, 
                 integrated_normalized_data=integrated_normalized_data,
                 _spectrum_normalized_data=_spectrum_normalized_data,
+                tof_array=time_spectra,
                 lambda_array=lambda_array, 
                 energy_array=energy_array, 
                 output_folder=output_folder, 
                 export_corrected_stack_of_normalized_data=export_corrected_stack_of_normalized_data,
                 export_corrected_integrated_normalized_data=export_corrected_integrated_normalized_data,
                 roi=roi,
-                spectra_array=spectra_array,
-                spectra_file=sample_master_dict[list_run_number[0]][MasterDictKeys.spectra_file_name])
+                spectra_array=rebinned_payload["export_spectra_array"],
+                spectra_file=sample_master_dict[list_run_number[0]][MasterDictKeys.spectra_file_name],
+                output_suffix=output_suffix,
+                bin_metadata=rebinned_payload["bin_metadata"],
+                uncertainty_model_label=uncertainty_model_label)
 
     else:
     
@@ -469,6 +546,7 @@ def normalization_with_list_of_full_path(
                 display(HTML(f"Normalization of run {_sample_run_number}"))
 
             _sample_data = sample_master_dict[_sample_run_number][MasterDictKeys.data]
+            sample_variance_input = np.asarray(_sample_data, dtype=np.float64)
 
             # get statistics of sample data
             logging_statistics_of_data(data=_sample_data, data_type=DataType.sample)
@@ -502,10 +580,49 @@ def normalization_with_list_of_full_path(
                 if verbose and (container_roi_file is not None):
                     display(HTML(f"Container roi file created: {container_roi_file}."))
 
+            sample_proton_charge = None
+            if normalized_by_proton_charge:
+                sample_proton_charge = sample_master_dict[_sample_run_number][MasterDictKeys.proton_charge]
+            _sample_variance = calculate_data_variance(
+                data=sample_variance_input,
+                shutter_counts=sample_master_dict[_sample_run_number].get(MasterDictKeys.shutter_counts),
+                use_experimental_uncertainties=experimental_uncertainties_flag,
+            )
+            if sample_proton_charge is not None:
+                _sample_variance = _sample_variance / (sample_proton_charge**2)
+
             logging.info(f"{_sample_data.shape = }")
             logging.info(f"{_sample_data.dtype = }")
             logging.info(f"{ob_data_combined.shape = }")
             logging.info(f"{ob_data_combined.dtype = }")
+
+            current_detector_delay_us = detector_delay_us
+            if current_detector_delay_us is None:
+                current_detector_delay_us = sample_master_dict[_sample_run_number][MasterDictKeys.detector_delay_us]
+                logging.info(
+                    f"detector_delay argument is None, using detector delay from sample run {_sample_run_number}: {current_detector_delay_us} us"
+                )
+
+            time_spectra = sample_master_dict[_sample_run_number][MasterDictKeys.list_spectra]
+            rebinned_payload = prepare_rebinned_payload(
+                current_sample_data=_sample_data,
+                current_sample_variance=_sample_variance,
+                current_time_spectra=time_spectra,
+                current_detector_delay_us=current_detector_delay_us,
+            )
+
+            _sample_data = rebinned_payload["sample_data"]
+            _sample_variance = rebinned_payload["sample_variance"]
+            ob_data_for_normalization = rebinned_payload["ob_data_combined"]
+            dc_data_for_normalization = rebinned_payload["dc_data_combined"]
+            ob_data_combined_for_spectrum = rebinned_payload["ob_data_combined_for_spectrum"]
+            ob_data_combined_variance_for_spectrum = rebinned_payload["ob_data_combined_variance_for_spectrum"]
+            dc_data_combined_for_spectrum = rebinned_payload["dc_data_combined_for_spectrum"]
+            dc_data_combined_variance_for_spectrum = rebinned_payload["dc_data_combined_variance_for_spectrum"]
+            time_spectra = rebinned_payload["tof_array"]
+            lambda_array = rebinned_payload["lambda_array"]
+            energy_array = rebinned_payload["energy_array"]
+            output_suffix = rebinned_payload["output_suffix"]
 
             # export sample data after correction if requested
             if export_corrected_stack_of_sample_data or export_corrected_integrated_sample_data:
@@ -516,20 +633,40 @@ def normalization_with_list_of_full_path(
                     _sample_run_number,
                     _sample_data,
                     spectra_file_name=sample_master_dict[_sample_run_number][MasterDictKeys.spectra_file_name],
-                    spectra_array=spectra_array,
+                    spectra_array=rebinned_payload["export_spectra_array"],
+                    output_suffix=output_suffix,
+                    bin_metadata=rebinned_payload["bin_metadata"],
                 )
 
-            _normalized_dict = perform_normalization(_sample_data, ob_data_combined, dc_data_combined)
+            first_ob_run_number = list(ob_master_dict.keys())[0]
+            if export_corrected_stack_of_ob_data or export_corrected_integrated_ob_data:
+                export_ob_images(
+                    ob_master_dict.keys(),
+                    output_folder,
+                    export_corrected_stack_of_ob_data,
+                    export_corrected_integrated_ob_data,
+                    ob_data_for_normalization,
+                    spectra_file_name=ob_master_dict[first_ob_run_number][MasterDictKeys.spectra_file_name],
+                    spectra_array=rebinned_payload["export_spectra_array"],
+                    output_suffix=output_suffix,
+                    bin_metadata=rebinned_payload["bin_metadata"],
+                )
+
+            _normalized_dict = perform_normalization(_sample_data, ob_data_for_normalization, dc_data_for_normalization)
             _normalized_data = _normalized_dict['normalized_data']
             _integrated_normalized_data = _normalized_dict['integrated_normalized_data']       
             integrated_normalized_data[_sample_run_number] = _integrated_normalized_data
             normalized_data[_sample_run_number] = _normalized_data
 
             _spectrum_normalized_data = perform_spectrum_normalization(roi=roi, 
-                                                                    sample_data=_sample_data, 
-                                                                    ob_data_combined_for_spectrum=ob_data_combined_for_spectrum, 
-                                                                    dc_data_combined=dc_data_combined,
-                                                                    dc_data_combined_for_spectrum=dc_data_combined_for_spectrum)
+                                                                    sample_data=_sample_data,
+                                                                    sample_variance=_sample_variance,
+                                                                    ob_data_combined_for_spectrum=ob_data_combined_for_spectrum,
+                                                                    ob_data_combined_variance_for_spectrum=ob_data_combined_variance_for_spectrum,
+                                                                    dc_data_combined=dc_data_for_normalization,
+                                                                    dc_data_combined_for_spectrum=dc_data_combined_for_spectrum,
+                                                                    dc_data_combined_variance=rebinned_payload["dc_data_combined_variance"],
+                                                                    dc_data_combined_variance_for_spectrum=dc_data_combined_variance_for_spectrum)
             spectrum_normalized_data[_sample_run_number] = _spectrum_normalized_data
 
             # normalized_data[_sample_run_number] = np.array(np.divide(_sample_data, ob_data_combined))
@@ -538,53 +675,7 @@ def normalization_with_list_of_full_path(
             logging.info(f"number of NaN in normalized data: {np.sum(np.isnan(normalized_data[_sample_run_number]))}")
             logging.info(f"number of inf in normalized data: {np.sum(np.isinf(normalized_data[_sample_run_number]))}")
 
-            if detector_delay_us is None:
-                detector_delay_us = sample_master_dict[_sample_run_number][MasterDictKeys.detector_delay_us]
-                logging.info(f"detector_delay argument is None, using detector delay from sample run {_sample_run_number}: {detector_delay_us} us")
-                
-            time_spectra = sample_master_dict[_sample_run_number][MasterDictKeys.list_spectra]
-
             dict_to_return.tof_array = time_spectra
-
-            if time_spectra is None:
-                logging.info("Time spectra is None, cannot convert to lambda or energy arrays")
-                lambda_array = None
-                energy_array = None
-            
-            else:
-
-                logging.info(f"We have a time_spectra!")
-                logging.info(f"time spectra shape: {time_spectra.shape}")
-                
-                if detector_delay_us is None:
-                    detector_delay_us = 0.0
-                    logging.info(f"detector delay is None, setting it to {detector_delay_us} us")
-
-                logging.info(f"we have a detector delay of {detector_delay_us} us")
-
-                lambda_array = convert_array_from_time_to_lambda(
-                    time_array=time_spectra,
-                    time_unit=TimeUnitOptions.s,
-                    distance_source_detector=distance_source_detector_m,
-                    distance_source_detector_unit=DistanceUnitOptions.m,
-                    detector_offset=detector_delay_us,
-                    detector_offset_unit=TimeUnitOptions.us,
-                    lambda_unit=DistanceUnitOptions.angstrom,
-                )
-                logging.info(f"Lambda array shape: {lambda_array.shape}")
-                logging.info(f"{lambda_array = }")
-
-                energy_array = convert_array_from_time_to_energy(
-                    time_array=time_spectra,
-                    time_unit=TimeUnitOptions.s,
-                    distance_source_detector=distance_source_detector_m,
-                    distance_source_detector_unit=DistanceUnitOptions.m,
-                    detector_offset=detector_delay_us,
-                    detector_offset_unit=TimeUnitOptions.us,
-                    energy_unit=EnergyUnitOptions.eV,
-                )
-                logging.info(f"Energy array shape: {energy_array.shape}")
-                logging.info(f"{energy_array = }")
 
             dict_to_return.lambda_array = lambda_array
             dict_to_return.energy_array = energy_array
@@ -592,12 +683,12 @@ def normalization_with_list_of_full_path(
             logging.info(f"Preview: {preview = }")
             if preview:
                 preview_normalized_data(_sample_data, 
-                                        ob_data_combined, 
-                                        dc_data_combined, 
+                                        ob_data_for_normalization, 
+                                        dc_data_for_normalization, 
                                         normalized_data, 
                                         lambda_array,
                                         energy_array, 
-                                        detector_delay_us, 
+                                        current_detector_delay_us, 
                                         _sample_run_number,
                                         combine_samples,
                                         _spectrum_normalized_data,
@@ -612,14 +703,18 @@ def normalization_with_list_of_full_path(
                     normalized_data=normalized_data, 
                     integrated_normalized_data=integrated_normalized_data,
                     _spectrum_normalized_data=_spectrum_normalized_data,
+                    tof_array=time_spectra,
                     lambda_array=lambda_array, 
                     energy_array=energy_array, 
                     output_folder=output_folder, 
                     export_corrected_stack_of_normalized_data=export_corrected_stack_of_normalized_data,
                     export_corrected_integrated_normalized_data=export_corrected_integrated_normalized_data,
                     roi=roi,
-                    spectra_array=spectra_array,
-                    spectra_file=sample_master_dict[_sample_run_number][MasterDictKeys.spectra_file_name])
+                    spectra_array=rebinned_payload["export_spectra_array"],
+                    spectra_file=sample_master_dict[_sample_run_number][MasterDictKeys.spectra_file_name],
+                    output_suffix=output_suffix,
+                    bin_metadata=rebinned_payload["bin_metadata"],
+                    uncertainty_model_label=uncertainty_model_label)
           
     dict_to_return.data = normalized_data
 
