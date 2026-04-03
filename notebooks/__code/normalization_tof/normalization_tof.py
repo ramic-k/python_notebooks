@@ -85,7 +85,7 @@ class NormalizationTof:
     
     # container
     container_roi = None # container only ROI
-    default_roi = Roi(left=50, top=50, width=200, height=200)
+    default_roi = Roi(left=156, top=156, width=200, height=200)
     default_container_roi = Roi(left=150, top=150, width=40, height=40)
     we_need_to_automatically_save_the_container_roi = False
     rect_container = None
@@ -1533,23 +1533,41 @@ class NormalizationTof:
                     )
 
                 figure.update_layout(
-                    title=(
-                        f"Preview of {rebin_mode} boundaries over simplified transmission<br>"
-                        f"<sup>{sample_source_label} vs {ob_source_label} | {preview_scaling_label} | "
-                        f"active bins: {len(active_bin_indices)}</sup>"
+                    title=dict(
+                        text=(
+                            f"Preview of {rebin_mode} boundaries over simplified transmission<br>"
+                            f"<sup>{sample_source_label} vs {ob_source_label} | {preview_scaling_label} | "
+                            f"active bins: {len(active_bin_indices)}</sup>"
+                        ),
+                        x=0.02,
+                        xanchor="left",
+                        y=0.98,
+                        yanchor="top",
+                        pad=dict(t=0, b=18),
                     ),
                     xaxis_title=x_axis_label,
                     yaxis_title="Transmission (a.u.)",
                     yaxis_type="linear",
                     width=1000,
                     height=500,
-                    margin=dict(t=120),
+                    margin=dict(t=205),
                     hovermode="x unified",
                     showlegend=True,
                     shapes=shapes,
                     plot_bgcolor="white",
+                    annotations=[
+                        dict(
+                            text="Energy (eV)",
+                            x=0.5,
+                            xref="paper",
+                            y=1.22,
+                            yref="paper",
+                            showarrow=False,
+                            font=dict(size=14, color="black"),
+                        )
+                    ],
                     xaxis2=dict(
-                        title="Energy (eV)",
+                        title="",
                         overlaying="x",
                         side="top",
                         anchor="y",
@@ -1558,6 +1576,7 @@ class NormalizationTof:
                         ticktext=energy_tick_labels,
                         showgrid=False,
                         tickangle=0,
+                        tickfont=dict(size=11),
                         showline=True,
                         linecolor="black",
                         linewidth=1,
@@ -1597,7 +1616,7 @@ class NormalizationTof:
         display(HTML("<span style='font-size: 16px; color:red'>Normalization of full spectrum of ROI</span>"))
         display(HTML("<span style='font-size: 12px;'>If checked, normalization will be done as follows. After selecting a region of interest (ROI), for each image, the total counts of that region of the sample will be divided by the total" \
         " counts of the same region of the OB. This will produce a profile of this normalization value for each image.</span>"))
-        self.full_spectrum_roi_flag = widgets.Checkbox(description="Work on full spectrum of ROI", value=False)
+        self.full_spectrum_roi_flag = widgets.Checkbox(description="Work on full spectrum of ROI", value=True)
         display(self.full_spectrum_roi_flag)
         display(HTML("<hr>"))
 
@@ -1720,7 +1739,7 @@ class NormalizationTof:
         )
         self.rebin_full_bins_only_ui = widgets.Checkbox(
             description="Full bins only",
-            value=False,
+            value=True,
             disabled=True,
             layout=widgets.Layout(width="220px"),
         )
@@ -1753,7 +1772,7 @@ class NormalizationTof:
         self.rebin_custom_scale_ui.observe(self._on_custom_schedule_scale_change, names="value")
 
         self.rebin_custom_schedule_ui = widgets.Textarea(
-            value="2000, 10\n5000, 20\n, 50",
+            value="560, 70\n2700, 60\n5500, 50\n, 40",
             description="segments:",
             disabled=True,
             layout=widgets.Layout(width="520px", height="110px"),
