@@ -367,19 +367,19 @@ def _normalize_custom_schedule(rebin_custom_schedule: list = None) -> list[dict]
     normalized_schedule = []
     for segment_index, segment in enumerate(rebin_custom_schedule):
         if isinstance(segment, dict):
-            end_energy = segment.get("end_energy_eV")
+            end_value = segment.get("end_value")
             step_value = segment.get("step")
         else:
             if len(segment) != 2:
                 raise ValueError(
-                    f"Invalid custom segment at index {segment_index}: expected (end_energy_eV, step)."
+                    f"Invalid custom segment at index {segment_index}: expected (end_value, step)."
                 )
-            end_energy, step_value = segment
+            end_value, step_value = segment
 
-        if end_energy in ["", None]:
-            normalized_end_energy = None
+        if end_value in ["", None]:
+            normalized_end_value = None
         else:
-            normalized_end_energy = float(end_energy)
+            normalized_end_value = float(end_value)
 
         normalized_step_value = float(step_value)
         if normalized_step_value <= 0:
@@ -387,50 +387,25 @@ def _normalize_custom_schedule(rebin_custom_schedule: list = None) -> list[dict]
 
         normalized_schedule.append(
             {
-                "end_energy_eV": normalized_end_energy,
+                "end_value": normalized_end_value,
                 "step": normalized_step_value,
             }
         )
 
-    none_indices = [index for index, segment in enumerate(normalized_schedule) if segment["end_energy_eV"] is None]
+    none_indices = [index for index, segment in enumerate(normalized_schedule) if segment["end_value"] is None]
     if len(none_indices) > 1:
         raise ValueError("Custom schedule can contain at most one open-ended segment.")
     if none_indices and none_indices[0] != len(normalized_schedule) - 1:
         raise ValueError("The open-ended custom schedule segment must be the final line.")
 
-    specified_end_energies = [
-        segment["end_energy_eV"] for segment in normalized_schedule if segment["end_energy_eV"] is not None
-    ]
+    specified_end_values = [segment["end_value"] for segment in normalized_schedule if segment["end_value"] is not None]
     if any(
-        specified_end_energies[index] >= specified_end_energies[index + 1]
-        for index in range(len(specified_end_energies) - 1)
+        specified_end_values[index] >= specified_end_values[index + 1]
+        for index in range(len(specified_end_values) - 1)
     ):
-        raise ValueError("Custom schedule energy boundaries must be provided in strictly increasing order.")
+        raise ValueError("Custom schedule boundaries must be provided in strictly increasing order.")
 
     return normalized_schedule
-
-
-def _interpolate_axis_value_from_energy(
-    energy_array: np.ndarray = None,
-    axis_values: np.ndarray = None,
-    target_energy_eV: float = None,
-) -> float:
-    energy_array = np.asarray(energy_array, dtype=np.float64)
-    axis_values = np.asarray(axis_values, dtype=np.float64)
-
-    sort_index = np.argsort(energy_array)
-    sorted_energy = energy_array[sort_index]
-    sorted_axis = axis_values[sort_index]
-    unique_energy, unique_index = np.unique(sorted_energy, return_index=True)
-    unique_axis = sorted_axis[unique_index]
-
-    if target_energy_eV < unique_energy[0] or target_energy_eV > unique_energy[-1]:
-        raise ValueError(
-            f"Requested custom schedule boundary {target_energy_eV} eV is outside the data range "
-            f"[{unique_energy[0]}, {unique_energy[-1]}] eV."
-        )
-
-    return float(np.interp(target_energy_eV, unique_energy, unique_axis))
 
 
 def _create_edges_for_custom_segment(
@@ -457,7 +432,6 @@ def _create_edges_for_custom_segment(
 def _build_custom_schedule_bin_edges(
     tof_array: np.ndarray = None,
     lambda_array: np.ndarray = None,
-    energy_array: np.ndarray = None,
     rebin_custom_basis: str = None,
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
@@ -472,88 +446,59 @@ def _build_custom_schedule_bin_edges(
 
     if rebin_custom_basis == RebinCustomBasis.tof:
         axis_values = _validate_rebin_axis(tof_array, RebinMode.custom_schedule)
+        axis_label = "microseconds"
     elif rebin_custom_basis == RebinCustomBasis.lambda_:
         axis_values = _validate_rebin_axis(lambda_array, RebinMode.custom_schedule)
+        axis_label = "Angstroms"
     elif rebin_custom_basis == RebinCustomBasis.lambda_squared:
         axis_values = _validate_rebin_axis(np.square(lambda_array), RebinMode.custom_schedule)
         if rebin_custom_scale != RebinCustomScale.linear:
             raise ValueError("lambda^2 custom schedules only support linear steps.")
+        axis_label = "Angstroms^2"
     else:
         raise ValueError(f"Unsupported custom schedule basis: {rebin_custom_basis}")
 
     axis_start = float(axis_values[0])
     axis_end = float(axis_values[-1])
-    data_energy_min = float(np.min(energy_array))
-    data_energy_max = float(np.max(energy_array))
-
-    def _energy_to_axis(energy_value: float) -> float:
-        if np.isclose(energy_value, data_energy_max):
-            return axis_start
-        if np.isclose(energy_value, data_energy_min):
-            return axis_end
-        return _interpolate_axis_value_from_energy(
-            energy_array=energy_array,
-            axis_values=axis_values,
-            target_energy_eV=energy_value,
-        )
-
-    interval_specs = []
-    current_low_energy = data_energy_min
-    for segment in normalized_schedule:
-        end_energy = segment["end_energy_eV"]
-        interval_high_energy = data_energy_max if end_energy is None else float(end_energy)
-        if interval_high_energy < data_energy_min or interval_high_energy > data_energy_max:
-            raise ValueError(
-                f"Custom schedule boundary {interval_high_energy} eV is outside the data range "
-                f"[{data_energy_min}, {data_energy_max}] eV."
-            )
-        if interval_high_energy <= current_low_energy:
-            raise ValueError("Custom schedule boundaries must increase from low energy to high energy.")
-
-        interval_specs.append(
-            {
-                "low_energy_eV": current_low_energy,
-                "high_energy_eV": interval_high_energy,
-                "step": segment["step"],
-            }
-        )
-        current_low_energy = interval_high_energy
-        if np.isclose(current_low_energy, data_energy_max):
-            break
-
-    if current_low_energy < data_energy_max:
-        interval_specs.append(
-            {
-                "low_energy_eV": current_low_energy,
-                "high_energy_eV": data_energy_max,
-                "step": normalized_schedule[-1]["step"],
-            }
-        )
 
     custom_bin_edges = [axis_start]
     current_start = axis_start
-    for interval_spec in reversed(interval_specs):
-        segment_end = _energy_to_axis(interval_spec["low_energy_eV"])
+    for segment in normalized_schedule:
+        end_value = segment["end_value"]
+        segment_end = axis_end if end_value is None else float(end_value)
+        if (rebin_custom_basis == RebinCustomBasis.tof) and (end_value is not None):
+            segment_end *= 1e-6
+
+        if segment_end < axis_start or segment_end > axis_end:
+            display_start = axis_start * 1e6 if rebin_custom_basis == RebinCustomBasis.tof else axis_start
+            display_end = axis_end * 1e6 if rebin_custom_basis == RebinCustomBasis.tof else axis_end
+            requested_end = float(end_value) if end_value is not None else display_end
+            raise ValueError(
+                f"Custom schedule boundary {requested_end} is outside the data range "
+                f"[{display_start}, {display_end}] {axis_label}."
+            )
+
         if segment_end <= current_start:
-            continue
+            raise ValueError("Custom schedule boundaries must increase from the minimum axis upward.")
+
         segment_edges = _create_edges_for_custom_segment(
             start_value=current_start,
             end_value=segment_end,
-            step_value=_convert_custom_step(interval_spec["step"]),
+            step_value=_convert_custom_step(segment["step"]),
             rebin_custom_scale=rebin_custom_scale,
             full_bins_only=rebin_full_bins_only,
         )
         custom_bin_edges.extend(segment_edges[1:])
         current_start = custom_bin_edges[-1]
 
-        if current_start >= axis_end:
+        if current_start >= axis_end or end_value is None:
             break
 
     if current_start < axis_end:
         segment_edges = _create_edges_for_custom_segment(
             start_value=current_start,
             end_value=axis_end,
-            step_value=_convert_custom_step(normalized_schedule[0]["step"]),
+            step_value=_convert_custom_step(normalized_schedule[-1]["step"]),
             rebin_custom_scale=rebin_custom_scale,
             full_bins_only=rebin_full_bins_only,
         )
@@ -613,7 +558,6 @@ def build_rebin_bin_groups(
         axis_values, bin_edges = _build_custom_schedule_bin_edges(
             tof_array=tof_array,
             lambda_array=lambda_array,
-            energy_array=energy_array,
             rebin_custom_basis=rebin_custom_basis,
             rebin_custom_scale=rebin_custom_scale,
             rebin_custom_schedule=rebin_custom_schedule,

@@ -42,7 +42,7 @@ class RebinMode:
     log_tof = "log_tof(delta_tof_over_tof)"
     log_lambda = "log_lambda(delta_lambda_over_lambda)"
     inverse_log_lambda = "inverse_log_lambda(delta_lambda_squared_A2)"
-    custom_schedule = "custom_schedule(energy_segments)"
+    custom_schedule = "custom_schedule(axis_segments)"
 
 
 class RebinCustomBasis:

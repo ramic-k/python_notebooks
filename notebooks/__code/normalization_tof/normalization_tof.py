@@ -1,4 +1,5 @@
 import glob
+import h5py
 import logging
 import logging as notebook_logging
 import os
@@ -9,7 +10,7 @@ import pandas as pd
 import ipywidgets as widgets
 import plotly.express as px
 
-from IPython.display import HTML, display
+from IPython.display import HTML, clear_output, display
 from ipywidgets import interactive
 from PIL import Image
 
@@ -36,6 +37,11 @@ from __code.normalization_tof.normalization_for_timepix1_timepix3 import (
     # normalization,
     normalization_with_list_of_full_path,
     retrieve_list_of_tif,
+)
+from __code.normalization_tof.utilities import (
+    build_rebin_bin_groups,
+    calculate_time_lambda_energy_arrays,
+    get_detector_offset_from_nexus,
 )
 
 
@@ -982,6 +988,8 @@ class NormalizationTof:
         self.rebin_custom_basis_ui.disabled = custom_schedule_disabled
         self.rebin_custom_scale_ui.disabled = custom_schedule_disabled
         self.rebin_custom_schedule_ui.disabled = custom_schedule_disabled
+        if hasattr(self, "preview_rebin_boundaries_button"):
+            self.preview_rebin_boundaries_button.disabled = selected_mode == RebinMode.none
         self._update_custom_schedule_help()
 
     def _get_custom_schedule_scale_options(self):
@@ -1004,18 +1012,24 @@ class NormalizationTof:
         scale = self.rebin_custom_scale_ui.value
 
         if basis == RebinCustomBasis.tof:
+            end_label = "end_tof_us"
             step_label = "delta_us" if scale == RebinCustomScale.linear else "dt/t"
+            boundary_help = "TOF boundaries must be listed in strictly increasing order, from the minimum TOF upward."
         elif basis == RebinCustomBasis.lambda_:
+            end_label = "end_lambda_A"
             step_label = "delta_A" if scale == RebinCustomScale.linear else "dl/l"
+            boundary_help = "Lambda boundaries must be listed in strictly increasing order, from the minimum lambda upward."
         else:
+            end_label = "end_lambda2_A2"
             step_label = "delta_(A^2)"
+            boundary_help = "Lambda^2 boundaries must be listed in strictly increasing order, from the minimum lambda^2 upward."
 
         self.rebin_custom_schedule_help_ui.value = (
             "<span style='font-size: 12px;'>"
             "Custom schedule format: one segment per line as "
-            f"<code>end_energy_eV, {step_label}</code>. "
-            "Energy boundaries must be listed in strictly increasing order, from the lowest energy upward. "
-            "Leave the final energy blank to continue to the maximum energy in the data."
+            f"<code>{end_label}, {step_label}</code>. "
+            f"{boundary_help} "
+            "Leave the final boundary blank to continue to the maximum value in the data."
             "</span>"
         )
 
@@ -1040,12 +1054,12 @@ class NormalizationTof:
             parts = [part.strip() for part in line_without_comment.split(",")]
             if len(parts) != 2:
                 raise ValueError(
-                    f"Invalid custom schedule line {line_index}: expected 'end_energy_eV, step'."
+                    f"Invalid custom schedule line {line_index}: expected 'end_value, step'."
                 )
 
-            end_energy_raw, step_raw = parts
+            end_value_raw, step_raw = parts
             try:
-                end_energy_eV = None if end_energy_raw == "" else float(end_energy_raw)
+                end_value = None if end_value_raw == "" else float(end_value_raw)
                 step_value = float(step_raw)
             except ValueError as exc:
                 raise ValueError(
@@ -1054,7 +1068,7 @@ class NormalizationTof:
 
             parsed_schedule.append(
                 {
-                    "end_energy_eV": end_energy_eV,
+                    "end_value": end_value,
                     "step": step_value,
                 }
             )
@@ -1063,6 +1077,501 @@ class NormalizationTof:
             raise ValueError("Custom schedule requires at least one non-empty segment line.")
 
         return parsed_schedule
+
+    @staticmethod
+    def _load_spectra_file_for_preview(spectra_file: str = None) -> tuple[np.ndarray, np.ndarray]:
+        if spectra_file is None:
+            return None, None
+
+        pd_spectra = pd.read_csv(spectra_file, sep=",", header=0)
+        if "shutter_time" in pd_spectra.columns:
+            tof_array = np.asarray(pd_spectra["shutter_time"].values, dtype=np.float64)
+        else:
+            tof_array = np.asarray(pd_spectra.iloc[:, 0].values, dtype=np.float64)
+
+        counts_array = None
+        if "counts" in pd_spectra.columns:
+            counts_array = np.asarray(pd_spectra["counts"].values, dtype=np.float64)
+        elif pd_spectra.shape[1] >= 2:
+            counts_array = np.asarray(pd_spectra.iloc[:, 1].values, dtype=np.float64)
+
+        return tof_array, counts_array
+
+    @staticmethod
+    def _load_tof_array_only_for_preview(spectra_file: str = None) -> np.ndarray:
+        tof_array, _ = NormalizationTof._load_spectra_file_for_preview(spectra_file)
+        return tof_array
+
+    @staticmethod
+    def _compute_total_counts_from_tiff_stack(full_path: str = None) -> np.ndarray:
+        list_tiff = retrieve_list_of_tif(full_path)
+        if len(list_tiff) == 0:
+            return None
+
+        total_counts = np.empty(len(list_tiff), dtype=np.float64)
+        for index, tiff_file in enumerate(list_tiff):
+            total_counts[index] = np.sum(np.asarray(Image.open(tiff_file), dtype=np.float64))
+        return total_counts
+
+    @staticmethod
+    def _get_proton_charge_from_nexus_for_preview(nexus_full_path: str = None) -> float:
+        if nexus_full_path is None or not os.path.exists(nexus_full_path):
+            return None
+
+        try:
+            with h5py.File(nexus_full_path, "r") as hdf5_data:
+                return float(hdf5_data["entry"]["proton_charge"][0] / 1e12)
+        except (KeyError, OSError, TypeError, ValueError):
+            return None
+
+    def _get_preview_run_axis(self, dict_runs=None) -> np.ndarray:
+        if not dict_runs:
+            raise ValueError("No run selected for preview.")
+
+        first_run = list(dict_runs.keys())[0]
+        spectra_file_found, spectra_file_name = NormalizationTof._is_spectra_file_found_and_list(first_run)
+        if spectra_file_found:
+            tof_array = self._load_tof_array_only_for_preview(spectra_file_name)
+        else:
+            if self.spectra_array is None:
+                raise ValueError(
+                    "No spectra axis is available yet. Load a spectra file or create the manual spectra array first."
+                )
+            tof_array = np.asarray(self.spectra_array, dtype=np.float64)
+
+        if tof_array is None or len(tof_array) == 0:
+            raise ValueError("Preview TOF axis is empty.")
+        return np.asarray(tof_array, dtype=np.float64)
+
+    def _get_preview_signal_for_run(self, dict_runs=None, run_role: str = "sample") -> tuple[np.ndarray, np.ndarray, float, str]:
+        if not dict_runs:
+            raise ValueError(f"Select at least one {run_role} run before previewing rebin boundaries.")
+
+        first_run = list(dict_runs.keys())[0]
+        spectra_file_found, spectra_file_name = NormalizationTof._is_spectra_file_found_and_list(first_run)
+
+        if spectra_file_found:
+            tof_array, counts_array = self._load_spectra_file_for_preview(spectra_file_name)
+            source_label = f"first {run_role} spectra counts: {os.path.basename(first_run)}"
+        else:
+            if self.spectra_array is None:
+                raise ValueError(
+                    "No spectra axis is available yet. Load a spectra file or create the manual spectra array first."
+                )
+            tof_array = np.asarray(self.spectra_array, dtype=np.float64)
+            counts_array = self._compute_total_counts_from_tiff_stack(first_run)
+            source_label = (
+                f"first {run_role} full-image counts from TIFF stack: {os.path.basename(first_run)}"
+            )
+
+        if tof_array is None or counts_array is None:
+            raise ValueError(f"Unable to build a preview signal from the first {run_role} run.")
+
+        min_length = min(len(tof_array), len(counts_array))
+        if min_length == 0:
+            raise ValueError("Preview signal is empty.")
+
+        proton_charge = self._get_proton_charge_from_nexus_for_preview(
+            dict_runs.get(first_run, {}).get("nexus")
+        )
+
+        return (
+            np.asarray(tof_array[:min_length], dtype=np.float64),
+            np.asarray(counts_array[:min_length], dtype=np.float64),
+            proton_charge,
+            source_label,
+        )
+
+    def _get_preview_detector_delay_us(self) -> float:
+        if self.instrument == "SNAP":
+            return self.detector_offset_us.value
+
+        if not self.dict_sample:
+            return 0.0
+
+        first_sample_run = list(self.dict_sample.keys())[0]
+        nexus_full_path = self.dict_sample.get(first_sample_run, {}).get("nexus")
+        if nexus_full_path and os.path.exists(nexus_full_path):
+            detector_delay_us = get_detector_offset_from_nexus(nexus_full_path)
+            if detector_delay_us is not None:
+                return float(detector_delay_us)
+
+        return 0.0
+
+    def _build_current_rebin_groups_for_preview(self, max_frames: int = None):
+        rebin_mode = self.rebin_mode_ui.value
+        if rebin_mode == RebinMode.none:
+            return None, None, None, None, None
+
+        tof_array = self._get_preview_run_axis(self.dict_sample)
+        if max_frames is not None:
+            tof_array = np.asarray(tof_array[:max_frames], dtype=np.float64)
+        detector_delay_us = self._get_preview_detector_delay_us()
+        _, lambda_array, energy_array = calculate_time_lambda_energy_arrays(
+            time_spectra=tof_array,
+            distance_source_detector_m=self.distance_source_detector.value,
+            detector_delay_us=detector_delay_us,
+        )
+
+        rebin_custom_schedule = None
+        if rebin_mode == RebinMode.custom_schedule:
+            rebin_custom_schedule = self._parse_custom_rebin_schedule()
+
+        bin_groups, bin_edges = build_rebin_bin_groups(
+            rebin_mode=rebin_mode,
+            tof_array=tof_array,
+            lambda_array=lambda_array,
+            energy_array=energy_array,
+            rebin_delta_tof_us=self.rebin_delta_tof_us_ui.value if rebin_mode == RebinMode.linear_tof else None,
+            rebin_delta_lambda_a=self.rebin_delta_lambda_a_ui.value if rebin_mode == RebinMode.linear_lambda else None,
+            rebin_delta_tof_over_tof=(
+                self.rebin_delta_tof_over_tof_ui.value if rebin_mode == RebinMode.log_tof else None
+            ),
+            rebin_delta_lambda_over_lambda=(
+                self.rebin_delta_lambda_over_lambda_ui.value if rebin_mode == RebinMode.log_lambda else None
+            ),
+            rebin_delta_lambda_squared_a2=(
+                self.rebin_delta_lambda_squared_a2_ui.value if rebin_mode == RebinMode.inverse_log_lambda else None
+            ),
+            rebin_custom_basis=self.rebin_custom_basis_ui.value if rebin_mode == RebinMode.custom_schedule else None,
+            rebin_custom_scale=self.rebin_custom_scale_ui.value if rebin_mode == RebinMode.custom_schedule else None,
+            rebin_custom_schedule=rebin_custom_schedule,
+            rebin_full_bins_only=self.rebin_full_bins_only_ui.value,
+        )
+        return tof_array, lambda_array, energy_array, bin_groups, bin_edges
+
+    def _update_rebin_bin_count_display(self, _change=None):
+        if not hasattr(self, "rebin_bin_count_ui"):
+            return
+
+        try:
+            rebin_mode = self.rebin_mode_ui.value
+            if rebin_mode == RebinMode.none:
+                original_tof_array = self._get_preview_run_axis(self.dict_sample)
+                self.rebin_bin_count_ui.value = (
+                    f"<span style='font-size: 12px; color: #2b6;'>"
+                    f"Active bins with current settings: {len(original_tof_array)} "
+                    f"(no rebin, original frame count)</span>"
+                )
+                return
+
+            _, _, _, bin_groups, _ = self._build_current_rebin_groups_for_preview()
+            active_bin_count = np.sum([len(_group) > 0 for _group in bin_groups])
+            self.rebin_bin_count_ui.value = (
+                f"<span style='font-size: 12px; color: #2b6;'>"
+                f"Active bins with current settings: {int(active_bin_count)}</span>"
+            )
+        except Exception as exc:
+            self.rebin_bin_count_ui.value = (
+                f"<span style='font-size: 12px; color: #b33;'>"
+                f"Active bin count unavailable: {exc}</span>"
+            )
+
+    def _observe_rebin_preview_controls(self):
+        widgets_to_observe = [
+            self.rebin_mode_ui,
+            self.rebin_delta_tof_us_ui,
+            self.rebin_delta_lambda_a_ui,
+            self.rebin_delta_tof_over_tof_ui,
+            self.rebin_delta_lambda_over_lambda_ui,
+            self.rebin_delta_lambda_squared_a2_ui,
+            self.rebin_full_bins_only_ui,
+            self.rebin_custom_basis_ui,
+            self.rebin_custom_scale_ui,
+            self.rebin_custom_schedule_ui,
+        ]
+        if hasattr(self, "distance_source_detector"):
+            widgets_to_observe.append(self.distance_source_detector)
+        for _widget in widgets_to_observe:
+            _widget.observe(self._update_rebin_bin_count_display, names="value")
+
+    def _get_rebin_preview_axis(self, tof_array=None, lambda_array=None, rebin_mode: str = None):
+        if rebin_mode in [RebinMode.linear_tof, RebinMode.log_tof]:
+            return tof_array * 1e6, "TOF (micros)"
+        if rebin_mode in [RebinMode.linear_lambda, RebinMode.log_lambda]:
+            return lambda_array, "Lambda (Angstroms)"
+        if rebin_mode == RebinMode.inverse_log_lambda:
+            return np.square(lambda_array), "Lambda^2 (Angstroms^2)"
+        if rebin_mode == RebinMode.custom_schedule:
+            if self.rebin_custom_basis_ui.value == RebinCustomBasis.tof:
+                return tof_array * 1e6, "TOF (micros)"
+            if self.rebin_custom_basis_ui.value == RebinCustomBasis.lambda_:
+                return lambda_array, "Lambda (Angstroms)"
+            return np.square(lambda_array), "Lambda^2 (Angstroms^2)"
+        return tof_array * 1e6, "TOF (micros)"
+
+    def _get_rebin_preview_edge_display_array(self, bin_edges=None, rebin_mode: str = None) -> np.ndarray:
+        if bin_edges is None:
+            return None
+        if rebin_mode in [RebinMode.linear_tof, RebinMode.log_tof]:
+            return np.asarray(bin_edges, dtype=np.float64) * 1e6
+        if rebin_mode == RebinMode.custom_schedule and self.rebin_custom_basis_ui.value == RebinCustomBasis.tof:
+            return np.asarray(bin_edges, dtype=np.float64) * 1e6
+        return np.asarray(bin_edges, dtype=np.float64)
+
+    @staticmethod
+    def _format_preview_energy_tick_label(energy_value_eV: float) -> str:
+        if not np.isfinite(energy_value_eV):
+            return ""
+        if energy_value_eV >= 1:
+            return f"{energy_value_eV:.3g}"
+        if energy_value_eV >= 0.1:
+            return f"{energy_value_eV:.3f}"
+        if energy_value_eV >= 0.01:
+            return f"{energy_value_eV:.4f}"
+        return f"{energy_value_eV:.2e}"
+
+    def _get_preview_energy_axis_ticks(
+        self,
+        display_x_array: np.ndarray = None,
+        energy_array: np.ndarray = None,
+        max_ticks: int = 7,
+    ) -> tuple[np.ndarray, list[str]]:
+        if display_x_array is None or energy_array is None:
+            return None, None
+
+        display_x_array = np.asarray(display_x_array, dtype=np.float64)
+        energy_array = np.asarray(energy_array, dtype=np.float64)
+        finite_mask = np.isfinite(display_x_array) & np.isfinite(energy_array)
+        if not np.any(finite_mask):
+            return None, None
+
+        valid_indices = np.flatnonzero(finite_mask)
+        n_ticks = min(max_ticks, len(valid_indices))
+        tick_indices = np.unique(np.linspace(0, len(valid_indices) - 1, num=n_ticks, dtype=int))
+        selected_indices = valid_indices[tick_indices]
+        tickvals = display_x_array[selected_indices]
+        ticktext = [
+            self._format_preview_energy_tick_label(_energy_value)
+            for _energy_value in energy_array[selected_indices]
+        ]
+        return tickvals, ticktext
+
+    def preview_rebin_boundaries_clicked(self, _button):
+        with self.rebin_preview_output_ui:
+            clear_output(wait=True)
+            try:
+                rebin_mode = self.rebin_mode_ui.value
+                if rebin_mode == RebinMode.none:
+                    display(HTML("<span style='color:blue'>Select a rebin mode to preview its boundaries.</span>"))
+                    return
+
+                sample_tof_array, sample_counts_array, sample_proton_charge, sample_source_label = (
+                    self._get_preview_signal_for_run(self.dict_sample, run_role="sample")
+                )
+                ob_tof_array, ob_counts_array, ob_proton_charge, ob_source_label = (
+                    self._get_preview_signal_for_run(self.dict_ob, run_role="OB")
+                )
+                min_length = min(len(sample_tof_array), len(ob_tof_array), len(sample_counts_array), len(ob_counts_array))
+                if min_length == 0:
+                    raise ValueError("Unable to build a preview transmission signal.")
+
+                tof_array = np.asarray(sample_tof_array[:min_length], dtype=np.float64)
+                sample_counts_array = np.asarray(sample_counts_array[:min_length], dtype=np.float64)
+                ob_counts_array = np.asarray(ob_counts_array[:min_length], dtype=np.float64)
+
+                if self.proton_charge_flag.value and (sample_proton_charge is not None) and (ob_proton_charge is not None):
+                    sample_preview_signal = sample_counts_array / sample_proton_charge
+                    ob_preview_signal = ob_counts_array / ob_proton_charge
+                    preview_scaling_label = "proton-charge scaled sample/OB transmission preview"
+                else:
+                    sample_preview_signal = sample_counts_array
+                    ob_preview_signal = ob_counts_array
+                    preview_scaling_label = "raw sample/OB transmission preview"
+
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    preview_transmission = np.divide(
+                        sample_preview_signal,
+                        ob_preview_signal,
+                        out=np.full_like(sample_preview_signal, np.nan, dtype=np.float64),
+                        where=np.abs(ob_preview_signal) > 0,
+                    )
+
+                _, lambda_array, energy_array, bin_groups, bin_edges = self._build_current_rebin_groups_for_preview(
+                    max_frames=min_length
+                )
+
+                display_x_array, x_axis_label = self._get_rebin_preview_axis(
+                    tof_array=tof_array,
+                    lambda_array=lambda_array,
+                    rebin_mode=rebin_mode,
+                )
+                energy_tick_values, energy_tick_labels = self._get_preview_energy_axis_ticks(
+                    display_x_array=display_x_array,
+                    energy_array=energy_array,
+                )
+                display_edge_array = self._get_rebin_preview_edge_display_array(
+                    bin_edges=bin_edges,
+                    rebin_mode=rebin_mode,
+                )
+
+                active_bin_indices = [index for index, group in enumerate(bin_groups) if len(group) > 0]
+                if not active_bin_indices:
+                    raise ValueError("No active bins were created with the current rebin settings.")
+
+                import plotly.graph_objects as go
+
+                figure = go.Figure()
+                figure.add_trace(
+                    go.Scatter(
+                        x=display_x_array,
+                        y=np.asarray(preview_transmission, dtype=np.float64),
+                        mode="lines",
+                        line=dict(color="black", width=1.2),
+                        name="original transmission",
+                        customdata=np.asarray(energy_array, dtype=np.float64).reshape(-1, 1),
+                        hovertemplate=(
+                            f"{x_axis_label}: %{{x}}<br>"
+                            "Energy (eV): %{customdata[0]}<br>"
+                            "transmission: %{y}<extra></extra>"
+                        ),
+                    )
+                )
+
+                rebinned_x_array = []
+                rebinned_energy_array = []
+                rebinned_transmission_array = []
+                rebinned_sample_total_array = []
+                rebinned_ob_total_array = []
+                rebinned_n_frames_array = []
+                for active_bin_index in active_bin_indices:
+                    frame_group = np.asarray(bin_groups[active_bin_index], dtype=int)
+                    rebinned_x_array.append(np.mean(display_x_array[frame_group]))
+                    rebinned_energy_array.append(np.mean(energy_array[frame_group]))
+                    rebinned_sample_total = np.sum(sample_preview_signal[frame_group], dtype=np.float64)
+                    rebinned_ob_total = np.sum(ob_preview_signal[frame_group], dtype=np.float64)
+                    if np.abs(rebinned_ob_total) > 0:
+                        rebinned_transmission = rebinned_sample_total / rebinned_ob_total
+                    else:
+                        rebinned_transmission = np.nan
+                    rebinned_transmission_array.append(rebinned_transmission)
+                    rebinned_sample_total_array.append(rebinned_sample_total)
+                    rebinned_ob_total_array.append(rebinned_ob_total)
+                    rebinned_n_frames_array.append(len(frame_group))
+
+                figure.add_trace(
+                    go.Scatter(
+                        x=np.asarray(rebinned_x_array, dtype=np.float64),
+                        y=np.asarray(rebinned_transmission_array, dtype=np.float64),
+                        mode="lines+markers",
+                        line=dict(color="darkorange", width=2.0),
+                        marker=dict(color="darkorange", size=5),
+                        name="rebinned transmission",
+                        customdata=np.column_stack(
+                            [
+                                np.asarray(rebinned_energy_array, dtype=np.float64),
+                                np.asarray(rebinned_sample_total_array, dtype=np.float64),
+                                np.asarray(rebinned_ob_total_array, dtype=np.float64),
+                                np.asarray(rebinned_n_frames_array, dtype=np.int64),
+                            ]
+                        ),
+                        hovertemplate=(
+                            f"{x_axis_label}: %{{x}}<br>"
+                            "Energy (eV): %{customdata[0]}<br>"
+                            "rebinned transmission: %{y}<br>"
+                            "sample sum in bin: %{customdata[1]}<br>"
+                            "OB sum in bin: %{customdata[2]}<br>"
+                            "frames in bin: %{customdata[3]}<extra></extra>"
+                        ),
+                    )
+                )
+
+                if energy_tick_values is not None and energy_tick_labels is not None:
+                    figure.add_trace(
+                        go.Scatter(
+                            x=np.asarray(energy_tick_values, dtype=np.float64),
+                            y=np.zeros(len(energy_tick_values), dtype=np.float64),
+                            mode="markers",
+                            marker=dict(opacity=0, size=1),
+                            hoverinfo="skip",
+                            showlegend=False,
+                            xaxis="x2",
+                            yaxis="y",
+                        )
+                    )
+
+                shapes = []
+                if len(active_bin_indices) <= 80:
+                    for display_bin_index, active_bin_index in enumerate(active_bin_indices):
+                        x0 = float(display_edge_array[active_bin_index])
+                        x1 = float(display_edge_array[active_bin_index + 1])
+                        if display_bin_index % 2 == 0:
+                            shapes.append(
+                                dict(
+                                    type="rect",
+                                    xref="x",
+                                    yref="paper",
+                                    x0=x0,
+                                    x1=x1,
+                                    y0=0,
+                                    y1=1,
+                                    fillcolor="rgba(65, 105, 225, 0.08)",
+                                    line=dict(width=0),
+                                    layer="below",
+                                )
+                            )
+
+                boundary_values = []
+                for active_bin_index in active_bin_indices:
+                    boundary_values.append(display_edge_array[active_bin_index])
+                    boundary_values.append(display_edge_array[active_bin_index + 1])
+                boundary_values = np.unique(np.asarray(boundary_values, dtype=np.float64))
+
+                for boundary_value in boundary_values:
+                    shapes.append(
+                        dict(
+                            type="line",
+                            xref="x",
+                            yref="paper",
+                            x0=float(boundary_value),
+                            x1=float(boundary_value),
+                            y0=0,
+                            y1=1,
+                            line=dict(color="crimson", width=1.2),
+                            layer="above",
+                        )
+                    )
+
+                figure.update_layout(
+                    title=(
+                        f"Preview of {rebin_mode} boundaries over simplified transmission<br>"
+                        f"<sup>{sample_source_label} vs {ob_source_label} | {preview_scaling_label} | "
+                        f"active bins: {len(active_bin_indices)}</sup>"
+                    ),
+                    xaxis_title=x_axis_label,
+                    yaxis_title="Transmission (a.u.)",
+                    yaxis_type="linear",
+                    width=1000,
+                    height=500,
+                    margin=dict(t=120),
+                    hovermode="x unified",
+                    showlegend=True,
+                    shapes=shapes,
+                    plot_bgcolor="white",
+                    xaxis2=dict(
+                        title="Energy (eV)",
+                        overlaying="x",
+                        side="top",
+                        anchor="y",
+                        tickmode="array",
+                        tickvals=energy_tick_values,
+                        ticktext=energy_tick_labels,
+                        showgrid=False,
+                        tickangle=0,
+                        showline=True,
+                        linecolor="black",
+                        linewidth=1,
+                        ticks="outside",
+                        ticklen=6,
+                        zeroline=False,
+                    ),
+                )
+                figure.update_xaxes(showgrid=False)
+                figure.update_yaxes(showgrid=True, gridcolor="rgba(0, 0, 0, 0.10)")
+                figure.show()
+
+            except Exception as exc:
+                display(HTML(f"<span style='color:red'>Unable to preview rebin boundaries: {exc}</span>"))
 
     def settings(self):
 
@@ -1244,7 +1753,7 @@ class NormalizationTof:
         self.rebin_custom_scale_ui.observe(self._on_custom_schedule_scale_change, names="value")
 
         self.rebin_custom_schedule_ui = widgets.Textarea(
-            value="0.2, 10\n1.0, 20\n, 50",
+            value="2000, 10\n5000, 20\n, 50",
             description="segments:",
             disabled=True,
             layout=widgets.Layout(width="520px", height="110px"),
@@ -1265,6 +1774,31 @@ class NormalizationTof:
                 ]
             )
         )
+
+        display(
+            HTML(
+                "<span style='font-size: 12px;'>"
+                "Preview uses the first selected sample run together with the first selected OB run and shows a simplified "
+                "transmission estimate with the proposed bin boundaries. If no spectra file exists, it falls back to "
+                "full-image counts from the TIFF stack."
+                "</span>"
+            )
+        )
+        self.preview_rebin_boundaries_button = widgets.Button(
+            description="Preview rebin boundaries",
+            button_style="info",
+            disabled=True,
+            layout=widgets.Layout(width="260px"),
+            tooltip="Overlay the current rebin boundaries on the first sample run data",
+        )
+        self.preview_rebin_boundaries_button.on_click(self.preview_rebin_boundaries_clicked)
+        self.rebin_bin_count_ui = widgets.HTML()
+        self.rebin_preview_output_ui = widgets.Output()
+        self._observe_rebin_preview_controls()
+        self._update_rebin_bin_count_display()
+        display(self.rebin_bin_count_ui)
+        display(self.preview_rebin_boundaries_button)
+        display(self.rebin_preview_output_ui)
 
         display(HTML("<hr>"))
 
@@ -1362,6 +1896,7 @@ class NormalizationTof:
         self.distance_source_detector = widgets.FloatText(
             value=distance_source_detector_m[self.instrument], disabled=False, layout=widgets.Layout(width="150px")
         )
+        self.distance_source_detector.observe(self._update_rebin_bin_count_display, names="value")
         hori_layout = widgets.HBox([label, self.distance_source_detector])
         display(hori_layout)
 
