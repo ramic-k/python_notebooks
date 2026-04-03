@@ -1,4 +1,4 @@
-from __code.resonance_fitting import DetectorType
+from __code.normalization_tof import DetectorType
 
 
 class DEBUG_DATA:

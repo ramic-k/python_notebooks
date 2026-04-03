@@ -21,7 +21,6 @@ from __code.normalization_tof import DataType
 from __code._utilities.json import load_json
 
 from __code.ipywe.fileselector import FileSelectorPanel as MyFileSelectorPanel
-from __code.ipywe.myfileselector import FileSelectorPanelWithJumpFolders as MyFileSelectorPanelWithJumpFolders
 from __code.normalization_tof import (
     DetectorType,
     RebinCustomBasis,
@@ -32,6 +31,7 @@ from __code.normalization_tof import (
     raw_dir,
 )
 from __code.normalization_tof.config import DEBUG_DATA, timepix1_config, timepix3_config
+from __code.normalization_tof.jump_folder_selector import FileSelectorPanelWithJumpFolders as MyFileSelectorPanelWithJumpFolders
 from __code.normalization_tof.normalization_for_timepix1_timepix3 import (
     load_data_using_multithreading,
     # normalization,

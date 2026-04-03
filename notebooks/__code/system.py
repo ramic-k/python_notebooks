@@ -1,3 +1,4 @@
+import datetime
 import getpass
 import glob
 import os
@@ -7,10 +8,24 @@ from IPython.display import HTML, display
 from ipywidgets import widgets
 
 from __code import LOGGER_FILE, config
-from __code._utilities.file import append_to_file
-from __code._utilities.time import get_current_time_in_special_file_name_format
 
 list_instrument_per_facility = {"HFIR": ["CG1D"], "SNS": ["SNAP", "VENUS"]}
+
+
+def append_to_file(data=None, output_file_name=""):
+    if data is None:
+        data = []
+    folder_name = os.path.dirname(output_file_name)
+    if folder_name and (not os.path.exists(folder_name)):
+        os.makedirs(folder_name, exist_ok=True)
+
+    with open(output_file_name, "a") as output_file:
+        for line in data:
+            output_file.write(f"{line}\n")
+
+
+def get_current_time_in_special_file_name_format():
+    return datetime.datetime.now().strftime("%mm_%dd_%Yy_%Hh_%Mmn")
 
 
 class System:
