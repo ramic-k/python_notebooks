@@ -62,7 +62,10 @@ def load_runtime_dependencies():
     from __code.normalization_tof.normalization_for_timepix1_timepix3 import (
         normalization_with_list_of_full_path,
     )
-    from __code.normalization_tof.utilities import retrieve_list_of_tif
+    from __code.normalization_tof.utilities import (
+        DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE,
+        retrieve_list_of_tif,
+    )
 
     return {
         "extract_file_path_from_nexus": extract_file_path_from_nexus,
@@ -75,6 +78,7 @@ def load_runtime_dependencies():
         "raw_dir": raw_dir,
         "normalization_with_list_of_full_path": normalization_with_list_of_full_path,
         "retrieve_list_of_tif": retrieve_list_of_tif,
+        "DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE": DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE,
     }
 
 
@@ -193,6 +197,27 @@ def parse_args() -> argparse.Namespace:
         "--full-bins-only",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+
+    parser.add_argument(
+        "--black-filter-background",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable ROI-spectrum black-filter background correction. Use only for data containing "
+            "the Ag black notch used to scale the fitted background shape."
+        ),
+    )
+    parser.add_argument(
+        "--black-filter-background-file",
+        default=None,
+        help="Background shape CSV. Defaults to the built-in HDPErpi degree-8 cdmax0.3 shape path.",
+    )
+    parser.add_argument(
+        "--black-filter-anchor-energy-ev",
+        type=float,
+        default=5.1044,
+        help="Nearest measured energy bin used to scale the sample and OB background shapes.",
     )
 
     parser.add_argument(
@@ -455,6 +480,7 @@ def main() -> int:
     extract_file_path_from_nexus = runtime["extract_file_path_from_nexus"]
     normalization_with_list_of_full_path = runtime["normalization_with_list_of_full_path"]
     retrieve_list_of_tif = runtime["retrieve_list_of_tif"]
+    default_black_filter_background_shape_file = runtime["DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE"]
 
     instrument = args.instrument.upper()
     ipts = normalize_ipts(args.ipts)
@@ -530,6 +556,14 @@ def main() -> int:
     rebin_custom_schedule = parse_custom_segments(args.segment) if rebin_mode == RebinMode.custom_schedule else None
     export_mode = default_export_mode(args)
     kernel_size = parse_kernel_size(args.kernel_size)
+    black_filter_background_config = None
+    if args.black_filter_background:
+        black_filter_background_config = {
+            "enabled": True,
+            "background_shape_file": args.black_filter_background_file
+            or default_black_filter_background_shape_file,
+            "anchor_energy_eV": args.black_filter_anchor_energy_ev,
+        }
 
     sample_dict = build_data_dictionary(sample_paths, working_dir, instrument, detector_type)
     ob_dict = build_data_dictionary(ob_paths, working_dir, instrument, detector_type)
@@ -547,6 +581,7 @@ def main() -> int:
     print(f"  custom schedule: {rebin_custom_schedule}")
     print(f"  experimental uncertainties: {experimental_uncertainties_flag}")
     print(f"  proton charge: {args.proton_charge}")
+    print(f"  black-filter background correction: {black_filter_background_config}")
 
     normalized = normalization_with_list_of_full_path(
         sample_dict=sample_dict,
@@ -594,6 +629,7 @@ def main() -> int:
         rebin_custom_schedule=rebin_custom_schedule,
         rebin_full_bins_only=args.full_bins_only if rebin_mode != RebinMode.none else False,
         experimental_uncertainties_flag=experimental_uncertainties_flag,
+        black_filter_background_config=black_filter_background_config,
     )
 
     print("Normalization completed.")

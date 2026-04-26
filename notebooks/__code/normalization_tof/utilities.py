@@ -49,6 +49,9 @@ from __code.normalization_tof.units import (
 LOAD_DTYPE = np.uint16
 
 PROTON_CHARGE_TOLERANCE = 0.1
+DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE = (
+    str(Path(__file__).resolve().parent / "data" / "hdperpi_background_constrained_poly_curve.csv")
+)
 
 
 class PLOT_SIZE:
@@ -707,6 +710,10 @@ def maybe_rebin_data_and_axes(
             "ob_data_combined_variance": ob_data_combined_variance,
             "dc_data_combined": dc_data_combined,
             "dc_data_combined_variance": dc_data_combined_variance,
+            "original_tof_array": tof_array,
+            "original_lambda_array": lambda_array,
+            "original_energy_array": energy_array,
+            "active_frame_groups": None,
             "tof_array": None,
             "lambda_array": None,
             "energy_array": None,
@@ -748,6 +755,10 @@ def maybe_rebin_data_and_axes(
         "dc_data_combined_variance": rebin_array_from_bin_groups(
             dc_data_combined_variance, active_frame_groups, reducer="sum"
         ),
+        "original_tof_array": tof_array,
+        "original_lambda_array": lambda_array,
+        "original_energy_array": energy_array,
+        "active_frame_groups": active_frame_groups,
         "tof_array": None if bin_metadata is None else bin_metadata["mean_tof_array"],
         "lambda_array": None if bin_metadata is None else bin_metadata["mean_lambda_array"],
         "energy_array": None if bin_metadata is None else bin_metadata["mean_energy_array"],
@@ -785,6 +796,219 @@ def calculate_roi_profile(data=None, roi=None):
         [np.sum(_data[y0 : y0 + height, x0 : x0 + width], dtype=np.float64) for _data in data],
         dtype=np.float64,
     )
+
+
+def _load_black_filter_background_shape(background_shape_file: str) -> dict:
+    if not background_shape_file:
+        raise ValueError("Black-filter background correction requires a background shape CSV file.")
+
+    background_shape_path = Path(background_shape_file).expanduser()
+    if not background_shape_path.exists():
+        raise FileNotFoundError(f"Black-filter background shape file not found: {background_shape_path}")
+
+    background_shape = pd.read_csv(background_shape_path)
+    required_columns = {
+        "energy_eV",
+        "sample_background_counts_fit",
+        "ob_background_counts_fit",
+    }
+    missing_columns = required_columns.difference(background_shape.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Black-filter background shape file is missing required columns: {sorted(missing_columns)}"
+        )
+
+    energy = np.asarray(background_shape["energy_eV"], dtype=np.float64)
+    sample_shape = np.asarray(background_shape["sample_background_counts_fit"], dtype=np.float64)
+    ob_shape = np.asarray(background_shape["ob_background_counts_fit"], dtype=np.float64)
+
+    valid = np.isfinite(energy) & np.isfinite(sample_shape) & np.isfinite(ob_shape)
+    valid &= (energy > 0) & (sample_shape > 0) & (ob_shape > 0)
+    if np.count_nonzero(valid) < 2:
+        raise ValueError("Black-filter background shape file does not contain at least two valid positive rows.")
+
+    order = np.argsort(energy[valid])
+    return {
+        "file": str(background_shape_path),
+        "energy": energy[valid][order],
+        "sample": sample_shape[valid][order],
+        "ob": ob_shape[valid][order],
+    }
+
+
+def _evaluate_black_filter_background_shape(
+    energy_array: np.ndarray,
+    shape_energy: np.ndarray,
+    shape_counts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate a positive sampled background shape on the measured energy bins.
+
+    The fitted background file is sampled on a dense energy grid. We interpolate
+    that fitted model in log-log space. Energies outside the fitted range are left
+    uncorrected by returning a zero background there.
+    """
+    measured_energy = np.asarray(energy_array, dtype=np.float64)
+    evaluated_shape = np.zeros_like(measured_energy, dtype=np.float64)
+    in_range = (
+        np.isfinite(measured_energy)
+        & (measured_energy >= shape_energy[0])
+        & (measured_energy <= shape_energy[-1])
+        & (measured_energy > 0)
+    )
+    if np.any(in_range):
+        evaluated_shape[in_range] = np.exp(
+            np.interp(
+                np.log(measured_energy[in_range]),
+                np.log(shape_energy),
+                np.log(shape_counts),
+            )
+        )
+    return evaluated_shape, in_range
+
+
+def calculate_black_filter_background_corrected_spectrum(
+    roi=None,
+    sample_data=None,
+    sample_variance=None,
+    ob_data_combined=None,
+    ob_data_combined_variance=None,
+    energy_array=None,
+    active_frame_groups=None,
+    background_shape_file: str = None,
+    anchor_energy_eV: float = 5.1044,
+) -> dict:
+    """Subtract a scaled black-filter background shape before ROI rebinning.
+
+    Scaling uses one nearest measured energy bin:
+        sample_scale = sample_roi(anchor) / sample_shape(anchor)
+        ob_scale = ob_roi(anchor) / ob_shape(anchor)
+
+    The returned uncertainty propagates only the measured sample/OB counting
+    variance. The fitted background shape and single-bin scale factors are treated
+    as exact model inputs.
+    """
+    if roi is None:
+        raise ValueError("Black-filter background correction requires a ROI.")
+    if sample_data is None or ob_data_combined is None:
+        raise ValueError("Black-filter background correction requires sample and OB data.")
+    if energy_array is None:
+        raise ValueError("Black-filter background correction requires an energy axis.")
+
+    measured_energy = np.asarray(energy_array, dtype=np.float64)
+    sample_roi_counts = calculate_roi_profile(data=sample_data, roi=roi)
+    ob_roi_counts = calculate_roi_profile(data=ob_data_combined, roi=roi)
+    if sample_roi_counts is None or ob_roi_counts is None:
+        raise ValueError("Unable to compute ROI counts for black-filter background correction.")
+    if len(measured_energy) != len(sample_roi_counts):
+        raise ValueError(
+            "Black-filter background correction energy axis length does not match sample ROI profile length."
+        )
+
+    if sample_variance is None:
+        sample_roi_variance = np.asarray(sample_roi_counts, dtype=np.float64)
+    else:
+        sample_roi_variance = calculate_roi_profile(data=sample_variance, roi=roi)
+
+    if ob_data_combined_variance is None:
+        ob_roi_variance = np.asarray(ob_roi_counts, dtype=np.float64)
+    else:
+        ob_roi_variance = calculate_roi_profile(data=ob_data_combined_variance, roi=roi)
+
+    background_shape = _load_black_filter_background_shape(background_shape_file)
+    sample_shape, sample_shape_in_range = _evaluate_black_filter_background_shape(
+        measured_energy,
+        background_shape["energy"],
+        background_shape["sample"],
+    )
+    ob_shape, ob_shape_in_range = _evaluate_black_filter_background_shape(
+        measured_energy,
+        background_shape["energy"],
+        background_shape["ob"],
+    )
+
+    finite_energy = np.isfinite(measured_energy)
+    if not np.any(finite_energy):
+        raise ValueError("Black-filter background correction found no finite measured energies.")
+
+    anchor_index = int(np.nanargmin(np.abs(measured_energy - float(anchor_energy_eV))))
+    anchor_energy = float(measured_energy[anchor_index])
+    if not (sample_shape_in_range[anchor_index] and ob_shape_in_range[anchor_index]):
+        raise ValueError(
+            "Black-filter background anchor is outside the fitted background shape range: "
+            f"anchor request {anchor_energy_eV} eV, nearest measured bin {anchor_energy} eV, "
+            f"shape range [{background_shape['energy'][0]}, {background_shape['energy'][-1]}] eV."
+        )
+    if sample_shape[anchor_index] <= 0 or ob_shape[anchor_index] <= 0:
+        raise ValueError("Black-filter background shape is non-positive at the selected anchor bin.")
+
+    sample_scale = float(sample_roi_counts[anchor_index] / sample_shape[anchor_index])
+    ob_scale = float(ob_roi_counts[anchor_index] / ob_shape[anchor_index])
+
+    sample_background = sample_shape * sample_scale
+    ob_background = ob_shape * ob_scale
+    sample_corrected = sample_roi_counts - sample_background
+    ob_corrected = ob_roi_counts - ob_background
+
+    rebinned_sample_background = rebin_array_from_bin_groups(sample_background, active_frame_groups, reducer="sum")
+    rebinned_ob_background = rebin_array_from_bin_groups(ob_background, active_frame_groups, reducer="sum")
+    rebinned_sample_corrected = rebin_array_from_bin_groups(sample_corrected, active_frame_groups, reducer="sum")
+    rebinned_ob_corrected = rebin_array_from_bin_groups(ob_corrected, active_frame_groups, reducer="sum")
+    rebinned_sample_variance = rebin_array_from_bin_groups(sample_roi_variance, active_frame_groups, reducer="sum")
+    rebinned_ob_variance = rebin_array_from_bin_groups(ob_roi_variance, active_frame_groups, reducer="sum")
+
+    corrected_normalization = np.divide(
+        rebinned_sample_corrected,
+        rebinned_ob_corrected,
+        out=np.zeros_like(rebinned_sample_corrected, dtype=np.float64),
+        where=rebinned_ob_corrected != 0,
+    )
+
+    corrected_variance = np.zeros_like(rebinned_sample_corrected, dtype=np.float64)
+    valid = rebinned_ob_corrected != 0
+    corrected_variance[valid] = (
+        rebinned_sample_variance[valid] / (rebinned_ob_corrected[valid] ** 2)
+        + ((rebinned_sample_corrected[valid] ** 2) * rebinned_ob_variance[valid])
+        / (rebinned_ob_corrected[valid] ** 4)
+    )
+
+    out_of_shape_range = int(
+        np.count_nonzero(~(sample_shape_in_range & ob_shape_in_range) & finite_energy)
+    )
+    return {
+        "black_filter_background_sample_roi_counts": rebinned_sample_background,
+        "black_filter_background_ob_roi_counts": rebinned_ob_background,
+        "black_filter_background_corrected_sample_roi_counts": rebinned_sample_corrected,
+        "black_filter_background_corrected_sample_roi_uncertainty": np.sqrt(
+            np.clip(rebinned_sample_variance, 0, None)
+        ),
+        "black_filter_background_corrected_ob_roi_counts": rebinned_ob_corrected,
+        "black_filter_background_corrected_ob_roi_uncertainty": np.sqrt(
+            np.clip(rebinned_ob_variance, 0, None)
+        ),
+        "black_filter_background_corrected_spectrum_normalization": corrected_normalization,
+        "black_filter_background_corrected_spectrum_normalization_uncertainty": np.sqrt(
+            np.clip(corrected_variance, 0, None)
+        ),
+        "black_filter_background_metadata": {
+            "enabled": True,
+            "shape_file": background_shape["file"],
+            "scale_anchor_requested_eV": float(anchor_energy_eV),
+            "scale_anchor_nearest_energy_eV": anchor_energy,
+            "sample_scale_factor": sample_scale,
+            "ob_scale_factor": ob_scale,
+            "sample_anchor_roi_counts": float(sample_roi_counts[anchor_index]),
+            "ob_anchor_roi_counts": float(ob_roi_counts[anchor_index]),
+            "sample_shape_at_anchor": float(sample_shape[anchor_index]),
+            "ob_shape_at_anchor": float(ob_shape[anchor_index]),
+            "shape_energy_min_eV": float(background_shape["energy"][0]),
+            "shape_energy_max_eV": float(background_shape["energy"][-1]),
+            "uncertainty_note": (
+                "Corrected uncertainty propagates measured sample/OB ROI counting variance only; "
+                "background-shape and scale-factor uncertainty are not included."
+            ),
+            "out_of_shape_range_frame_count": out_of_shape_range,
+        },
+    }
 
 
 def _extract_primary_shutter_count(shutter_counts=None) -> float:
@@ -866,10 +1090,9 @@ def calculate_combined_data_variance(
     if use_proton_charge:
         list_proton_charges = [master_dict[_run_number][MasterDictKeys.proton_charge] for _run_number in run_numbers]
         sum_proton_charge = np.sum(list_proton_charges)
-        coeff = np.mean(list_proton_charges)
+        scale_factor = 1.0 / sum_proton_charge
     else:
-        sum_proton_charge = 1.0
-        coeff = 1.0
+        scale_factor = 1.0 / len(run_numbers)
 
     full_variance = []
     for _run_number in run_numbers:
@@ -879,11 +1102,6 @@ def calculate_combined_data_variance(
             shutter_counts=master_dict[_run_number].get(MasterDictKeys.shutter_counts),
             use_experimental_uncertainties=use_experimental_uncertainties,
         )
-        if use_proton_charge:
-            proton_charge = master_dict[_run_number][MasterDictKeys.proton_charge]
-            scale_factor = (proton_charge / sum_proton_charge) / coeff
-        else:
-            scale_factor = 1.0
         full_variance.append(variance * scale_factor**2)
 
     return np.sum(np.asarray(full_variance), axis=0)
@@ -1979,7 +2197,8 @@ def combine_images(
     full_data_corrected = []
 
     if use_proton_charge:
-        # used for the weighted sum of the ob data
+        # Combined run is the total counts divided by total proton charge.
+        # This is equivalent to exposure-time normalization for unequal-charge runs.
         logging.info(f"Getting proton charge for each {data_type} run number:")
         list_proton_charges = []
         for _run_number in master_dict.keys():
@@ -2009,16 +2228,6 @@ def combine_images(
         logging.info(f"\t minimum of {data_type} data: {np.min(data)}")
         logging.info("**********************************")
 
-        if use_proton_charge:
-            logging.info("\t -> Normalized by proton charge")
-            proton_charge = master_dict[_run_number][MasterDictKeys.proton_charge]
-            logging.info(f"\t\t proton charge: {proton_charge} C")
-            logging.info(f"\t\t{type(proton_charge) = }")
-            logging.info(f"\t\tbefore division: {proton_charge.dtype = }")
-            data *= (proton_charge / sum_proton_charge) # weighted sum
-            logging.info(f"\t\tafter division: {data.dtype = }")
-            logging.info(f"{data.shape = }")
-
         if replace_zeros_by_local_median:
             data = replace_zero_with_local_median(data, 
                                                 kernel_size=kernel_size_for_local_median, 
@@ -2030,11 +2239,9 @@ def combine_images(
     logging.info("Combining all ob images is done!")
     logging.info(f"\tbefore: {len(full_data_corrected) = }")
     if use_proton_charge:
-        coeff = np.mean(list_proton_charges)
+        data_combined = np.array(full_data_corrected).sum(axis=0) / sum_proton_charge
     else:
-        coeff = 1
-            
-    data_combined = np.array(full_data_corrected).sum(axis=0) / coeff
+        data_combined = np.array(full_data_corrected).mean(axis=0)
     
     # if use_proton_charge:
     #     data_combined = np.array(full_data_corrected).sum(axis=0)
@@ -2168,6 +2375,7 @@ def perform_spectrum_normalization(
     dc_data_combined_for_spectrum=None,
     dc_data_combined_variance=None,
     dc_data_combined_variance_for_spectrum=None,
+    black_filter_background_profile=None,
 ):
     if roi is None:
         return None
@@ -2256,6 +2464,8 @@ def perform_spectrum_normalization(
     spectrum_result["spectrum_normalization_uncertainty"] = np.sqrt(
         np.clip(spectrum_normalization_variance, 0, None)
     )
+    if black_filter_background_profile is not None:
+        spectrum_result.update(black_filter_background_profile)
     logging.info(f"{np.shape(spectrum_result['spectrum_normalization']) = }")
     return spectrum_result
 
@@ -2329,6 +2539,32 @@ def export_normalized_data(ob_master_dict=None,
                 ("ob_minus_dc_roi_uncertainty", "OB minus DC ROI uncertainty"),
                 ("spectrum_normalization", "spectrum normalization"),
                 ("spectrum_normalization_uncertainty", "spectrum normalization uncertainty"),
+                ("black_filter_background_sample_roi_counts", "black-filter background sample ROI counts"),
+                ("black_filter_background_ob_roi_counts", "black-filter background OB ROI counts"),
+                (
+                    "black_filter_background_corrected_sample_roi_counts",
+                    "black-filter corrected sample ROI counts",
+                ),
+                (
+                    "black_filter_background_corrected_sample_roi_uncertainty",
+                    "black-filter corrected sample ROI uncertainty",
+                ),
+                (
+                    "black_filter_background_corrected_ob_roi_counts",
+                    "black-filter corrected OB ROI counts",
+                ),
+                (
+                    "black_filter_background_corrected_ob_roi_uncertainty",
+                    "black-filter corrected OB ROI uncertainty",
+                ),
+                (
+                    "black_filter_background_corrected_spectrum_normalization",
+                    "black-filter corrected spectrum normalization",
+                ),
+                (
+                    "black_filter_background_corrected_spectrum_normalization_uncertainty",
+                    "black-filter corrected spectrum normalization uncertainty",
+                ),
             ]
             for source_key, output_key in ordered_columns:
                 values = _spectrum_normalized_data.get(source_key)
@@ -2342,6 +2578,11 @@ def export_normalized_data(ob_master_dict=None,
         pd_dataframe.attrs['uncertainty model'] = uncertainty_model_label or (
             "Poisson counting statistics; proton charge treated as an exact scale factor"
         )
+        if isinstance(_spectrum_normalized_data, dict):
+            black_filter_background_metadata = _spectrum_normalized_data.get("black_filter_background_metadata")
+            if black_filter_background_metadata:
+                for key, value in black_filter_background_metadata.items():
+                    pd_dataframe.attrs[f"black-filter background {key}"] = value
                         
         with open(full_file_name, 'w') as f:
             for key, value in pd_dataframe.attrs.items():

@@ -141,6 +141,51 @@ Current defaults:
 - TPX1: experimental uncertainties on by default
 - TPX3: experimental uncertainties off by default
 
+## Black-filter background correction
+
+This is optional and should only be enabled for ROI spectrum profiles from production data that included the Ag black notch used to scale the fitted background shape.
+
+Enable it:
+
+```bash
+--black-filter-background
+```
+
+The default shape CSV is bundled with this repo:
+
+```text
+notebooks/__code/normalization_tof/data/hdperpi_background_constrained_poly_curve.csv
+```
+
+Override it if needed:
+
+```bash
+--black-filter-background-file /path/to/background_shape.csv
+```
+
+Set the single scaling anchor energy:
+
+```bash
+--black-filter-anchor-energy-ev 5.1044
+```
+
+What it does:
+- extracts unrebinned sample and OB ROI counts
+- scales the sample and OB background shapes independently at the nearest measured bin to the anchor energy
+- subtracts the scaled backgrounds before TOF rebinning
+- exports corrected sample counts, corrected OB counts, and corrected transmission columns
+
+Main corrected columns in `spectrum_normalization_profile.txt`:
+- `black-filter corrected sample ROI counts`
+- `black-filter corrected OB ROI counts`
+- `black-filter corrected spectrum normalization`
+- `black-filter corrected spectrum normalization uncertainty`
+
+Important limitations:
+- full image stacks are not background-corrected by this option
+- corrected uncertainty currently propagates sample/OB counting variance only
+- background-shape and single-anchor scale-factor uncertainty are not included
+
 ## Rebin modes
 
 Valid modes:
@@ -334,6 +379,8 @@ cd /SNS/users/ykr/Desktop/VENUS_python_notebooks_normalization
   --segment ,40 \
   --full-bins-only \
   --experimental-uncertainties \
+  --black-filter-background \
+  --black-filter-anchor-energy-ev 5.1044 \
   --export-normalized-integrated
 ```
 

@@ -99,7 +99,8 @@ def normalization_with_list_of_full_path(
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
     rebin_full_bins_only: bool = False,
-    experimental_uncertainties_flag: bool = False) -> NormalizedData:
+    experimental_uncertainties_flag: bool = False,
+    black_filter_background_config: dict = None) -> NormalizedData:
      
     # """
     # normalize the sample data with ob data using proton charge and shutter counts
@@ -210,6 +211,7 @@ def normalization_with_list_of_full_path(
     logging.info(f"{rebin_custom_schedule = }")
     logging.info(f"{rebin_full_bins_only = }")
     logging.info(f"{experimental_uncertainties_flag = }")
+    logging.info(f"{black_filter_background_config = }")
     logging.info(f"")
     
     sample_master_dict, sample_status_metadata = create_master_dict(
@@ -294,6 +296,32 @@ def normalization_with_list_of_full_path(
             data=rebinned_payload["dc_data_combined_variance"],
             roi=roi,
         )
+
+        rebinned_payload["black_filter_background_profile"] = None
+        if black_filter_background_config and black_filter_background_config.get("enabled", False):
+            if roi is None:
+                raise ValueError("Black-filter background correction is enabled but no ROI was provided.")
+            if dc_data_combined is not None:
+                raise ValueError("Black-filter background correction is not currently supported with dark-current data.")
+            rebinned_payload["black_filter_background_profile"] = (
+                calculate_black_filter_background_corrected_spectrum(
+                    roi=roi,
+                    sample_data=current_sample_data,
+                    sample_variance=current_sample_variance,
+                    ob_data_combined=ob_data_combined,
+                    ob_data_combined_variance=ob_data_combined_variance,
+                    energy_array=rebinned_payload["original_energy_array"],
+                    active_frame_groups=rebinned_payload["active_frame_groups"],
+                    background_shape_file=black_filter_background_config.get(
+                        "background_shape_file",
+                        DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE,
+                    ),
+                    anchor_energy_eV=black_filter_background_config.get(
+                        "anchor_energy_eV",
+                        5.1044,
+                    ),
+                )
+            )
 
         if rebin_mode == RebinMode.none:
             rebinned_payload["export_spectra_array"] = spectra_array
@@ -404,12 +432,10 @@ def normalization_with_list_of_full_path(
         logging_statistics_of_data(data=sample_data_combined, data_type=DataType.sample_combined)
         
         if normalized_by_proton_charge:
-            logging.info(f"Normalizing by proton charge")
+            logging.info("Combined sample data normalized by total proton charge during image combination")
             logging.info(f"\t{sample_sum_proton_charge = }")
             if verbose:
-                display(HTML(f"Normalizing by proton charge"))
-            sample_data_combined /= sample_sum_proton_charge 
-            sample_data_combined_variance /= sample_sum_proton_charge**2
+                display(HTML("Combined sample data normalized by total proton charge during image combination"))
 
         if (container_roi is not None) or (container_roi_file is not None):
                 logging.info(f"Applying container normalization:")
@@ -498,7 +524,8 @@ def normalization_with_list_of_full_path(
                                                                 dc_data_combined=dc_data_for_normalization,
                                                                 dc_data_combined_for_spectrum=dc_data_combined_for_spectrum,
                                                                 dc_data_combined_variance=rebinned_payload["dc_data_combined_variance"],
-                                                                dc_data_combined_variance_for_spectrum=dc_data_combined_variance_for_spectrum)
+                                                                dc_data_combined_variance_for_spectrum=dc_data_combined_variance_for_spectrum,
+                                                                black_filter_background_profile=rebinned_payload["black_filter_background_profile"])
         spectrum_normalized_data[str_list_run_number] = _spectrum_normalized_data
 
         # normalized_data[_sample_run_number] = np.array(np.divide(_sample_data, ob_data_combined))
@@ -679,7 +706,8 @@ def normalization_with_list_of_full_path(
                                                                     dc_data_combined=dc_data_for_normalization,
                                                                     dc_data_combined_for_spectrum=dc_data_combined_for_spectrum,
                                                                     dc_data_combined_variance=rebinned_payload["dc_data_combined_variance"],
-                                                                    dc_data_combined_variance_for_spectrum=dc_data_combined_variance_for_spectrum)
+                                                                    dc_data_combined_variance_for_spectrum=dc_data_combined_variance_for_spectrum,
+                                                                    black_filter_background_profile=rebinned_payload["black_filter_background_profile"])
             spectrum_normalized_data[_sample_run_number] = _spectrum_normalized_data
 
             # normalized_data[_sample_run_number] = np.array(np.divide(_sample_data, ob_data_combined))

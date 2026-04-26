@@ -39,6 +39,7 @@ from __code.normalization_tof.normalization_for_timepix1_timepix3 import (
     retrieve_list_of_tif,
 )
 from __code.normalization_tof.utilities import (
+    DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE,
     build_rebin_bin_groups,
     calculate_time_lambda_energy_arrays,
     get_detector_offset_from_nexus,
@@ -1040,6 +1041,11 @@ class NormalizationTof:
     def _on_custom_schedule_scale_change(self, change):
         self._update_custom_schedule_help()
 
+    def _on_black_filter_background_flag_change(self, change):
+        disabled = not change["new"]
+        self.black_filter_background_shape_file_ui.disabled = disabled
+        self.black_filter_background_anchor_energy_ui.disabled = disabled
+
     def _parse_custom_rebin_schedule(self) -> list[dict]:
         schedule_text = self.rebin_custom_schedule_ui.value
         if schedule_text is None:
@@ -1861,6 +1867,46 @@ class NormalizationTof:
         display(vertical_layout)
 
         display(HTML("<hr>"))
+        display(HTML("<span style='font-size: 16px; color:red'>Black-filter background correction for ROI spectrum</span>"))
+        display(HTML(
+            "<span style='font-size: 12px;'>"
+            "Optional. Enable only for production data that include the same Ag black notch used to scale the "
+            "background shape. The correction subtracts scaled sample and OB background ROI profiles before "
+            "TOF rebinning, then computes corrected transmission."
+            "</span>"
+        ))
+        self.black_filter_background_flag = widgets.Checkbox(
+            description="Enable black-filter background correction",
+            value=False,
+            layout=widgets.Layout(width="450px"),
+        )
+        self.black_filter_background_shape_file_ui = widgets.Text(
+            description="shape CSV:",
+            value=DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE,
+            disabled=True,
+            layout=widgets.Layout(width="900px"),
+        )
+        self.black_filter_background_anchor_energy_ui = widgets.BoundedFloatText(
+            description="Ag anchor eV:",
+            value=5.1044,
+            min=0.0,
+            max=1e6,
+            step=0.0001,
+            disabled=True,
+            layout=widgets.Layout(width="260px"),
+        )
+        self.black_filter_background_flag.observe(self._on_black_filter_background_flag_change, names="value")
+        display(
+            widgets.VBox(
+                [
+                    self.black_filter_background_flag,
+                    self.black_filter_background_shape_file_ui,
+                    self.black_filter_background_anchor_energy_ui,
+                ]
+            )
+        )
+
+        display(HTML("<hr>"))
 
         display(HTML("<span style='font-size: 16px; color:red'>How to handle OB zeros - <i>May take much more time!</i></span>"))
         
@@ -2466,6 +2512,14 @@ class NormalizationTof:
                 display(HTML(f"<span style='color:red'>{exc}</span>"))
                 raise
 
+        black_filter_background_config = None
+        if getattr(self, "black_filter_background_flag", None) is not None and self.black_filter_background_flag.value:
+            black_filter_background_config = {
+                "enabled": True,
+                "background_shape_file": self.black_filter_background_shape_file_ui.value,
+                "anchor_energy_eV": self.black_filter_background_anchor_energy_ui.value,
+            }
+
         self.normalized_dict = normalization_with_list_of_full_path(
             sample_dict=sample_dict,
             ob_dict=ob_dict,
@@ -2516,6 +2570,7 @@ class NormalizationTof:
             rebin_custom_schedule=rebin_custom_schedule,
             rebin_full_bins_only=self.rebin_full_bins_only_ui.value if rebin_mode != RebinMode.none else False,
             experimental_uncertainties_flag=self.experimental_uncertainties_flag.value,
+            black_filter_background_config=black_filter_background_config,
         )
         
         display(HTML("<span style='color:blue'>Normalization completed</span>"))
