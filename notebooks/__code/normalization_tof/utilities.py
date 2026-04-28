@@ -127,6 +127,10 @@ def create_x_axis_file(
     if bin_metadata:
         x_axis_data = {
             "file_index": bin_metadata["active_bin_index_array"],
+            "source frame count": bin_metadata.get(
+                "source_frame_count_array",
+                np.ones(len(bin_metadata["active_bin_index_array"]), dtype=int),
+            ),
             "starting tof (s)": bin_metadata["starting_tof_array"],
             "ending tof (s)": bin_metadata["ending_tof_array"],
             "mean tof (s)": bin_metadata["mean_tof_array"],
@@ -166,6 +170,7 @@ def create_rebin_output_suffix(
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
     rebin_full_bins_only: bool = False,
+    rebin_snap_to_native_grid: bool = False,
 ) -> str:
     if rebin_mode == RebinMode.none:
         return ""
@@ -208,6 +213,16 @@ def create_rebin_output_suffix(
 
     if rebin_full_bins_only:
         output_suffix += "_fullbins"
+    snap_to_native_applies = (
+        rebin_mode in [RebinMode.linear_tof, RebinMode.linear_lambda]
+        or (
+            rebin_mode == RebinMode.custom_schedule
+            and rebin_custom_scale == RebinCustomScale.linear
+            and rebin_custom_basis in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+        )
+    )
+    if rebin_snap_to_native_grid and snap_to_native_applies:
+        output_suffix += "_snapnative"
     return output_suffix
 
 
@@ -251,9 +266,19 @@ def _validate_rebin_axis(axis_values: np.ndarray, rebin_mode: str) -> np.ndarray
     return axis_values
 
 
-def _create_linear_bin_edges(axis_values: np.ndarray, bin_width: float, full_bins_only: bool = False) -> np.ndarray:
+def _create_linear_bin_edges(
+    axis_values: np.ndarray,
+    bin_width: float,
+    full_bins_only: bool = False,
+    snap_to_native_grid: bool = False,
+) -> np.ndarray:
     if bin_width is None or bin_width <= 0:
         raise ValueError("Linear rebinning requires a strictly positive bin width.")
+    bin_width = _snap_linear_bin_width_to_native_axis(
+        axis_values=axis_values,
+        bin_width=bin_width,
+        snap_to_native_grid=snap_to_native_grid,
+    )
     new_axis = np.arange(axis_values[0], axis_values[-1], bin_width, dtype=np.float64)
     if len(new_axis) == 0:
         new_axis = np.array([axis_values[0]], dtype=np.float64)
@@ -261,6 +286,58 @@ def _create_linear_bin_edges(axis_values: np.ndarray, bin_width: float, full_bin
     if (not full_bins_only) or (next_edge <= axis_values[-1] + 1e-12):
         new_axis = np.append(new_axis, next_edge)
     return new_axis
+
+
+def _estimate_native_axis_step(axis_values: np.ndarray) -> float | None:
+    axis_values = np.asarray(axis_values, dtype=np.float64)
+    diffs = np.diff(axis_values)
+    positive_diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if len(positive_diffs) == 0:
+        return None
+
+    median_step = float(np.median(positive_diffs))
+    if median_step <= 0:
+        return None
+
+    # TPX1 axes can contain large chopper/frame gaps; those should not define
+    # the native frame spacing used for fixed-width bin snapping.
+    native_like_diffs = positive_diffs[positive_diffs <= (5.0 * median_step)]
+    if len(native_like_diffs) == 0:
+        native_like_diffs = positive_diffs
+    native_step = float(np.median(native_like_diffs))
+    return native_step if native_step > 0 else None
+
+
+def _snap_linear_bin_width_to_native_axis(
+    axis_values: np.ndarray,
+    bin_width: float,
+    snap_to_native_grid: bool = False,
+) -> float:
+    if not snap_to_native_grid:
+        return bin_width
+
+    native_step = _estimate_native_axis_step(axis_values)
+    if native_step is None:
+        return bin_width
+
+    native_frame_count = max(1, int(round(bin_width / native_step)))
+    return native_frame_count * native_step
+
+
+def _snap_native_grid_full_bin_filter(
+    bin_groups: list[list[int]],
+    bin_edges: np.ndarray,
+    axis_values: np.ndarray,
+) -> list[list[int]]:
+    native_step = _estimate_native_axis_step(axis_values)
+    if native_step is None:
+        return bin_groups
+
+    filtered_groups = []
+    for group, start_edge, end_edge in zip(bin_groups, bin_edges[:-1], bin_edges[1:]):
+        expected_frame_count = max(1, int(round((end_edge - start_edge) / native_step)))
+        filtered_groups.append(group if len(group) == expected_frame_count else [])
+    return filtered_groups
 
 
 def _create_log_bin_edges(
@@ -288,12 +365,19 @@ def _create_log_bin_edges(
 
 
 def _create_linear_bin_edges_between(
-    start_value: float, end_value: float, bin_width: float, full_bins_only: bool = False
+    start_value: float,
+    end_value: float,
+    bin_width: float,
+    full_bins_only: bool = False,
+    native_axis_step: float = None,
 ) -> np.ndarray:
     if bin_width is None or bin_width <= 0:
         raise ValueError("Linear rebinning requires a strictly positive bin width.")
     if end_value <= start_value:
         raise ValueError("Segment end must be greater than the segment start.")
+    if native_axis_step is not None and native_axis_step > 0:
+        native_frame_count = max(1, int(round(bin_width / native_axis_step)))
+        bin_width = native_frame_count * native_axis_step
 
     new_bin_array = [float(start_value)]
     parameter = float(start_value)
@@ -417,9 +501,16 @@ def _create_edges_for_custom_segment(
     step_value: float = None,
     rebin_custom_scale: str = None,
     full_bins_only: bool = False,
+    native_axis_step: float = None,
 ) -> np.ndarray:
     if rebin_custom_scale == RebinCustomScale.linear:
-        return _create_linear_bin_edges_between(start_value, end_value, step_value, full_bins_only=full_bins_only)
+        return _create_linear_bin_edges_between(
+            start_value,
+            end_value,
+            step_value,
+            full_bins_only=full_bins_only,
+            native_axis_step=native_axis_step,
+        )
     if rebin_custom_scale == RebinCustomScale.log:
         return _create_log_bin_edges_between(
             start_value, end_value, step_value, RebinMode.custom_schedule, full_bins_only=full_bins_only
@@ -439,6 +530,7 @@ def _build_custom_schedule_bin_edges(
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
     rebin_full_bins_only: bool = False,
+    rebin_snap_to_native_grid: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     normalized_schedule = _normalize_custom_schedule(rebin_custom_schedule)
 
@@ -463,6 +555,13 @@ def _build_custom_schedule_bin_edges(
 
     axis_start = float(axis_values[0])
     axis_end = float(axis_values[-1])
+    native_axis_step = None
+    if (
+        rebin_snap_to_native_grid
+        and rebin_custom_scale == RebinCustomScale.linear
+        and rebin_custom_basis in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+    ):
+        native_axis_step = _estimate_native_axis_step(axis_values)
 
     custom_bin_edges = [axis_start]
     current_start = axis_start
@@ -490,6 +589,7 @@ def _build_custom_schedule_bin_edges(
             step_value=_convert_custom_step(segment["step"]),
             rebin_custom_scale=rebin_custom_scale,
             full_bins_only=rebin_full_bins_only,
+            native_axis_step=native_axis_step,
         )
         custom_bin_edges.extend(segment_edges[1:])
         current_start = custom_bin_edges[-1]
@@ -504,6 +604,7 @@ def _build_custom_schedule_bin_edges(
             step_value=_convert_custom_step(normalized_schedule[-1]["step"]),
             rebin_custom_scale=rebin_custom_scale,
             full_bins_only=rebin_full_bins_only,
+            native_axis_step=native_axis_step,
         )
         custom_bin_edges.extend(segment_edges[1:])
 
@@ -524,6 +625,7 @@ def build_rebin_bin_groups(
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
     rebin_full_bins_only: bool = False,
+    rebin_snap_to_native_grid: bool = False,
 ) -> tuple[list[list[int]], np.ndarray]:
     if tof_array is None:
         return None, None
@@ -535,12 +637,18 @@ def build_rebin_bin_groups(
     if rebin_mode == RebinMode.linear_tof:
         axis_values = _validate_rebin_axis(tof_array, rebin_mode)
         bin_edges = _create_linear_bin_edges(
-            axis_values, rebin_delta_tof_us * 1e-6, full_bins_only=rebin_full_bins_only
+            axis_values,
+            rebin_delta_tof_us * 1e-6,
+            full_bins_only=rebin_full_bins_only,
+            snap_to_native_grid=rebin_snap_to_native_grid,
         )
     elif rebin_mode == RebinMode.linear_lambda:
         axis_values = _validate_rebin_axis(lambda_array, rebin_mode)
         bin_edges = _create_linear_bin_edges(
-            axis_values, rebin_delta_lambda_a, full_bins_only=rebin_full_bins_only
+            axis_values,
+            rebin_delta_lambda_a,
+            full_bins_only=rebin_full_bins_only,
+            snap_to_native_grid=rebin_snap_to_native_grid,
         )
     elif rebin_mode == RebinMode.log_tof:
         axis_values = _validate_rebin_axis(tof_array, rebin_mode)
@@ -565,6 +673,7 @@ def build_rebin_bin_groups(
             rebin_custom_scale=rebin_custom_scale,
             rebin_custom_schedule=rebin_custom_schedule,
             rebin_full_bins_only=rebin_full_bins_only,
+            rebin_snap_to_native_grid=rebin_snap_to_native_grid,
         )
     else:
         raise ValueError(f"Unsupported rebin mode: {rebin_mode}")
@@ -575,6 +684,21 @@ def build_rebin_bin_groups(
         if group_index < 0 or group_index >= len(bin_groups):
             continue
         bin_groups[group_index].append(frame_index)
+
+    snap_to_native_applies = (
+        rebin_mode in [RebinMode.linear_tof, RebinMode.linear_lambda]
+        or (
+            rebin_mode == RebinMode.custom_schedule
+            and rebin_custom_scale == RebinCustomScale.linear
+            and rebin_custom_basis in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+        )
+    )
+    if rebin_snap_to_native_grid and rebin_full_bins_only and snap_to_native_applies:
+        bin_groups = _snap_native_grid_full_bin_filter(
+            bin_groups=bin_groups,
+            bin_edges=bin_edges,
+            axis_values=axis_values,
+        )
 
     return bin_groups, bin_edges
 
@@ -590,6 +714,7 @@ def build_rebin_bin_metadata(
 
     active_bin_indices = []
     active_frame_groups = []
+    source_frame_counts = []
     starting_tof = []
     ending_tof = []
     mean_tof = []
@@ -607,6 +732,7 @@ def build_rebin_bin_metadata(
         frame_group = np.asarray(frame_group, dtype=int)
         active_bin_indices.append(full_bin_index)
         active_frame_groups.append(frame_group)
+        source_frame_counts.append(len(frame_group))
 
         tof_values = np.asarray(tof_array[frame_group], dtype=np.float64)
         lambda_values = np.asarray(lambda_array[frame_group], dtype=np.float64)
@@ -627,6 +753,7 @@ def build_rebin_bin_metadata(
     return {
         "active_bin_index_array": np.asarray(active_bin_indices, dtype=int),
         "list_file_index_array": active_frame_groups,
+        "source_frame_count_array": np.asarray(source_frame_counts, dtype=int),
         "starting_tof_array": np.asarray(starting_tof, dtype=np.float64),
         "ending_tof_array": np.asarray(ending_tof, dtype=np.float64),
         "mean_tof_array": np.asarray(mean_tof, dtype=np.float64),
@@ -649,6 +776,9 @@ def rebin_array_from_bin_groups(
         return np.asarray(data).copy()
 
     array_data = np.asarray(data)
+    if array_data.ndim == 0:
+        return None
+
     if reducer == "sum":
         reduced_chunks = [np.sum(array_data[_group], axis=0) for _group in active_frame_groups]
     elif reducer == "mean":
@@ -679,6 +809,7 @@ def maybe_rebin_data_and_axes(
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
     rebin_full_bins_only: bool = False,
+    rebin_snap_to_native_grid: bool = False,
 ) -> dict:
     if (time_spectra is None) and (rebin_mode != RebinMode.none):
         raise ValueError(f"{rebin_mode} requires a valid spectra/time axis.")
@@ -700,6 +831,7 @@ def maybe_rebin_data_and_axes(
         rebin_custom_scale=rebin_custom_scale,
         rebin_custom_schedule=rebin_custom_schedule,
         rebin_full_bins_only=rebin_full_bins_only,
+        rebin_snap_to_native_grid=rebin_snap_to_native_grid,
     )
 
     if tof_array is None:
@@ -735,6 +867,7 @@ def maybe_rebin_data_and_axes(
         rebin_custom_scale=rebin_custom_scale,
         rebin_custom_schedule=rebin_custom_schedule,
         rebin_full_bins_only=rebin_full_bins_only,
+        rebin_snap_to_native_grid=rebin_snap_to_native_grid,
     )
     bin_metadata = build_rebin_bin_metadata(
         tof_array=tof_array,
@@ -743,6 +876,8 @@ def maybe_rebin_data_and_axes(
         bin_groups=bin_groups,
     )
     active_frame_groups = None if bin_metadata is None else bin_metadata["list_file_index_array"]
+    if bin_metadata is not None:
+        bin_metadata["rebin_snap_to_native_grid"] = bool(rebin_snap_to_native_grid)
 
     return {
         "sample_data": rebin_array_from_bin_groups(sample_data, active_frame_groups, reducer="sum"),
@@ -788,12 +923,16 @@ def calculate_roi_profile(data=None, roi=None):
     if (roi is None) or (data is None):
         return None
 
+    array_data = np.asarray(data)
+    if array_data.ndim < 3:
+        return None
+
     x0 = roi.left
     y0 = roi.top
     width = roi.width
     height = roi.height
     return np.asarray(
-        [np.sum(_data[y0 : y0 + height, x0 : x0 + width], dtype=np.float64) for _data in data],
+        [np.sum(_data[y0 : y0 + height, x0 : x0 + width], dtype=np.float64) for _data in array_data],
         dtype=np.float64,
     )
 
@@ -1118,6 +1257,107 @@ def calculate_dc_combined_variance(dc_master_dict: dict = None) -> np.ndarray:
     return np.sum(np.asarray(full_variance), axis=0) / (len(full_variance) ** 2)
 
 
+def calculate_ratio_and_uncertainty(
+    numerator: np.ndarray,
+    denominator: np.ndarray,
+    numerator_variance: np.ndarray,
+    denominator_variance: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    numerator = np.asarray(numerator, dtype=np.float64)
+    denominator = np.asarray(denominator, dtype=np.float64)
+    numerator_variance = np.asarray(numerator_variance, dtype=np.float64)
+    denominator_variance = np.asarray(denominator_variance, dtype=np.float64)
+
+    ratio = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator, dtype=np.float64),
+        where=denominator != 0,
+    )
+    variance = np.zeros_like(numerator, dtype=np.float64)
+    valid = denominator != 0
+    variance[valid] = (
+        numerator_variance[valid] / (denominator[valid] ** 2)
+        + ((numerator[valid] ** 2) * denominator_variance[valid]) / (denominator[valid] ** 4)
+    )
+    return ratio, np.sqrt(np.clip(variance, 0, None))
+
+
+def calculate_bragg_edge_cd_background_profile(
+    roi=None,
+    raw_sample_data=None,
+    raw_sample_variance=None,
+    raw_ob_data=None,
+    raw_ob_variance=None,
+    sample_background_data=None,
+    sample_background_variance=None,
+    ob_background_data=None,
+    ob_background_variance=None,
+    mode: str = "Cd-filter background correction for Bragg edge mode",
+    column_label: str = "Cd-filter",
+    key_prefix: str = "bragg_edge_cd",
+) -> dict:
+    if roi is None:
+        return None
+
+    raw_sample_roi_counts = calculate_roi_profile(data=raw_sample_data, roi=roi)
+    raw_ob_roi_counts = calculate_roi_profile(data=raw_ob_data, roi=roi)
+    sample_background_roi_counts = calculate_roi_profile(data=sample_background_data, roi=roi)
+    ob_background_roi_counts = calculate_roi_profile(data=ob_background_data, roi=roi)
+
+    raw_sample_roi_variance = calculate_roi_profile(data=raw_sample_variance, roi=roi)
+    raw_ob_roi_variance = calculate_roi_profile(data=raw_ob_variance, roi=roi)
+    sample_background_roi_variance = calculate_roi_profile(data=sample_background_variance, roi=roi)
+    ob_background_roi_variance = calculate_roi_profile(data=ob_background_variance, roi=roi)
+
+    corrected_sample_roi_counts = raw_sample_roi_counts - sample_background_roi_counts
+    corrected_ob_roi_counts = raw_ob_roi_counts - ob_background_roi_counts
+    corrected_sample_roi_variance = raw_sample_roi_variance + sample_background_roi_variance
+    corrected_ob_roi_variance = raw_ob_roi_variance + ob_background_roi_variance
+
+    uncorrected_norm, uncorrected_unc = calculate_ratio_and_uncertainty(
+        raw_sample_roi_counts,
+        raw_ob_roi_counts,
+        raw_sample_roi_variance,
+        raw_ob_roi_variance,
+    )
+    corrected_norm, corrected_unc = calculate_ratio_and_uncertainty(
+        corrected_sample_roi_counts,
+        corrected_ob_roi_counts,
+        corrected_sample_roi_variance,
+        corrected_ob_roi_variance,
+    )
+
+    return {
+        f"{key_prefix}_raw_sample_roi_counts": raw_sample_roi_counts,
+        f"{key_prefix}_raw_sample_roi_uncertainty": np.sqrt(np.clip(raw_sample_roi_variance, 0, None)),
+        f"{key_prefix}_raw_ob_roi_counts": raw_ob_roi_counts,
+        f"{key_prefix}_raw_ob_roi_uncertainty": np.sqrt(np.clip(raw_ob_roi_variance, 0, None)),
+        f"{key_prefix}_sample_background_roi_counts": sample_background_roi_counts,
+        f"{key_prefix}_sample_background_roi_uncertainty": np.sqrt(
+            np.clip(sample_background_roi_variance, 0, None)
+        ),
+        f"{key_prefix}_ob_background_roi_counts": ob_background_roi_counts,
+        f"{key_prefix}_ob_background_roi_uncertainty": np.sqrt(np.clip(ob_background_roi_variance, 0, None)),
+        f"{key_prefix}_corrected_sample_roi_counts": corrected_sample_roi_counts,
+        f"{key_prefix}_corrected_sample_roi_uncertainty": np.sqrt(
+            np.clip(corrected_sample_roi_variance, 0, None)
+        ),
+        f"{key_prefix}_corrected_ob_roi_counts": corrected_ob_roi_counts,
+        f"{key_prefix}_corrected_ob_roi_uncertainty": np.sqrt(np.clip(corrected_ob_roi_variance, 0, None)),
+        f"{key_prefix}_uncorrected_spectrum_normalization": uncorrected_norm,
+        f"{key_prefix}_uncorrected_spectrum_normalization_uncertainty": uncorrected_unc,
+        f"{key_prefix}_corrected_spectrum_normalization": corrected_norm,
+        f"{key_prefix}_corrected_spectrum_normalization_uncertainty": corrected_unc,
+        f"{key_prefix}_background_metadata": {
+            "enabled": True,
+            "mode": mode,
+            "column_label": column_label,
+            "key_prefix": key_prefix,
+        },
+    }
+
+
 def extract_spectrum_normalization_values(spectrum_profile=None):
     if spectrum_profile is None:
         return None
@@ -1135,7 +1375,10 @@ def extract_spectrum_normalization_uncertainty(spectrum_profile=None):
 def  calculate_ob_data_combined_used_by_spectrum_normalization(roi=None, ob_data_combined=None, verbose=False):
 
     logging.info(f"Calculating the ob_data_combined for spectrum normalization")
-    if roi is not None:
+    if ob_data_combined is None:
+        logging.info("\tno OB data provided. Skipping OB spectrum profile.")
+        ob_data_combined_for_spectrum = None
+    elif roi is not None:
         logging.info(f"\t{roi =}")
         ob_data_combined_for_spectrum = calculate_roi_profile(data=ob_data_combined, roi=roi)
         logging.info(f"\t{np.shape(ob_data_combined_for_spectrum) = }")
@@ -1145,7 +1388,7 @@ def  calculate_ob_data_combined_used_by_spectrum_normalization(roi=None, ob_data
         logging.info(f"\tno roi provided! Skipping the normalization of spectrum.")
         ob_data_combined_for_spectrum = None
 
-    if verbose:
+    if verbose and ob_data_combined is not None:
         display(HTML(f"{ob_data_combined.shape = }"))
 
     return ob_data_combined_for_spectrum
@@ -1233,15 +1476,37 @@ def preview_normalized_data(_sample_data, ob_data_combined, dc_data_combined,
                             detector_delay_us, _sample_run_number,
                             combine_samples=False,
                             _spectrum_normalized_data=None,
-                            roi=None):
+                            roi=None,
+                            bin_metadata: dict = None):
    
     """preview normalized data"""
+    def _source_frame_counts_for(data):
+        if not bin_metadata or "source_frame_count_array" not in bin_metadata:
+            return None
+        source_frame_counts = np.asarray(bin_metadata["source_frame_count_array"], dtype=np.float64)
+        if data is None or len(source_frame_counts) != np.asarray(data).shape[0]:
+            return None
+        return source_frame_counts
+
+    def _data_per_source_frame(data):
+        source_frame_counts = _source_frame_counts_for(data)
+        if source_frame_counts is None:
+            return data
+        return np.asarray(data, dtype=np.float64) / source_frame_counts[:, None, None]
+
+    def _profile_per_source_frame(profile, data):
+        source_frame_counts = _source_frame_counts_for(data)
+        if source_frame_counts is None:
+            return profile, "Integrated counts"
+        return profile / source_frame_counts, "Integrated counts per source frame"
+
+    profile_xaxis_title = "Rebinned bin index" if bin_metadata is not None else "File image index"
 
     # display preview of normalized data
     fig = make_subplots(rows=1, cols=2, 
                        subplot_titles=["Integrated Sample data", "Sample Profile"],
                        horizontal_spacing=0.15)
-    sample_data_integrated = np.nanmean(_sample_data, axis=0)
+    sample_data_integrated = np.nanmean(_data_per_source_frame(_sample_data), axis=0)
     
     # Calculate 2-98% percentile range for better contrast
     vmin, vmax = np.percentile(sample_data_integrated, [2, 98])
@@ -1258,50 +1523,55 @@ def preview_normalized_data(_sample_data, ob_data_combined, dc_data_combined,
 
     sample_integrated1 = np.nansum(_sample_data, axis=1)
     sample_integrated = np.nansum(sample_integrated1, axis=1)
+    sample_integrated, sample_profile_yaxis = _profile_per_source_frame(sample_integrated, _sample_data)
     fig.add_trace(go.Scatter(y=sample_integrated, 
                            mode='markers',
                            marker=dict(size=MARKERSIZE),
                            name="Sample"), row=1, col=2)
-    fig.update_xaxes(title_text="File image index", row=1, col=2)
-    fig.update_yaxes(title_text="Transmission (a.u.)", row=1, col=2)
+    fig.update_xaxes(title_text=profile_xaxis_title, row=1, col=2)
+    fig.update_yaxes(title_text=sample_profile_yaxis, row=1, col=2)
     # Ensure equal aspect ratio for heatmap (square pixels)
     fig.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
     fig.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
     fig.show()
 
-    fig2 = make_subplots(rows=1, cols=2, 
-                        subplot_titles=["OB integrated data", "OB Profile"],
-                        horizontal_spacing=0.15)
-    ob_data_integrated = np.nanmean(ob_data_combined, axis=0)
-    
-    # Calculate 2-98% percentile range for better contrast
-    vmin, vmax = np.percentile(ob_data_integrated, [2, 98])
-    fig2.add_trace(go.Heatmap(z=ob_data_integrated, 
-                            colorscale="gray",
-                            zmin=vmin,
-                            zmax=vmax,
-                            showscale=True,
-                            showlegend=False,
-                            colorbar=dict(x=0.45)), row=1, col=1)
+    if ob_data_combined is not None:
+        fig2 = make_subplots(rows=1, cols=2,
+                            subplot_titles=["OB integrated data", "OB Profile"],
+                            horizontal_spacing=0.15)
+        ob_data_integrated = np.nanmean(_data_per_source_frame(ob_data_combined), axis=0)
 
-    ob_integrated1 = np.nansum(ob_data_combined, axis=1)
-    ob_integrated = np.nansum(ob_integrated1, axis=1)
-    fig2.add_trace(go.Scatter(y=ob_integrated, 
-                            mode='markers',
-                            marker=dict(size=MARKERSIZE),
-                            name="OB"), row=1, col=2)
-    fig2.update_xaxes(title_text="File image index", row=1, col=2)
-    fig2.update_yaxes(title_text="Transmission (a.u.)", row=1, col=2)
-    # Ensure equal aspect ratio for heatmap (square pixels)
-    fig2.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
-    fig2.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
-    fig2.show()
+        # Calculate 2-98% percentile range for better contrast
+        vmin, vmax = np.percentile(ob_data_integrated, [2, 98])
+        fig2.add_trace(go.Heatmap(z=ob_data_integrated,
+                                colorscale="gray",
+                                zmin=vmin,
+                                zmax=vmax,
+                                showscale=True,
+                                showlegend=False,
+                                colorbar=dict(x=0.45)), row=1, col=1)
+
+        ob_integrated1 = np.nansum(ob_data_combined, axis=1)
+        ob_integrated = np.nansum(ob_integrated1, axis=1)
+        ob_integrated, ob_profile_yaxis = _profile_per_source_frame(ob_integrated, ob_data_combined)
+        fig2.add_trace(go.Scatter(y=ob_integrated,
+                                mode='markers',
+                                marker=dict(size=MARKERSIZE),
+                                name="OB"), row=1, col=2)
+        fig2.update_xaxes(title_text=profile_xaxis_title, row=1, col=2)
+        fig2.update_yaxes(title_text=ob_profile_yaxis, row=1, col=2)
+        # Ensure equal aspect ratio for heatmap (square pixels)
+        fig2.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
+        fig2.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
+        fig2.show()
+    else:
+        display(HTML("<span style='color:blue'>No OB run was provided; skipping OB preview.</span>"))
 
     if dc_data_combined is not None:
         fig3 = make_subplots(rows=1, cols=2, 
                            subplot_titles=["DC integrated data", "DC Profile"],
                            horizontal_spacing=0.15)
-        dc_data_integrated = np.nanmean(dc_data_combined, axis=0)
+        dc_data_integrated = np.nanmean(_data_per_source_frame(dc_data_combined), axis=0)
         
         # Calculate 2-98% percentile range for better contrast
         vmin, vmax = np.percentile(dc_data_integrated, [2, 98])
@@ -1315,12 +1585,13 @@ def preview_normalized_data(_sample_data, ob_data_combined, dc_data_combined,
 
         dc_integrated1 = np.nansum(dc_data_combined, axis=1)
         dc_integrated = np.nansum(dc_integrated1, axis=1)
+        dc_integrated, dc_profile_yaxis = _profile_per_source_frame(dc_integrated, dc_data_combined)
         fig3.add_trace(go.Scatter(y=dc_integrated, 
                                 mode='markers',
                                 marker=dict(size=MARKERSIZE),
                                 name="DC"), row=1, col=2)
-        fig3.update_xaxes(title_text="File image index", row=1, col=2)
-        fig3.update_yaxes(title_text="Transmission (a.u.)", row=1, col=2)
+        fig3.update_xaxes(title_text=profile_xaxis_title, row=1, col=2)
+        fig3.update_yaxes(title_text=dc_profile_yaxis, row=1, col=2)
         # Ensure equal aspect ratio for heatmap (square pixels)
         fig3.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
         fig3.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
@@ -2333,6 +2604,16 @@ def combine_images(
 
 
 def perform_normalization(_sample_data=None, ob_data_combined=None, dc_data_combined=None):
+    if ob_data_combined is None:
+        if dc_data_combined is not None:
+            raise ValueError("Dark-current subtraction requires an open-beam reference.")
+        logging.info("normalization without OB: treating sample data as already normalized")
+        _normalized_data = np.asarray(_sample_data).copy()
+        _integrated_normalized_data = np.nanmean(_normalized_data, axis=0)
+        return {
+            'normalized_data': _normalized_data,
+            'integrated_normalized_data': _integrated_normalized_data,
+        }
     
     # working on each image (TOF) independently
     if dc_data_combined is not None:
@@ -2376,6 +2657,8 @@ def perform_spectrum_normalization(
     dc_data_combined_variance=None,
     dc_data_combined_variance_for_spectrum=None,
     black_filter_background_profile=None,
+    bragg_edge_cd_background_profile=None,
+    measured_background_profiles=None,
 ):
     if roi is None:
         return None
@@ -2386,10 +2669,15 @@ def perform_spectrum_normalization(
     else:
         sample_roi_variance = calculate_roi_profile(data=sample_variance, roi=roi)
 
-    ob_roi_counts = np.asarray(ob_data_combined_for_spectrum, dtype=np.float64)
-    if ob_data_combined_variance_for_spectrum is None:
-        ob_roi_variance = np.asarray(ob_roi_counts, dtype=np.float64)
+    if ob_data_combined_for_spectrum is None:
+        roi_pixel_count = float(roi.width * roi.height)
+        ob_roi_counts = np.full_like(sample_roi_counts, roi_pixel_count, dtype=np.float64)
+        ob_roi_variance = np.zeros_like(sample_roi_counts, dtype=np.float64)
     else:
+        ob_roi_counts = np.asarray(ob_data_combined_for_spectrum, dtype=np.float64)
+    if ob_data_combined_for_spectrum is not None and ob_data_combined_variance_for_spectrum is None:
+        ob_roi_variance = np.asarray(ob_roi_counts, dtype=np.float64)
+    elif ob_data_combined_for_spectrum is not None:
         ob_roi_variance = np.asarray(ob_data_combined_variance_for_spectrum, dtype=np.float64)
 
     spectrum_result = {
@@ -2466,6 +2754,11 @@ def perform_spectrum_normalization(
     )
     if black_filter_background_profile is not None:
         spectrum_result.update(black_filter_background_profile)
+    if bragg_edge_cd_background_profile is not None:
+        spectrum_result.update(bragg_edge_cd_background_profile)
+    for measured_background_profile in measured_background_profiles or []:
+        if measured_background_profile is not None:
+            spectrum_result.update(measured_background_profile)
     logging.info(f"{np.shape(spectrum_result['spectrum_normalization']) = }")
     return spectrum_result
 
@@ -2493,6 +2786,8 @@ def export_normalized_data(ob_master_dict=None,
 
     list_ob_runs = list(ob_master_dict.keys())
     str_ob_runs = "_".join([str(_ob_run_number) for _ob_run_number in list_ob_runs])
+    if not str_ob_runs:
+        str_ob_runs = "no_open_beam"
     full_output_folder = os.path.join(
         output_folder, f"normalized_sample_{_sample_run_number}_obs_{str_ob_runs}{output_suffix}"
     )  # issue for WEI here !
@@ -2509,17 +2804,32 @@ def export_normalized_data(ob_master_dict=None,
         full_file_name = os.path.join(full_output_folder, "spectrum_normalization_profile.txt")
         if bin_metadata is not None:
             bin_index_array = bin_metadata["active_bin_index_array"]
+            source_frame_count_array = bin_metadata.get(
+                "source_frame_count_array",
+                np.ones(len(bin_index_array), dtype=int),
+            )
+            starting_tof_micros = bin_metadata["starting_tof_array"] * 1e6
+            ending_tof_micros = bin_metadata["ending_tof_array"] * 1e6
+            effective_tof_span_micros = ending_tof_micros - starting_tof_micros
             mean_tof_micros = bin_metadata["mean_tof_array"] * 1e6
             mean_lambda = bin_metadata["mean_lambda_array"]
             mean_energy = bin_metadata["mean_energy_array"]
         else:
             bin_index_array = np.arange(len(lambda_array))
+            source_frame_count_array = np.ones(len(bin_index_array), dtype=int)
+            starting_tof_micros = None if tof_array is None else np.asarray(tof_array, dtype=np.float64) * 1e6
+            ending_tof_micros = None if tof_array is None else np.asarray(tof_array, dtype=np.float64) * 1e6
+            effective_tof_span_micros = np.zeros(len(bin_index_array), dtype=np.float64)
             mean_tof_micros = None if tof_array is None else np.asarray(tof_array, dtype=np.float64) * 1e6
             mean_lambda = lambda_array
             mean_energy = energy_array
 
         pd_dataframe_dict = {
             "bin index": bin_index_array,
+            "source frame count": source_frame_count_array,
+            "starting_tof (micros)": starting_tof_micros,
+            "ending_tof (micros)": ending_tof_micros,
+            "effective_tof_span (micros)": effective_tof_span_micros,
             "mean_tof (micros)": mean_tof_micros,
             "mean_lambda (Angstroms)": mean_lambda,
             "mean_energy (eV)": mean_energy,
@@ -2566,6 +2876,84 @@ def export_normalized_data(ob_master_dict=None,
                     "black-filter corrected spectrum normalization uncertainty",
                 ),
             ]
+            measured_background_metadata = []
+            for metadata_key, metadata in _spectrum_normalized_data.items():
+                if (
+                    metadata_key.endswith("_background_metadata")
+                    and metadata_key != "black_filter_background_metadata"
+                    and isinstance(metadata, dict)
+                ):
+                    prefix = metadata.get("key_prefix") or metadata_key.removesuffix("_background_metadata")
+                    measured_background_metadata.append((prefix, metadata))
+
+            for background_prefix, background_metadata in measured_background_metadata:
+                background_column_label = background_metadata.get("column_label", "Cd-filter")
+                ordered_columns += [
+                    (
+                        f"{background_prefix}_raw_sample_roi_counts",
+                        f"{background_column_label} raw sample ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_raw_sample_roi_uncertainty",
+                        f"{background_column_label} raw sample ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_raw_ob_roi_counts",
+                        f"{background_column_label} raw OB ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_raw_ob_roi_uncertainty",
+                        f"{background_column_label} raw OB ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_sample_background_roi_counts",
+                        f"{background_column_label} sample background ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_sample_background_roi_uncertainty",
+                        f"{background_column_label} sample background ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_ob_background_roi_counts",
+                        f"{background_column_label} OB background ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_ob_background_roi_uncertainty",
+                        f"{background_column_label} OB background ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_sample_roi_counts",
+                        f"{background_column_label} corrected sample ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_sample_roi_uncertainty",
+                        f"{background_column_label} corrected sample ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_ob_roi_counts",
+                        f"{background_column_label} corrected OB ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_ob_roi_uncertainty",
+                        f"{background_column_label} corrected OB ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_uncorrected_spectrum_normalization",
+                        f"{background_column_label} uncorrected spectrum normalization",
+                    ),
+                    (
+                        f"{background_prefix}_uncorrected_spectrum_normalization_uncertainty",
+                        f"{background_column_label} uncorrected spectrum normalization uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_spectrum_normalization",
+                        f"{background_column_label} corrected spectrum normalization",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_spectrum_normalization_uncertainty",
+                        f"{background_column_label} corrected spectrum normalization uncertainty",
+                    ),
+                ]
             for source_key, output_key in ordered_columns:
                 values = _spectrum_normalized_data.get(source_key)
                 if values is not None:
@@ -2578,11 +2966,28 @@ def export_normalized_data(ob_master_dict=None,
         pd_dataframe.attrs['uncertainty model'] = uncertainty_model_label or (
             "Poisson counting statistics; proton charge treated as an exact scale factor"
         )
+        if bin_metadata is not None:
+            pd_dataframe.attrs["rebin snap to native grid"] = bin_metadata.get(
+                "rebin_snap_to_native_grid",
+                False,
+            )
         if isinstance(_spectrum_normalized_data, dict):
             black_filter_background_metadata = _spectrum_normalized_data.get("black_filter_background_metadata")
             if black_filter_background_metadata:
                 for key, value in black_filter_background_metadata.items():
                     pd_dataframe.attrs[f"black-filter background {key}"] = value
+            for metadata_key, metadata in _spectrum_normalized_data.items():
+                if (
+                    metadata_key.endswith("_background_metadata")
+                    and metadata_key != "black_filter_background_metadata"
+                    and isinstance(metadata, dict)
+                ):
+                    metadata_prefix = metadata.get(
+                        "mode",
+                        "Cd-filter background correction for Bragg edge mode",
+                    )
+                    for key, value in metadata.items():
+                        pd_dataframe.attrs[f"{metadata_prefix} {key}"] = value
                         
         with open(full_file_name, 'w') as f:
             for key, value in pd_dataframe.attrs.items():

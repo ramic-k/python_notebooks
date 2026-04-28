@@ -74,13 +74,33 @@ class NormalizationTof:
     dict_sample = {}
     dict_ob = {}
     dict_dc = {}
+    dict_bragg_edge_cd_sample_background = {}
+    dict_bragg_edge_cd_ob_background = {}
+    dict_closed_slits_sample_background = {}
+    dict_closed_slits_ob_background = {}
 
     # {'short_name': 'full_path_data'}
-    dict_short_name_full_path = {"sample": {}, "ob": {}, "dc": {}}
+    dict_short_name_full_path = {
+        "sample": {},
+        "ob": {},
+        "dc": {},
+        "bragg_edge_cd_sample_background": {},
+        "bragg_edge_cd_ob_background": {},
+        "closed_slits_sample_background": {},
+        "closed_slits_ob_background": {},
+    }
 
     dict_ob_runs = None
     dict_ob_data = None
     dict_dc_data = None
+    bragg_edge_cd_sample_background_run_numbers_selected = None
+    bragg_edge_cd_ob_background_run_numbers_selected = None
+    bragg_edge_cd_sample_background_check_nbr_tiff = []
+    bragg_edge_cd_ob_background_check_nbr_tiff = []
+    closed_slits_sample_background_run_numbers_selected = None
+    closed_slits_ob_background_run_numbers_selected = None
+    closed_slits_sample_background_check_nbr_tiff = []
+    closed_slits_ob_background_check_nbr_tiff = []
 
     roi = None  # full spectrum ROI
     
@@ -177,6 +197,24 @@ class NormalizationTof:
         self.dict_dc_runs = None
         self.dict_dc_data = None
         self.check_nbr_tiff[DataType.dc] = []
+
+    def reset_measured_background_dicts(self, background_key: str, role: str):
+        short_key = f"{background_key}_{role}_background"
+        self.dict_short_name_full_path[short_key] = {}
+        setattr(self, f"dict_{short_key}", {})
+        setattr(self, f"{short_key}_check_nbr_tiff", [])
+
+    def reset_bragg_edge_cd_sample_background_dicts(self):
+        self.reset_measured_background_dicts("bragg_edge_cd", "sample")
+
+    def reset_bragg_edge_cd_ob_background_dicts(self):
+        self.reset_measured_background_dicts("bragg_edge_cd", "ob")
+
+    def reset_closed_slits_sample_background_dicts(self):
+        self.reset_measured_background_dicts("closed_slits", "sample")
+
+    def reset_closed_slits_ob_background_dicts(self):
+        self.reset_measured_background_dicts("closed_slits", "ob")
 
     def setup_default_paths(self):
         notebook_logging.info("Setting up default paths...")
@@ -711,6 +749,124 @@ class NormalizationTof:
                 display(HTML(f"<span style='color:red'>No valid DC runs found (different number of DC and sample TIFF files)</span>"))
                 notebook_logging.info("WARNING: No valid DC runs found!")
 
+    def _select_measured_background_run_numbers(
+        self,
+        background_key: str,
+        role: str,
+        background_label: str,
+    ):
+        label = "sample" if role == "sample" else "OB"
+        short_key = f"{background_key}_{role}_background"
+        widget_name = f"{short_key}_run_numbers_widget"
+        selected_attr = f"{short_key}_run_numbers_selected"
+        setattr(
+            self,
+            widget_name,
+            widgets.Textarea(value="", placeholder="", layout=widgets.Layout(width="400px")),
+        )
+        display(HTML(
+            f"<b><font color='green'>List of {label} {background_label} background run numbers "
+            "for Bragg edge / background-correction mode</font></b>"
+        ))
+        display(getattr(self, widget_name))
+        display(HTML("<span style='font-size: 16px; color:red'>OR</span>"))
+        self.select_folder(
+            instruction=f"Browse {label} {background_label} background run folders",
+            next_function=lambda folder_selected, attr=selected_attr: setattr(self, attr, folder_selected),
+            start_dir=self.sample_folder if role == "sample" else self.ob_folder,
+            multiple=True,
+        )
+        setattr(self, selected_attr, getattr(self, selected_attr, None))
+
+    def _select_bragg_edge_cd_background_run_numbers(self, role: str):
+        self._select_measured_background_run_numbers("bragg_edge_cd", role, "Cd-filter")
+
+    def select_bragg_edge_cd_sample_background_run_numbers(self):
+        self._select_bragg_edge_cd_background_run_numbers("sample")
+
+    def select_bragg_edge_cd_ob_background_run_numbers(self):
+        self._select_bragg_edge_cd_background_run_numbers("ob")
+
+    def select_closed_slits_sample_background_run_numbers(self):
+        self._select_measured_background_run_numbers("closed_slits", "sample", "closed-slits")
+
+    def select_closed_slits_ob_background_run_numbers(self):
+        self._select_measured_background_run_numbers("closed_slits", "ob", "closed-slits")
+
+    def _check_measured_background(self, background_key: str, role: str, background_label: str):
+        label = "sample" if role == "sample" else "OB"
+        short_key = f"{background_key}_{role}_background"
+        widget = getattr(self, f"{short_key}_run_numbers_widget", None)
+        selected_attr = f"{short_key}_run_numbers_selected"
+        dict_attr = f"dict_{short_key}"
+        check_attr = f"{short_key}_check_nbr_tiff"
+        self.reset_measured_background_dicts(background_key, role)
+        display(HTML(f"{label} {background_label} background runs selected:"))
+
+        full_paths = []
+        if widget is not None and widget.value.strip() != "":
+            for run_number in extract_list_of_runs_from_string(widget.value):
+                full_paths.append(self.extract_full_path(run_number=run_number))
+        else:
+            selected = getattr(self, selected_attr, None)
+            if selected is None:
+                display(HTML(f"<span style='color:red'>No {label} {background_label} background runs selected!</span>"))
+                return
+            full_paths = [os.path.abspath(_run) for _run in selected]
+
+        for full_path in full_paths:
+            if not os.path.exists(full_path):
+                display(HTML(f"<span style='color:red'>{full_path} - NOT FOUND!</span>"))
+                continue
+            is_valid_run, report_dict = self.check_folder_is_valid(full_path)
+            if not is_valid_run:
+                display(HTML(f"<span style='color:red'>{full_path} - EMPTY!</span>"))
+                continue
+
+            nbr_tiff = report_dict["nbr_tiff"]
+            getattr(self, check_attr).append(nbr_tiff)
+            getattr(self, dict_attr)[full_path] = {}
+            self.dict_short_name_full_path[short_key][os.path.basename(full_path)] = full_path
+            display(HTML(f"<span style='color:green'>{full_path}</span> - OK"))
+
+            _is_summary_json_file_found, _summary_dict = NormalizationTof._is_summary_json_file_found(full_path)
+            correct_chips_alignment_flag = (
+                _summary_dict.get("chips_alignment_correction", None) if _is_summary_json_file_found else None
+            )
+            self.display_infos(
+                input_full_path=full_path,
+                correct_chips_alignment_flag=correct_chips_alignment_flag,
+            )
+
+        if len(getattr(self, check_attr)) == 0:
+            display(HTML(f"<span style='color:red'>No valid {label} {background_label} background runs found!</span>"))
+        elif len(set(getattr(self, check_attr))) > 1:
+            display(HTML(
+                f"<span style='color:red'>Warning: Different number of TIFF files found in selected "
+                    f"{label} {background_label} background runs: {getattr(self, check_attr)}</span>"
+            ))
+        elif len(self.check_nbr_tiff[DataType.sample]) > 0 and getattr(self, check_attr)[0] != self.check_nbr_tiff[DataType.sample][0]:
+            display(HTML(
+                f"<span style='color:red'>Warning: {label} {background_label} background runs have a different "
+                f"number of TIFF files than the sample run.</span>"
+            ))
+        setattr(self, selected_attr, None)
+
+    def _check_bragg_edge_cd_background(self, role: str):
+        self._check_measured_background("bragg_edge_cd", role, "Cd-filter")
+
+    def check_bragg_edge_cd_sample_background(self):
+        self._check_bragg_edge_cd_background("sample")
+
+    def check_bragg_edge_cd_ob_background(self):
+        self._check_bragg_edge_cd_background("ob")
+
+    def check_closed_slits_sample_background(self):
+        self._check_measured_background("closed_slits", "sample", "closed-slits")
+
+    def check_closed_slits_ob_background(self):
+        self._check_measured_background("closed_slits", "ob", "closed-slits")
+
     def _load_and_get_integrated_ob(self, full_path):
         """
         Load the integrated open beam data from the given OB run path.
@@ -964,6 +1120,31 @@ class NormalizationTof:
                 all_nexus_files_found = False
                 self.dict_dc[full_path]["nexus"] = None
 
+        for label, background_dict in [
+            ("sample Cd-filter measured background", self.dict_bragg_edge_cd_sample_background),
+            ("OB Cd-filter measured background", self.dict_bragg_edge_cd_ob_background),
+            ("sample closed-slits measured background", self.dict_closed_slits_sample_background),
+            ("OB closed-slits measured background", self.dict_closed_slits_ob_background),
+        ]:
+            notebook_logging.info(f"\tworking with {label} runs:")
+            for full_path in background_dict.keys():
+                if self.detector_type == DetectorType.tpx1_legacy:
+                    run_number = os.path.basename(full_path).split("_")[1]
+                elif self.detector_type in [DetectorType.tpx1, DetectorType.tpx3]:
+                    file_name_split = os.path.basename(full_path).split("_")
+                    run_number = file_name_split[2]
+
+                nexus_full_path = os.path.join(
+                    self.nexus_folder, f"{self.instrument.upper()}_{run_number}.nxs.h5"
+                )
+                if os.path.exists(nexus_full_path):
+                    notebook_logging.info(f"\tNeXus file found: {nexus_full_path}")
+                    background_dict[full_path]["nexus"] = nexus_full_path
+                else:
+                    notebook_logging.warning(f"\tNeXus file NOT found: {nexus_full_path}")
+                    all_nexus_files_found = False
+                    background_dict[full_path]["nexus"] = None
+
         notebook_logging.info("Done retrieving NeXus file paths.")
 
         return all_nexus_files_found
@@ -976,6 +1157,81 @@ class NormalizationTof:
             # disable the widgets
             disable_widgets = True
         self.remove_container_options_flag.disabled = disable_widgets
+
+    def _set_measured_background_inputs_enabled(self, background_key: str, enabled: bool):
+        for role in ["sample", "ob"]:
+            widget = getattr(self, f"{background_key}_{role}_background_run_numbers_widget", None)
+            if widget is not None:
+                widget.disabled = not enabled
+
+        input_box = getattr(self, f"{background_key}_background_input_box", None)
+        if input_box is not None:
+            input_box.layout.display = None if enabled else "none"
+
+    def _on_measured_background_flag_change(self, background_key: str, change):
+        self._set_measured_background_inputs_enabled(background_key, bool(change["new"]))
+
+    def _create_measured_background_run_input_box(self, background_key: str, background_label: str):
+        sample_widget = widgets.Textarea(
+            value="",
+            placeholder="e.g. 19537, 19538",
+            description="sample bg:",
+            disabled=True,
+            layout=widgets.Layout(width="520px", height="55px"),
+        )
+        ob_widget = widgets.Textarea(
+            value="",
+            placeholder="e.g. 19536",
+            description="OB bg:",
+            disabled=True,
+            layout=widgets.Layout(width="520px", height="55px"),
+        )
+        setattr(self, f"{background_key}_sample_background_run_numbers_widget", sample_widget)
+        setattr(self, f"{background_key}_ob_background_run_numbers_widget", ob_widget)
+
+        input_box = widgets.VBox(
+            [
+                widgets.HTML(
+                    f"<span style='font-size: 12px;'>Enter {background_label} background run numbers. "
+                    "Use the same run-number syntax as sample/OB selection, e.g. 19537 or 19537-19538.</span>"
+                ),
+                sample_widget,
+                ob_widget,
+            ],
+            layout=widgets.Layout(
+                display="none",
+                margin="0 0 8px 28px",
+                border="1px solid #ddd",
+                padding="6px",
+                width="590px",
+            ),
+        )
+        setattr(self, f"{background_key}_background_input_box", input_box)
+        return input_box
+
+    def _collect_enabled_measured_background_run_numbers(self):
+        background_specs = [
+            (
+                "bragg_edge_cd",
+                "Cd-filter",
+                getattr(self, "bragg_edge_cd_background_flag", None),
+            ),
+            (
+                "closed_slits",
+                "closed-slits",
+                getattr(self, "closed_slits_background_flag", None),
+            ),
+        ]
+        for background_key, background_label, flag_widget in background_specs:
+            if flag_widget is None or not flag_widget.value:
+                continue
+            for role in ["sample", "ob"]:
+                short_key = f"{background_key}_{role}_background"
+                dict_attr = f"dict_{short_key}"
+                widget = getattr(self, f"{short_key}_run_numbers_widget", None)
+                widget_has_value = widget is not None and widget.value.strip() != ""
+                if widget_has_value or not getattr(self, dict_attr):
+                    self._check_measured_background(background_key, role, background_label)
 
     def _on_rebin_mode_change(self, change):
         selected_mode = change["new"]
@@ -991,7 +1247,25 @@ class NormalizationTof:
         self.rebin_custom_schedule_ui.disabled = custom_schedule_disabled
         if hasattr(self, "preview_rebin_boundaries_button"):
             self.preview_rebin_boundaries_button.disabled = selected_mode == RebinMode.none
+        self._update_rebin_snap_to_native_grid_state()
         self._update_custom_schedule_help()
+
+    def _fixed_width_rebin_mode_supports_native_snap(self):
+        selected_mode = self.rebin_mode_ui.value
+        if selected_mode in [RebinMode.linear_tof, RebinMode.linear_lambda]:
+            return True
+        if not hasattr(self, "rebin_custom_scale_ui") or not hasattr(self, "rebin_custom_basis_ui"):
+            return False
+        return (
+            selected_mode == RebinMode.custom_schedule
+            and self.rebin_custom_scale_ui.value == RebinCustomScale.linear
+            and self.rebin_custom_basis_ui.value in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+        )
+
+    def _update_rebin_snap_to_native_grid_state(self):
+        if not hasattr(self, "rebin_snap_to_native_grid_ui"):
+            return
+        self.rebin_snap_to_native_grid_ui.disabled = not self._fixed_width_rebin_mode_supports_native_snap()
 
     def _get_custom_schedule_scale_options(self):
         if self.rebin_custom_basis_ui.value == RebinCustomBasis.lambda_squared:
@@ -1036,9 +1310,11 @@ class NormalizationTof:
 
     def _on_custom_schedule_basis_change(self, change):
         self._update_custom_schedule_scale_options()
+        self._update_rebin_snap_to_native_grid_state()
         self._update_custom_schedule_help()
 
     def _on_custom_schedule_scale_change(self, change):
+        self._update_rebin_snap_to_native_grid_state()
         self._update_custom_schedule_help()
 
     def _on_black_filter_background_flag_change(self, change):
@@ -1243,6 +1519,14 @@ class NormalizationTof:
             rebin_custom_scale=self.rebin_custom_scale_ui.value if rebin_mode == RebinMode.custom_schedule else None,
             rebin_custom_schedule=rebin_custom_schedule,
             rebin_full_bins_only=self.rebin_full_bins_only_ui.value,
+            rebin_snap_to_native_grid=(
+                self.rebin_snap_to_native_grid_ui.value
+                if (
+                    hasattr(self, "rebin_snap_to_native_grid_ui")
+                    and self._fixed_width_rebin_mode_supports_native_snap()
+                )
+                else False
+            ),
         )
         return tof_array, lambda_array, energy_array, bin_groups, bin_edges
 
@@ -1263,9 +1547,19 @@ class NormalizationTof:
 
             _, _, _, bin_groups, _ = self._build_current_rebin_groups_for_preview()
             active_bin_count = np.sum([len(_group) > 0 for _group in bin_groups])
+            source_frame_counts = np.asarray([len(_group) for _group in bin_groups if len(_group) > 0], dtype=int)
+            if len(source_frame_counts) > 0:
+                unique_counts, count_counts = np.unique(source_frame_counts, return_counts=True)
+                source_frame_summary = ", ".join(
+                    f"{int(_count)} frames: {int(_n)} bins"
+                    for _count, _n in zip(unique_counts, count_counts)
+                )
+            else:
+                source_frame_summary = "none"
             self.rebin_bin_count_ui.value = (
                 f"<span style='font-size: 12px; color: #2b6;'>"
-                f"Active bins with current settings: {int(active_bin_count)}</span>"
+                f"Active bins with current settings: {int(active_bin_count)} "
+                f"({source_frame_summary})</span>"
             )
         except Exception as exc:
             self.rebin_bin_count_ui.value = (
@@ -1282,6 +1576,7 @@ class NormalizationTof:
             self.rebin_delta_lambda_over_lambda_ui,
             self.rebin_delta_lambda_squared_a2_ui,
             self.rebin_full_bins_only_ui,
+            self.rebin_snap_to_native_grid_ui,
             self.rebin_custom_basis_ui,
             self.rebin_custom_scale_ui,
             self.rebin_custom_schedule_ui,
@@ -1759,6 +2054,23 @@ class NormalizationTof:
         )
         display(self.rebin_full_bins_only_ui)
 
+        self.rebin_snap_to_native_grid_ui = widgets.Checkbox(
+            description="Snap fixed-width bins to native TOF grid",
+            value=True,
+            disabled=True,
+            layout=widgets.Layout(width="420px"),
+        )
+        display(
+            HTML(
+                "<span style='font-size: 12px;'>"
+                "For fixed-width TOF/lambda bins, round the requested bin width to an integer number of native "
+                "source frames. This avoids alternating 5-frame/6-frame bins when, for example, 30 us is not an "
+                "integer multiple of the native TPX1 TOF spacing."
+                "</span>"
+            )
+        )
+        display(self.rebin_snap_to_native_grid_ui)
+
         self.rebin_custom_basis_ui = widgets.Dropdown(
             options=[RebinCustomBasis.tof, RebinCustomBasis.lambda_, RebinCustomBasis.lambda_squared],
             value=RebinCustomBasis.tof,
@@ -1819,6 +2131,7 @@ class NormalizationTof:
         self.preview_rebin_boundaries_button.on_click(self.preview_rebin_boundaries_clicked)
         self.rebin_bin_count_ui = widgets.HTML()
         self.rebin_preview_output_ui = widgets.Output()
+        self._update_rebin_snap_to_native_grid_state()
         self._observe_rebin_preview_controls()
         self._update_rebin_bin_count_display()
         display(self.rebin_bin_count_ui)
@@ -1902,6 +2215,53 @@ class NormalizationTof:
                     self.black_filter_background_flag,
                     self.black_filter_background_shape_file_ui,
                     self.black_filter_background_anchor_energy_ui,
+                ]
+            )
+        )
+
+        display(HTML("<hr>"))
+        display(HTML("<span style='font-size: 16px; color:red'>Measured background correction for Bragg edge mode</span>"))
+        display(HTML(
+            "<span style='font-size: 12px;'>"
+            "Optional. Enable only when separate background runs were measured for both sample "
+            "and OB. The selected mode controls how the background runs are labeled in the "
+            "export; the correction itself subtracts proton-charge-normalized sample and OB "
+            "background estimates on the native frame grid before TOF rebinning and normalization."
+            "</span>"
+        ))
+        self.bragg_edge_cd_background_flag = widgets.Checkbox(
+            description="Enable Cd-filter background correction for Bragg edge mode",
+            value=False,
+            layout=widgets.Layout(width="650px"),
+        )
+        self.bragg_edge_cd_background_flag.observe(
+            lambda change: self._on_measured_background_flag_change("bragg_edge_cd", change),
+            names="value",
+        )
+        bragg_edge_cd_background_input_box = self._create_measured_background_run_input_box(
+            "bragg_edge_cd",
+            "Cd-filter",
+        )
+        self.closed_slits_background_flag = widgets.Checkbox(
+            description="Enable closed-slits background correction",
+            value=False,
+            layout=widgets.Layout(width="650px"),
+        )
+        self.closed_slits_background_flag.observe(
+            lambda change: self._on_measured_background_flag_change("closed_slits", change),
+            names="value",
+        )
+        closed_slits_background_input_box = self._create_measured_background_run_input_box(
+            "closed_slits",
+            "closed-slits",
+        )
+        display(
+            widgets.VBox(
+                [
+                    self.bragg_edge_cd_background_flag,
+                    bragg_edge_cd_background_input_box,
+                    self.closed_slits_background_flag,
+                    closed_slits_background_input_box,
                 ]
             )
         )
@@ -2393,6 +2753,12 @@ class NormalizationTof:
      
     def save_dc_run_numbers_selected(self, folder_selected):
         self.dc_run_numbers_selected = folder_selected
+
+    def save_bragg_edge_cd_sample_background_run_numbers_selected(self, folder_selected):
+        self.bragg_edge_cd_sample_background_run_numbers_selected = folder_selected
+
+    def save_bragg_edge_cd_ob_background_run_numbers_selected(self, folder_selected):
+        self.bragg_edge_cd_ob_background_run_numbers_selected = folder_selected
         
     def output_folder_selected(self, folder_selected):
 
@@ -2469,6 +2835,9 @@ class NormalizationTof:
         if self.instrument == "SNAP":
             detector_delay_us = self.detector_offset_us.value
 
+        self._collect_enabled_measured_background_run_numbers()
+        self.retrieve_nexus_file_path()
+
         sample_dict = {}
         for _full_path in self.dict_sample.keys():
             sample_dict[os.path.basename(_full_path)] = {
@@ -2491,6 +2860,34 @@ class NormalizationTof:
                     "full_path": _full_path,
                     "nexus": self.dict_dc[_full_path]["nexus"],
                 }
+
+        def _make_background_input_dict(background_dict, label):
+            output_dict = {}
+            if background_dict:
+                logging.info(f"{label} runs provided for Bragg edge mode")
+                for _full_path in background_dict.keys():
+                    output_dict[os.path.basename(_full_path)] = {
+                        "full_path": _full_path,
+                        "nexus": background_dict[_full_path]["nexus"],
+                    }
+            return output_dict
+
+        bragg_edge_cd_sample_background_dict = _make_background_input_dict(
+            self.dict_bragg_edge_cd_sample_background,
+            "Sample Cd-filter measured background",
+        )
+        bragg_edge_cd_ob_background_dict = _make_background_input_dict(
+            self.dict_bragg_edge_cd_ob_background,
+            "OB Cd-filter measured background",
+        )
+        closed_slits_sample_background_dict = _make_background_input_dict(
+            self.dict_closed_slits_sample_background,
+            "Sample closed-slits measured background",
+        )
+        closed_slits_ob_background_dict = _make_background_input_dict(
+            self.dict_closed_slits_ob_background,
+            "OB closed-slits measured background",
+        )
 
         if self.correct_chips_alignment_flag.value:
             if self.detector_type in [DetectorType.tpx1_legacy, DetectorType.tpx1]:
@@ -2519,11 +2916,42 @@ class NormalizationTof:
                 "background_shape_file": self.black_filter_background_shape_file_ui.value,
                 "anchor_energy_eV": self.black_filter_background_anchor_energy_ui.value,
             }
+        measured_background_configs = []
+        if getattr(self, "bragg_edge_cd_background_flag", None) is not None and self.bragg_edge_cd_background_flag.value:
+            measured_background_configs.append(
+                {
+                    "key": "cd",
+                    "enabled": True,
+                    "mode": "Cd-filter background correction for Bragg edge mode",
+                    "column_label": "Cd-filter",
+                    "key_prefix": "bragg_edge_cd",
+                    "sample_background_dict": bragg_edge_cd_sample_background_dict,
+                    "ob_background_dict": bragg_edge_cd_ob_background_dict,
+                    "weight": 1.0,
+                }
+            )
+        if getattr(self, "closed_slits_background_flag", None) is not None and self.closed_slits_background_flag.value:
+            measured_background_configs.append(
+                {
+                    "key": "closed_slits",
+                    "enabled": True,
+                    "mode": "Closed-slits background correction for Bragg edge mode",
+                    "column_label": "closed-slits",
+                    "key_prefix": "closed_slits",
+                    "sample_background_dict": closed_slits_sample_background_dict,
+                    "ob_background_dict": closed_slits_ob_background_dict,
+                    "weight": 1.0,
+                }
+            )
+        for _config in measured_background_configs:
+            _config.pop("key", None)
 
         self.normalized_dict = normalization_with_list_of_full_path(
             sample_dict=sample_dict,
             ob_dict=ob_dict,
             dc_dict=dc_dict,
+            bragg_edge_cd_sample_background_dict=bragg_edge_cd_sample_background_dict,
+            bragg_edge_cd_ob_background_dict=bragg_edge_cd_ob_background_dict,
             spectra_array=spectra_array,
             output_folder=output_folder,
             proton_charge_flag=self.proton_charge_flag.value,
@@ -2569,8 +2997,18 @@ class NormalizationTof:
             ),
             rebin_custom_schedule=rebin_custom_schedule,
             rebin_full_bins_only=self.rebin_full_bins_only_ui.value if rebin_mode != RebinMode.none else False,
+            rebin_snap_to_native_grid=(
+                self.rebin_snap_to_native_grid_ui.value
+                if (
+                    rebin_mode != RebinMode.none
+                    and hasattr(self, "rebin_snap_to_native_grid_ui")
+                    and self._fixed_width_rebin_mode_supports_native_snap()
+                )
+                else False
+            ),
             experimental_uncertainties_flag=self.experimental_uncertainties_flag.value,
             black_filter_background_config=black_filter_background_config,
+            measured_background_correction_configs=measured_background_configs,
         )
         
         display(HTML("<span style='color:blue'>Normalization completed</span>"))
