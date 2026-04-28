@@ -407,6 +407,7 @@ def normalization_with_list_of_full_path(
         current_sample_variance,
         current_time_spectra,
         current_detector_delay_us,
+        current_container_value_array=None,
     ):
         sample_data_for_rebin = current_sample_data
         sample_variance_for_rebin = current_sample_variance
@@ -486,6 +487,34 @@ def normalization_with_list_of_full_path(
             rebin_full_bins_only=rebin_full_bins_only,
             rebin_snap_to_native_grid=rebin_snap_to_native_grid,
         )
+
+        if container_only_without_ob and current_container_value_array is not None:
+            active_frame_groups = rebinned_payload["active_frame_groups"]
+            rebinned_container_value_array = rebin_array_from_bin_groups(
+                current_container_value_array,
+                active_frame_groups,
+                reducer="sum",
+            )
+            logging.info(
+                "Applying container-only normalization after rebinning so each output bin "
+                "uses the summed container reference for the same native frames."
+            )
+            rebinned_payload["sample_data"] = normalize_by_container_value_array(
+                sample_data=rebinned_payload["sample_data"],
+                container_value_array=rebinned_container_value_array,
+            )
+            if rebinned_payload["sample_variance"] is not None:
+                denominator_shape = (rebinned_container_value_array.shape[0],) + (
+                    1,
+                ) * (np.asarray(rebinned_payload["sample_variance"]).ndim - 1)
+                denominator = rebinned_container_value_array.reshape(denominator_shape)
+                rebinned_payload["sample_variance"] = np.divide(
+                    rebinned_payload["sample_variance"],
+                    denominator**2,
+                    out=np.zeros_like(rebinned_payload["sample_variance"], dtype=np.float64),
+                    where=denominator != 0,
+                )
+            rebinned_payload["container_roi_reference_value_array"] = rebinned_container_value_array
 
         rebinned_payload["bragg_edge_cd_background_profile"] = None
         rebinned_payload["measured_background_profiles"] = []
@@ -779,22 +808,33 @@ def normalization_with_list_of_full_path(
             if verbose:
                 display(HTML("Combined sample data normalized by total proton charge during image combination"))
 
+        current_container_value_array = None
+        combined_container_roi_file = container_roi_file
         if (container_roi is not None) or (container_roi_file is not None):
-                logging.info(f"Applying container normalization:")
-                logging.info(f"\t {container_roi = }")
-                logging.info(f"\t {container_roi_file = }")
-                if verbose:
-                    display(HTML(f"Applying container normalization:"))
-                
-                sample_data_combined, container_roi_file = normalize_by_container_roi(
+            logging.info(f"Applying container normalization:")
+            logging.info(f"\t {container_roi = }")
+            logging.info(f"\t {combined_container_roi_file = }")
+            if verbose:
+                display(HTML(f"Applying container normalization:"))
+
+            if container_only_without_ob:
+                current_container_value_array, combined_container_roi_file = calculate_container_roi_value_array(
                     sample_data=sample_data_combined,
                     container_roi=container_roi,
-                    container_roi_file=container_roi_file,
+                    container_roi_file=combined_container_roi_file,
                     output_folder=output_folder,
                     sample_run_number=str_list_run_number,
                 )
-                if verbose and (container_roi_file is not None):
-                    display(HTML(f"Container roi file created: {container_roi_file}."))
+            else:
+                sample_data_combined, combined_container_roi_file = normalize_by_container_roi(
+                    sample_data=sample_data_combined,
+                    container_roi=container_roi,
+                    container_roi_file=combined_container_roi_file,
+                    output_folder=output_folder,
+                    sample_run_number=str_list_run_number,
+                )
+            if verbose and (combined_container_roi_file is not None):
+                display(HTML(f"Container roi file created: {combined_container_roi_file}."))
 
         current_detector_delay_us = detector_delay_us
         if current_detector_delay_us is None:
@@ -809,6 +849,7 @@ def normalization_with_list_of_full_path(
             current_sample_variance=sample_data_combined_variance,
             current_time_spectra=time_spectra,
             current_detector_delay_us=current_detector_delay_us,
+            current_container_value_array=current_container_value_array,
         )
 
         sample_data_combined = rebinned_payload["sample_data"]
@@ -951,22 +992,33 @@ def normalization_with_list_of_full_path(
                                                           _sample_run_number, 
                                                           _sample_data)
 
+            current_container_value_array = None
+            container_roi_file_for_run = container_roi_file
             if (container_roi is not None) or (container_roi_file is not None):
                 logging.info(f"Applying container normalization:")
                 logging.info(f"\t {container_roi = }")
-                logging.info(f"\t {container_roi_file = }")
+                logging.info(f"\t {container_roi_file_for_run = }")
                 if verbose:
                     display(HTML(f"Applying container normalization:"))
-                
-                _sample_data, container_roi_file = normalize_by_container_roi(
-                    sample_data=_sample_data,
-                    container_roi=container_roi,
-                    container_roi_file=container_roi_file,
-                    output_folder=output_folder,
-                    sample_run_number=_sample_run_number,
-                )
-                if verbose and (container_roi_file is not None):
-                    display(HTML(f"Container roi file created: {container_roi_file}."))
+
+                if container_only_without_ob:
+                    current_container_value_array, container_roi_file_for_run = calculate_container_roi_value_array(
+                        sample_data=_sample_data,
+                        container_roi=container_roi,
+                        container_roi_file=container_roi_file_for_run,
+                        output_folder=output_folder,
+                        sample_run_number=_sample_run_number,
+                    )
+                else:
+                    _sample_data, container_roi_file_for_run = normalize_by_container_roi(
+                        sample_data=_sample_data,
+                        container_roi=container_roi,
+                        container_roi_file=container_roi_file_for_run,
+                        output_folder=output_folder,
+                        sample_run_number=_sample_run_number,
+                    )
+                if verbose and (container_roi_file_for_run is not None):
+                    display(HTML(f"Container roi file created: {container_roi_file_for_run}."))
 
             sample_proton_charge = None
             if normalized_by_proton_charge:
@@ -1000,6 +1052,7 @@ def normalization_with_list_of_full_path(
                 current_sample_variance=_sample_variance,
                 current_time_spectra=time_spectra,
                 current_detector_delay_us=current_detector_delay_us,
+                current_container_value_array=current_container_value_array,
             )
 
             _sample_data = rebinned_payload["sample_data"]

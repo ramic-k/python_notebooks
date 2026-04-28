@@ -3162,26 +3162,20 @@ def save_container_roi_file(output_folder:str,
     return container_roi_file
     
     
-def normalize_by_container_roi(sample_data: np.ndarray, 
-                               container_roi: Roi,
-                               container_roi_file: str,
-                               output_folder: str,
-                               sample_run_number: str) -> np.ndarray:
-    """normalize sample data subtracting by container roi"""
+def calculate_container_roi_value_array(
+    sample_data: np.ndarray,
+    container_roi: Roi,
+    container_roi_file: str,
+    output_folder: str,
+    sample_run_number: str,
+) -> tuple[np.ndarray, str]:
+    """Return the per-frame mean intensity in the selected container ROI."""
 
-    logging.info(f"in normalize_by_container_roi:")
+    logging.info(f"in calculate_container_roi_value_array:")
     if container_roi_file is not None:
         logging.info(f"\t {container_roi_file = }")
-        _container_value_array: float = read_container_roi_file(container_roi_file=container_roi_file)
+        _container_value_array = read_container_roi_file(container_roi_file=container_roi_file)
         logging.info(f"\t{_container_value_array =}")
-        
-        _normalized_sample = np.empty_like(sample_data)
-        for i, _sample in enumerate(sample_data):
-            _container_value = _container_value_array[i]
-            _log_sample = -np.log(_sample)
-            _log_container_value = -np.log(_container_value)
-            _log_normalized_sample = _log_sample - _log_container_value
-            _normalized_sample[i] = np.exp(- _log_normalized_sample)
 
     else:
         logging.info(f"\t {container_roi = }")
@@ -3190,15 +3184,10 @@ def normalize_by_container_roi(sample_data: np.ndarray,
         width: int = container_roi.width
         height: int = container_roi.height
         
-        _normalized_sample = np.empty_like(sample_data)
         list_container_values = []
         for i, _sample in enumerate(sample_data):
             _container_value = np.mean(np.mean(_sample[y0:y0 + height, x0:x0 + width], axis=0), axis=0)            
             list_container_values.append(_container_value)
-            _log_sample = -np.log(_sample)
-            _log_container_value = -np.log(_container_value)
-            _log_normalized_sample = _log_sample - _log_container_value
-            _normalized_sample[i] = np.exp(- _log_normalized_sample)
         
         # save the container roi file
         container_roi_file = save_container_roi_file(output_folder=output_folder, 
@@ -3206,7 +3195,58 @@ def normalize_by_container_roi(sample_data: np.ndarray,
                                                     container_roi=container_roi,
                                                     list_container_values=list_container_values,
                                                     integrated_image=np.sum(sample_data, axis=0))    
-        
+
+        _container_value_array = list_container_values
+
+    _container_value_array = np.asarray(_container_value_array, dtype=np.float64)
+    if _container_value_array.shape[0] != np.asarray(sample_data).shape[0]:
+        raise ValueError(
+            "Container ROI profile length does not match the sample stack length: "
+            f"{_container_value_array.shape[0]} container values for {np.asarray(sample_data).shape[0]} frames."
+        )
+    return _container_value_array, container_roi_file
+
+
+def normalize_by_container_value_array(
+    sample_data: np.ndarray,
+    container_value_array: np.ndarray,
+) -> np.ndarray:
+    array_data = np.asarray(sample_data, dtype=np.float64)
+    container_values = np.asarray(container_value_array, dtype=np.float64)
+    if container_values.shape[0] != array_data.shape[0]:
+        raise ValueError(
+            "Container ROI profile length does not match the sample stack length: "
+            f"{container_values.shape[0]} container values for {array_data.shape[0]} frames."
+        )
+    denominator_shape = (container_values.shape[0],) + (1,) * (array_data.ndim - 1)
+    denominator = container_values.reshape(denominator_shape)
+    return np.divide(
+        array_data,
+        denominator,
+        out=np.zeros_like(array_data, dtype=np.float64),
+        where=denominator != 0,
+    )
+
+
+def normalize_by_container_roi(sample_data: np.ndarray,
+                               container_roi: Roi,
+                               container_roi_file: str,
+                               output_folder: str,
+                               sample_run_number: str) -> np.ndarray:
+    """Normalize sample data by the mean intensity in a container-only ROI."""
+
+    logging.info(f"in normalize_by_container_roi:")
+    _container_value_array, container_roi_file = calculate_container_roi_value_array(
+        sample_data=sample_data,
+        container_roi=container_roi,
+        container_roi_file=container_roi_file,
+        output_folder=output_folder,
+        sample_run_number=sample_run_number,
+    )
+    _normalized_sample = normalize_by_container_value_array(
+        sample_data=sample_data,
+        container_value_array=_container_value_array,
+    )
     return _normalized_sample, container_roi_file
 
 
