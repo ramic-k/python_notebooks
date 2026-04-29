@@ -1874,6 +1874,229 @@ def make_tiff(data: list, filename: str = "", metadata: dict = None) -> None:
         new_image.save(filename)
 
 
+def _safe_write_integrated_preview_png(
+    output_file: str,
+    integrated_image: np.ndarray,
+    profile: np.ndarray = None,
+    roi: Roi = None,
+    vmin: float = None,
+    vmax: float = None,
+    profile_xaxis_title: str = "File image index",
+) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+
+        if profile is None:
+            fig, axis = plt.subplots(1, 1, figsize=(7, 6), constrained_layout=True)
+            image_axis = axis
+        else:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 6), constrained_layout=True)
+            image_axis = axes[0]
+
+        image = image_axis.imshow(
+            integrated_image,
+            cmap="gray",
+            vmin=vmin,
+            vmax=vmax,
+            origin="upper",
+            aspect="equal",
+        )
+        image_axis.set_title("Integrated Normalized data")
+        fig.colorbar(image, ax=image_axis, fraction=0.046, pad=0.04)
+        if roi is not None:
+            image_axis.add_patch(
+                Rectangle(
+                    (roi.left, roi.top),
+                    roi.width,
+                    roi.height,
+                    linewidth=2,
+                    edgecolor="red",
+                    facecolor="none",
+                )
+            )
+
+        if profile is not None:
+            profile_axis = axes[1]
+            profile_axis.plot(np.arange(len(profile)), profile, ".", markersize=MARKERSIZE)
+            profile_axis.set_title(
+                "pixel by pixel normalization profile of ROI"
+                if roi is not None
+                else "pixel by pixel normalization profile of full image"
+            )
+            profile_axis.set_xlabel(profile_xaxis_title)
+            profile_axis.set_ylabel("Transmission (a.u.)")
+            profile_axis.grid(True, alpha=0.25)
+
+        fig.savefig(output_file, dpi=150)
+        plt.close(fig)
+    except Exception as error:
+        logging.warning(
+            "Unable to export integrated normalized preview PNG %s. Error: %s",
+            output_file,
+            error,
+        )
+
+
+def export_integrated_normalized_preview(
+    output_folder: str,
+    integrated_normalized_image: np.ndarray,
+    normalized_stack: np.ndarray = None,
+    roi: Roi = None,
+    bin_metadata: dict = None,
+) -> None:
+    """Export the integrated-normalized preview plot and its underlying arrays."""
+    os.makedirs(output_folder, exist_ok=True)
+
+    integrated_image = np.asarray(integrated_normalized_image, dtype=np.float64)
+    data_file = os.path.join(output_folder, "normalized_integrated_data.txt")
+    np.savetxt(
+        data_file,
+        integrated_image,
+        fmt="%.8e",
+        header="Integrated normalized image used for the preview heatmap.",
+    )
+    logging.info(f"\t -> Exported integrated normalized preview data to {data_file}")
+
+    profile = None
+    if normalized_stack is not None:
+        stack = np.asarray(normalized_stack, dtype=np.float64)
+        if roi is not None:
+            x0 = roi.left
+            y0 = roi.top
+            width = roi.width
+            height = roi.height
+            profile_step1 = np.nanmean(stack[:, y0:y0 + height, x0:x0 + width], axis=1)
+            profile = np.nanmean(profile_step1, axis=1)
+            profile_label = "ROI mean normalized intensity"
+        else:
+            profile_step1 = np.nanmean(stack, axis=1)
+            profile = np.nanmean(profile_step1, axis=1)
+            profile_label = "full-image mean normalized intensity"
+
+    if profile is not None:
+        profile_xaxis_title = "Rebinned bin index" if bin_metadata is not None else "File image index"
+        profile_dict = {
+            "profile_index": np.arange(len(profile), dtype=int),
+            "integrated_normalized_profile": profile,
+        }
+        if bin_metadata is not None:
+            profile_dict.update(
+                {
+                    "source_frame_count": bin_metadata.get("source_frame_count_array"),
+                    "starting_tof (micros)": bin_metadata.get("starting_tof_array") * 1e6,
+                    "ending_tof (micros)": bin_metadata.get("ending_tof_array") * 1e6,
+                    "mean_tof (micros)": bin_metadata.get("mean_tof_array") * 1e6,
+                    "mean_lambda (Angstroms)": bin_metadata.get("mean_lambda_array"),
+                    "mean_energy (eV)": bin_metadata.get("mean_energy_array"),
+                }
+            )
+        profile_dataframe = pd.DataFrame(profile_dict)
+        profile_dataframe.attrs["profile description"] = profile_label
+        if roi is not None:
+            profile_dataframe.attrs["roi [left, top, width, height]"] = (
+                f"{roi.left}, {roi.top}, {roi.width}, {roi.height}"
+            )
+        profile_file = os.path.join(output_folder, "normalized_integrated_profile.txt")
+        with open(profile_file, "w") as profile_handle:
+            for key, value in profile_dataframe.attrs.items():
+                profile_handle.write(f"# {key}: {value}\n")
+            profile_dataframe.to_csv(profile_handle, index=False)
+        logging.info(f"\t -> Exported integrated normalized preview profile to {profile_file}")
+
+    finite_values = integrated_image[np.isfinite(integrated_image)]
+    if finite_values.size:
+        vmin, vmax = np.percentile(finite_values, [2, 98])
+        vmin = max(vmin, 0)
+        vmax = min(vmax, 1)
+    else:
+        vmin, vmax = 0, 1
+
+    if profile is None:
+        fig = make_subplots(rows=1, cols=1, subplot_titles=["Integrated Normalized data"])
+        fig.add_trace(
+            go.Heatmap(
+                z=integrated_image,
+                colorscale="gray",
+                zmin=vmin,
+                zmax=vmax,
+                showscale=True,
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+    else:
+        profile_title = "pixel by pixel normalization profile of ROI" if roi is not None else (
+            "pixel by pixel normalization profile of full image"
+        )
+        fig = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=["Integrated Normalized data", profile_title],
+            horizontal_spacing=0.15,
+        )
+        fig.add_trace(
+            go.Heatmap(
+                z=integrated_image,
+                colorscale="gray",
+                zmin=vmin,
+                zmax=vmax,
+                showscale=True,
+                showlegend=False,
+                colorbar=dict(x=0.45),
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                y=profile,
+                mode="markers",
+                marker=dict(size=MARKERSIZE),
+                showlegend=False,
+            ),
+            row=1,
+            col=2,
+        )
+        fig.update_xaxes(
+            title_text=profile_xaxis_title,
+            row=1,
+            col=2,
+        )
+        fig.update_yaxes(title_text="Transmission (a.u.)", row=1, col=2)
+
+    if roi is not None:
+        fig.add_shape(
+            type="rect",
+            x0=roi.left,
+            y0=roi.top,
+            x1=roi.left + roi.width,
+            y1=roi.top + roi.height,
+            line=dict(color="red", width=2),
+            fillcolor="rgba(0,0,0,0)",
+            row=1,
+            col=1,
+        )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
+    fig.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
+
+    html_file = os.path.join(output_folder, "normalized_integrated_preview.html")
+    fig.write_html(html_file, include_plotlyjs="cdn")
+    logging.info(f"\t -> Exported integrated normalized preview HTML to {html_file}")
+    _safe_write_integrated_preview_png(
+        output_file=os.path.join(output_folder, "normalized_integrated_preview.png"),
+        integrated_image=integrated_image,
+        profile=profile,
+        roi=roi,
+        vmin=vmin,
+        vmax=vmax,
+        profile_xaxis_title=profile_xaxis_title if profile is not None else "File image index",
+    )
+
+
 def isolate_run_number_from_full_path(run_number_full_path: str) -> str:
     """isolate the run number from the full path"""
     run_number = os.path.basename(run_number_full_path)
@@ -3001,6 +3224,13 @@ def export_normalized_data(ob_master_dict=None,
         logging.info(f"\t -> Exporting integrated normalized data to {full_file_name} ...")
         make_tiff(data=integrated_normalized_data[_sample_run_number], filename=full_file_name)
         logging.info(f"\t -> Exporting integrated normalized data to {full_file_name} is done!")
+        export_integrated_normalized_preview(
+            output_folder=full_output_folder,
+            integrated_normalized_image=integrated_normalized_data[_sample_run_number],
+            normalized_stack=normalized_data.get(_sample_run_number) if normalized_data is not None else None,
+            roi=roi,
+            bin_metadata=bin_metadata,
+        )
 
     if export_corrected_stack_of_normalized_data:
         output_stack_folder = os.path.join(full_output_folder, "stack")

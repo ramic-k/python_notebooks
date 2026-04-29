@@ -2685,7 +2685,10 @@ class NormalizationTof:
             disabled=True,
         )
         self.export_corrected_integrated_normalized_data = widgets.Checkbox(
-            description="Export integrated normalized data (integrated sample divide by integrated ob)", 
+            description=(
+                "Export integrated normalized data, preview plot, and preview data "
+                "(integrated sample divide by integrated ob)"
+            ),
             layout=widgets.Layout(width="100%"), 
             value=False
         )
