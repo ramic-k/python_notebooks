@@ -1531,7 +1531,9 @@ def preview_normalized_data(_sample_data, ob_data_combined, dc_data_combined,
     fig.update_xaxes(title_text=profile_xaxis_title, row=1, col=2)
     fig.update_yaxes(title_text=sample_profile_yaxis, row=1, col=2)
     # Ensure equal aspect ratio for heatmap (square pixels)
-    fig.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
+    # Match the detector-image convention used by Matplotlib:
+    # pixel row 0 is displayed at the top of the image.
+    fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1, row=1, col=1)
     fig.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
     fig.show()
 
@@ -2080,7 +2082,9 @@ def export_integrated_normalized_preview(
             row=1,
             col=1,
         )
-    fig.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
+    # Match the detector-image convention used by Matplotlib:
+    # pixel row 0 is displayed at the top of the image.
+    fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1, row=1, col=1)
     fig.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
 
     html_file = os.path.join(output_folder, "normalized_integrated_preview.html")
