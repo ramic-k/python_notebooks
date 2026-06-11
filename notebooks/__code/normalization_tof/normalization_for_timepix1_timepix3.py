@@ -414,6 +414,7 @@ def normalization_with_list_of_full_path(
         ob_data_for_rebin = ob_data_combined
         ob_variance_for_rebin = ob_data_combined_variance
         measured_background_diagnostic = None
+        native_pixel_ratio_data = None
 
         if measured_background_correction_enabled:
             total_sample_background_data = np.zeros_like(current_sample_data, dtype=np.float64)
@@ -465,6 +466,19 @@ def normalization_with_list_of_full_path(
             ob_data_for_rebin = ob_data_combined - total_ob_background_data
             ob_variance_for_rebin = ob_data_combined_variance + total_ob_background_variance
 
+        if rebin_mode != RebinMode.none:
+            if container_only_without_ob and current_container_value_array is not None:
+                native_pixel_ratio_data = normalize_by_container_value_array(
+                    sample_data=sample_data_for_rebin,
+                    container_value_array=current_container_value_array,
+                )
+            else:
+                native_pixel_ratio_data = perform_normalization(
+                    sample_data_for_rebin,
+                    ob_data_for_rebin,
+                    dc_data_combined,
+                )["normalized_data"]
+
         rebinned_payload = maybe_rebin_data_and_axes(
             sample_data=sample_data_for_rebin,
             sample_variance=sample_variance_for_rebin,
@@ -515,6 +529,15 @@ def normalization_with_list_of_full_path(
                     where=denominator != 0,
                 )
             rebinned_payload["container_roi_reference_value_array"] = rebinned_container_value_array
+
+        if native_pixel_ratio_data is not None:
+            rebinned_payload["normalized_data_from_native_pixel_ratios"] = rebin_array_from_bin_groups(
+                native_pixel_ratio_data,
+                rebinned_payload["active_frame_groups"],
+                reducer="mean",
+            )
+        else:
+            rebinned_payload["normalized_data_from_native_pixel_ratios"] = None
 
         rebinned_payload["bragg_edge_cd_background_profile"] = None
         rebinned_payload["measured_background_profiles"] = []
@@ -897,8 +920,12 @@ def normalization_with_list_of_full_path(
                 logging.info("Skipping OB export because no OB runs were provided.")
 
         _normalized_dict = perform_normalization(sample_data_combined, ob_data_for_normalization, dc_data_for_normalization)
-        _normalized_data = _normalized_dict['normalized_data']
-        _integrated_normalized_data = _normalized_dict['integrated_normalized_data']       
+        if rebinned_payload.get("normalized_data_from_native_pixel_ratios") is not None:
+            _normalized_data = rebinned_payload["normalized_data_from_native_pixel_ratios"]
+            _integrated_normalized_data = np.nanmean(_normalized_data, axis=0)
+        else:
+            _normalized_data = _normalized_dict['normalized_data']
+            _integrated_normalized_data = _normalized_dict['integrated_normalized_data']       
         integrated_normalized_data[str_list_run_number] = _integrated_normalized_data
         normalized_data[str_list_run_number] = _normalized_data
 
@@ -1100,8 +1127,12 @@ def normalization_with_list_of_full_path(
                     logging.info("Skipping OB export because no OB runs were provided.")
 
             _normalized_dict = perform_normalization(_sample_data, ob_data_for_normalization, dc_data_for_normalization)
-            _normalized_data = _normalized_dict['normalized_data']
-            _integrated_normalized_data = _normalized_dict['integrated_normalized_data']       
+            if rebinned_payload.get("normalized_data_from_native_pixel_ratios") is not None:
+                _normalized_data = rebinned_payload["normalized_data_from_native_pixel_ratios"]
+                _integrated_normalized_data = np.nanmean(_normalized_data, axis=0)
+            else:
+                _normalized_data = _normalized_dict['normalized_data']
+                _integrated_normalized_data = _normalized_dict['integrated_normalized_data']       
             integrated_normalized_data[_sample_run_number] = _integrated_normalized_data
             normalized_data[_sample_run_number] = _normalized_data
 

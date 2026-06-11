@@ -1,9 +1,12 @@
 import argparse
 import glob
+import hashlib
 import logging
 import multiprocessing as mp
 import os
+import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from sqlite3 import Time
 from typing import Tuple
@@ -20,15 +23,50 @@ from PIL import Image
 from skimage.io import imread
 from scipy.ndimage import median_filter
 
-try:
-    from timepix_geometry_correction.correct import TimepixGeometryCorrection
-except ModuleNotFoundError:
-    TimepixGeometryCorrection = None
+TimepixGeometryCorrection = None
 
 from __code.normalization_tof import RebinCustomBasis, RebinCustomScale, RebinMode, Roi
 from __code._utilities.json import load_json, save_json
 
 MARKERSIZE = 6
+MAX_NORMALIZATION_OUTPUT_BASENAME_LENGTH = 220
+
+
+def _compact_run_label(run_label) -> str:
+    run_label = str(run_label)
+    run_numbers = re.findall(r"Run_(\d+)", run_label)
+    if not run_numbers:
+        run_numbers = re.findall(r"\d{4,}", run_label)
+    if run_numbers:
+        return "Run_" + "_".join(run_numbers)
+    digest = hashlib.sha1(run_label.encode("utf-8")).hexdigest()[:10]
+    return f"hash_{digest}"
+
+
+def _safe_normalization_output_basename(sample_label, ob_label, output_suffix: str = "") -> str:
+    basename = f"normalized_sample_{sample_label}_obs_{ob_label}{output_suffix}"
+    if len(basename) <= MAX_NORMALIZATION_OUTPUT_BASENAME_LENGTH:
+        return basename
+
+    compact_sample = _compact_run_label(sample_label)
+    compact_ob = "no_open_beam" if str(ob_label) == "no_open_beam" else _compact_run_label(ob_label)
+    compact_basename = f"normalized_sample_{compact_sample}_obs_{compact_ob}{output_suffix}"
+    if len(compact_basename) <= MAX_NORMALIZATION_OUTPUT_BASENAME_LENGTH:
+        logging.warning(
+            "Normalization output directory name was too long; using compact run-number name: %s",
+            compact_basename,
+        )
+        return compact_basename
+
+    digest = hashlib.sha1(basename.encode("utf-8")).hexdigest()[:12]
+    suffix_budget = 70
+    compact_suffix = output_suffix[-suffix_budget:] if output_suffix else ""
+    shortened = f"normalized_sample_{compact_sample}_obs_{compact_ob}_h{digest}{compact_suffix}"
+    logging.warning(
+        "Normalization output directory name was too long even after compaction; using hashed name: %s",
+        shortened,
+    )
+    return shortened
 
 class NormalizedData:
     data= {}
@@ -98,15 +136,45 @@ def _worker(fl):
     #return (imread(fl).astype(np.float32))
 
 
+def _load_integrated_tof_data(list_tif: list = None) -> np.ndarray:
+    if not list_tif:
+        return np.array([], dtype=np.float32)
+
+    max_workers = min(len(list_tif), os.cpu_count() or 1, 8)
+    integrated_data = None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for frame in executor.map(_worker, list_tif):
+            if integrated_data is None:
+                integrated_data = frame
+            else:
+                integrated_data += frame
+
+    return integrated_data
+
+
 def load_data_using_multithreading(list_tif: list = None, combine_tof: bool = False) -> np.ndarray:
     """load data using multithreading"""
+    if combine_tof:
+        return _load_integrated_tof_data(list_tif=list_tif)
+
     with mp.Pool(processes=40) as pool:
         data = pool.map(_worker, list_tif)
 
-    if combine_tof:
-        return np.array(data).sum(axis=0)
-    else:
-        return np.array(data, dtype=np.float32)
+    return np.array(data, dtype=np.float32)
+
+
+def _get_timepix_geometry_correction():
+    global TimepixGeometryCorrection
+
+    if TimepixGeometryCorrection is None:
+        try:
+            from timepix_geometry_correction.correct import TimepixGeometryCorrection as _TimepixGeometryCorrection
+        except ModuleNotFoundError:
+            return None
+        TimepixGeometryCorrection = _TimepixGeometryCorrection
+
+    return TimepixGeometryCorrection
 
 
 def retrieve_list_of_tif(folder: str) -> list:
@@ -1409,7 +1477,8 @@ def correct_chips_alignment(data_combined=None, correct_chips_alignment_config=N
     if verbose:
         display(HTML("Correcting chips alignment ..."))
 
-    if TimepixGeometryCorrection is None:
+    timepix_geometry_correction_class = _get_timepix_geometry_correction()
+    if timepix_geometry_correction_class is None:
         raise ModuleNotFoundError(
             "timepix_geometry_correction is required when chip alignment correction is enabled."
         )
@@ -1418,8 +1487,8 @@ def correct_chips_alignment(data_combined=None, correct_chips_alignment_config=N
 
     data_combined_corrected = np.zeros_like(data_combined)
     for _index, _data in enumerate(data_combined):
-        o_corrector = TimepixGeometryCorrection(raw_images=_data,
-                                                config=correct_chips_alignment_config)
+        o_corrector = timepix_geometry_correction_class(raw_images=_data,
+                                                        config=correct_chips_alignment_config)
         data_corrected = o_corrector.correct()
     
         # remove useless dimension
@@ -1884,6 +1953,7 @@ def _safe_write_integrated_preview_png(
     vmin: float = None,
     vmax: float = None,
     profile_xaxis_title: str = "File image index",
+    profile_title: str = None,
 ) -> None:
     try:
         import matplotlib
@@ -1923,11 +1993,11 @@ def _safe_write_integrated_preview_png(
         if profile is not None:
             profile_axis = axes[1]
             profile_axis.plot(np.arange(len(profile)), profile, ".", markersize=MARKERSIZE)
-            profile_axis.set_title(
+            profile_axis.set_title(profile_title or (
                 "pixel by pixel normalization profile of ROI"
                 if roi is not None
                 else "pixel by pixel normalization profile of full image"
-            )
+            ))
             profile_axis.set_xlabel(profile_xaxis_title)
             profile_axis.set_ylabel("Transmission (a.u.)")
             profile_axis.grid(True, alpha=0.25)
@@ -1942,12 +2012,35 @@ def _safe_write_integrated_preview_png(
         )
 
 
+def _extract_spectrum_normalization_profile(spectrum_normalized_data=None):
+    if spectrum_normalized_data is None:
+        return None
+
+    if isinstance(spectrum_normalized_data, dict):
+        for key in (
+            "spectrum_normalization",
+            "black_filter_background_corrected_spectrum_normalization",
+        ):
+            if spectrum_normalized_data.get(key) is not None:
+                return np.asarray(spectrum_normalized_data[key], dtype=np.float64)
+
+        for key in sorted(spectrum_normalized_data):
+            if key.endswith("_corrected_spectrum_normalization"):
+                values = spectrum_normalized_data.get(key)
+                if values is not None:
+                    return np.asarray(values, dtype=np.float64)
+        return None
+
+    return np.asarray(spectrum_normalized_data, dtype=np.float64)
+
+
 def export_integrated_normalized_preview(
     output_folder: str,
     integrated_normalized_image: np.ndarray,
     normalized_stack: np.ndarray = None,
     roi: Roi = None,
     bin_metadata: dict = None,
+    spectrum_normalized_data=None,
 ) -> None:
     """Export the integrated-normalized preview plot and its underlying arrays."""
     os.makedirs(output_folder, exist_ok=True)
@@ -1962,7 +2055,8 @@ def export_integrated_normalized_preview(
     )
     logging.info(f"\t -> Exported integrated normalized preview data to {data_file}")
 
-    profile = None
+    pixel_profile = None
+    pixel_profile_label = None
     if normalized_stack is not None:
         stack = np.asarray(normalized_stack, dtype=np.float64)
         if roi is not None:
@@ -1971,19 +2065,39 @@ def export_integrated_normalized_preview(
             width = roi.width
             height = roi.height
             profile_step1 = np.nanmean(stack[:, y0:y0 + height, x0:x0 + width], axis=1)
-            profile = np.nanmean(profile_step1, axis=1)
-            profile_label = "ROI mean normalized intensity"
+            pixel_profile = np.nanmean(profile_step1, axis=1)
+            pixel_profile_label = "ROI mean pixel-normalized intensity"
         else:
             profile_step1 = np.nanmean(stack, axis=1)
-            profile = np.nanmean(profile_step1, axis=1)
-            profile_label = "full-image mean normalized intensity"
+            pixel_profile = np.nanmean(profile_step1, axis=1)
+            pixel_profile_label = "full-image mean pixel-normalized intensity"
 
+    spectrum_profile = _extract_spectrum_normalization_profile(spectrum_normalized_data)
+    if spectrum_profile is not None and pixel_profile is not None and len(spectrum_profile) != len(pixel_profile):
+        logging.warning(
+            "Integrated preview spectrum profile length (%s) does not match pixel profile length (%s); "
+            "falling back to the pixel profile.",
+            len(spectrum_profile),
+            len(pixel_profile),
+        )
+        spectrum_profile = None
+
+    profile = pixel_profile if pixel_profile is not None else spectrum_profile
+    profile_label = (
+        pixel_profile_label
+        if pixel_profile is not None
+        else "ROI summed-count transmission"
+    )
     if profile is not None:
         profile_xaxis_title = "Rebinned bin index" if bin_metadata is not None else "File image index"
         profile_dict = {
             "profile_index": np.arange(len(profile), dtype=int),
             "integrated_normalized_profile": profile,
         }
+        if spectrum_profile is not None:
+            profile_dict["roi_summed_count_transmission"] = spectrum_profile
+        if pixel_profile is not None:
+            profile_dict["pixel_mean_normalized_intensity"] = pixel_profile
         if bin_metadata is not None:
             profile_dict.update(
                 {
@@ -2031,8 +2145,8 @@ def export_integrated_normalized_preview(
             col=1,
         )
     else:
-        profile_title = "pixel by pixel normalization profile of ROI" if roi is not None else (
-            "pixel by pixel normalization profile of full image"
+        profile_title = "ROI normalization profiles" if roi is not None else (
+            "full-image normalization profiles"
         )
         fig = make_subplots(
             rows=1,
@@ -2058,11 +2172,23 @@ def export_integrated_normalized_preview(
                 y=profile,
                 mode="markers",
                 marker=dict(size=MARKERSIZE),
-                showlegend=False,
+                name=profile_label,
+                showlegend=spectrum_profile is not None and pixel_profile is not None,
             ),
             row=1,
             col=2,
         )
+        if spectrum_profile is not None and pixel_profile is not None:
+            fig.add_trace(
+                go.Scatter(
+                    y=spectrum_profile,
+                    mode="markers",
+                    marker=dict(size=MARKERSIZE, opacity=0.45),
+                    name="ROI summed-count transmission",
+                ),
+                row=1,
+                col=2,
+            )
         fig.update_xaxes(
             title_text=profile_xaxis_title,
             row=1,
@@ -2098,6 +2224,7 @@ def export_integrated_normalized_preview(
         vmin=vmin,
         vmax=vmax,
         profile_xaxis_title=profile_xaxis_title if profile is not None else "File image index",
+        profile_title=profile_label if profile is not None else None,
     )
 
 
@@ -3016,8 +3143,9 @@ def export_normalized_data(ob_master_dict=None,
     if not str_ob_runs:
         str_ob_runs = "no_open_beam"
     full_output_folder = os.path.join(
-        output_folder, f"normalized_sample_{_sample_run_number}_obs_{str_ob_runs}{output_suffix}"
-    )  # issue for WEI here !
+        output_folder,
+        _safe_normalization_output_basename(_sample_run_number, str_ob_runs, output_suffix),
+    )
     full_output_folder = os.path.abspath(full_output_folder)
     os.makedirs(full_output_folder, exist_ok=True)
 
@@ -3234,6 +3362,7 @@ def export_normalized_data(ob_master_dict=None,
             normalized_stack=normalized_data.get(_sample_run_number) if normalized_data is not None else None,
             roi=roi,
             bin_metadata=bin_metadata,
+            spectrum_normalized_data=_spectrum_normalized_data,
         )
 
     if export_corrected_stack_of_normalized_data:

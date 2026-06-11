@@ -231,6 +231,19 @@ def parse_args() -> argparse.Namespace:
         default=200,
         help="Centered square ROI size when --roi is not provided",
     )
+    parser.add_argument(
+        "--container-roi",
+        default=None,
+        help=(
+            "Container-only reference ROI as left,top,width,height. "
+            "When no OB run/path is provided, this enables container-only normalization."
+        ),
+    )
+    parser.add_argument(
+        "--container-roi-file",
+        default=None,
+        help="Previously exported container ROI JSON file to reuse for container normalization.",
+    )
 
     parser.add_argument(
         "--proton-charge",
@@ -423,6 +436,7 @@ def resolve_input_paths(
     autoreduce_dir,
     raw_dir,
     detector_type_constants,
+    allow_empty: bool = False,
 ) -> list[Path]:
     resolved = [Path(path) for path in explicit_paths]
     for run_number in run_numbers:
@@ -440,7 +454,7 @@ def resolve_input_paths(
             )
         )
 
-    if not resolved:
+    if not resolved and not allow_empty:
         raise ValueError(f"No {label} inputs were provided.")
 
     missing = [str(path) for path in resolved if not path.exists()]
@@ -614,6 +628,7 @@ def main() -> int:
         autoreduce_dir=autoreduce_dir,
         raw_dir=raw_dir,
         detector_type_constants=DetectorType,
+        allow_empty=bool(args.container_roi or args.container_roi_file),
     )
     dc_paths = resolve_input_paths(
         run_numbers=args.dc_run,
@@ -752,6 +767,8 @@ def main() -> int:
         )
     else:
         roi = None
+    container_roi = parse_roi(args.container_roi, Roi) if args.container_roi else None
+    container_roi_file = args.container_roi_file
 
     experimental_uncertainties_flag = (
         args.experimental_uncertainties
@@ -834,6 +851,8 @@ def main() -> int:
         )
     print(f"  output folder: {output_folder}")
     print(f"  roi: {roi}")
+    print(f"  container roi: {container_roi}")
+    print(f"  container roi file: {container_roi_file}")
     print(f"  rebin mode: {rebin_mode}")
     print(f"  custom schedule: {rebin_custom_schedule}")
     print(f"  snap fixed-width rebin to native grid: {snap_to_native_rebin_grid}")
@@ -864,8 +883,8 @@ def main() -> int:
         correct_chips_alignment_config=None,
         export_mode=export_mode,
         roi=roi,
-        container_roi=None,
-        container_roi_file=None,
+        container_roi=container_roi,
+        container_roi_file=container_roi_file,
         rebin_mode=rebin_mode,
         rebin_delta_tof_us=args.delta_tof_us if rebin_mode == RebinMode.linear_tof else None,
         rebin_delta_lambda_a=args.delta_lambda_a if rebin_mode == RebinMode.linear_lambda else None,
