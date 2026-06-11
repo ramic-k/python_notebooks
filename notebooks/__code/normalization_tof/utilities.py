@@ -1,9 +1,12 @@
 import argparse
 import glob
+import hashlib
 import logging
 import multiprocessing as mp
 import os
+import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from sqlite3 import Time
 from typing import Tuple
@@ -20,15 +23,50 @@ from PIL import Image
 from skimage.io import imread
 from scipy.ndimage import median_filter
 
-try:
-    from timepix_geometry_correction.correct import TimepixGeometryCorrection
-except ModuleNotFoundError:
-    TimepixGeometryCorrection = None
+TimepixGeometryCorrection = None
 
 from __code.normalization_tof import RebinCustomBasis, RebinCustomScale, RebinMode, Roi
 from __code._utilities.json import load_json, save_json
 
 MARKERSIZE = 6
+MAX_NORMALIZATION_OUTPUT_BASENAME_LENGTH = 220
+
+
+def _compact_run_label(run_label) -> str:
+    run_label = str(run_label)
+    run_numbers = re.findall(r"Run_(\d+)", run_label)
+    if not run_numbers:
+        run_numbers = re.findall(r"\d{4,}", run_label)
+    if run_numbers:
+        return "Run_" + "_".join(run_numbers)
+    digest = hashlib.sha1(run_label.encode("utf-8")).hexdigest()[:10]
+    return f"hash_{digest}"
+
+
+def _safe_normalization_output_basename(sample_label, ob_label, output_suffix: str = "") -> str:
+    basename = f"normalized_sample_{sample_label}_obs_{ob_label}{output_suffix}"
+    if len(basename) <= MAX_NORMALIZATION_OUTPUT_BASENAME_LENGTH:
+        return basename
+
+    compact_sample = _compact_run_label(sample_label)
+    compact_ob = "no_open_beam" if str(ob_label) == "no_open_beam" else _compact_run_label(ob_label)
+    compact_basename = f"normalized_sample_{compact_sample}_obs_{compact_ob}{output_suffix}"
+    if len(compact_basename) <= MAX_NORMALIZATION_OUTPUT_BASENAME_LENGTH:
+        logging.warning(
+            "Normalization output directory name was too long; using compact run-number name: %s",
+            compact_basename,
+        )
+        return compact_basename
+
+    digest = hashlib.sha1(basename.encode("utf-8")).hexdigest()[:12]
+    suffix_budget = 70
+    compact_suffix = output_suffix[-suffix_budget:] if output_suffix else ""
+    shortened = f"normalized_sample_{compact_sample}_obs_{compact_ob}_h{digest}{compact_suffix}"
+    logging.warning(
+        "Normalization output directory name was too long even after compaction; using hashed name: %s",
+        shortened,
+    )
+    return shortened
 
 class NormalizedData:
     data= {}
@@ -49,6 +87,9 @@ from __code.normalization_tof.units import (
 LOAD_DTYPE = np.uint16
 
 PROTON_CHARGE_TOLERANCE = 0.1
+DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE = (
+    str(Path(__file__).resolve().parent / "data" / "hdperpi_background_constrained_poly_curve.csv")
+)
 
 
 class PLOT_SIZE:
@@ -95,15 +136,45 @@ def _worker(fl):
     #return (imread(fl).astype(np.float32))
 
 
+def _load_integrated_tof_data(list_tif: list = None) -> np.ndarray:
+    if not list_tif:
+        return np.array([], dtype=np.float32)
+
+    max_workers = min(len(list_tif), os.cpu_count() or 1, 8)
+    integrated_data = None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for frame in executor.map(_worker, list_tif):
+            if integrated_data is None:
+                integrated_data = frame
+            else:
+                integrated_data += frame
+
+    return integrated_data
+
+
 def load_data_using_multithreading(list_tif: list = None, combine_tof: bool = False) -> np.ndarray:
     """load data using multithreading"""
+    if combine_tof:
+        return _load_integrated_tof_data(list_tif=list_tif)
+
     with mp.Pool(processes=40) as pool:
         data = pool.map(_worker, list_tif)
 
-    if combine_tof:
-        return np.array(data).sum(axis=0)
-    else:
-        return np.array(data, dtype=np.float32)
+    return np.array(data, dtype=np.float32)
+
+
+def _get_timepix_geometry_correction():
+    global TimepixGeometryCorrection
+
+    if TimepixGeometryCorrection is None:
+        try:
+            from timepix_geometry_correction.correct import TimepixGeometryCorrection as _TimepixGeometryCorrection
+        except ModuleNotFoundError:
+            return None
+        TimepixGeometryCorrection = _TimepixGeometryCorrection
+
+    return TimepixGeometryCorrection
 
 
 def retrieve_list_of_tif(folder: str) -> list:
@@ -124,6 +195,10 @@ def create_x_axis_file(
     if bin_metadata:
         x_axis_data = {
             "file_index": bin_metadata["active_bin_index_array"],
+            "source frame count": bin_metadata.get(
+                "source_frame_count_array",
+                np.ones(len(bin_metadata["active_bin_index_array"]), dtype=int),
+            ),
             "starting tof (s)": bin_metadata["starting_tof_array"],
             "ending tof (s)": bin_metadata["ending_tof_array"],
             "mean tof (s)": bin_metadata["mean_tof_array"],
@@ -163,6 +238,7 @@ def create_rebin_output_suffix(
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
     rebin_full_bins_only: bool = False,
+    rebin_snap_to_native_grid: bool = False,
 ) -> str:
     if rebin_mode == RebinMode.none:
         return ""
@@ -205,6 +281,16 @@ def create_rebin_output_suffix(
 
     if rebin_full_bins_only:
         output_suffix += "_fullbins"
+    snap_to_native_applies = (
+        rebin_mode in [RebinMode.linear_tof, RebinMode.linear_lambda]
+        or (
+            rebin_mode == RebinMode.custom_schedule
+            and rebin_custom_scale == RebinCustomScale.linear
+            and rebin_custom_basis in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+        )
+    )
+    if rebin_snap_to_native_grid and snap_to_native_applies:
+        output_suffix += "_snapnative"
     return output_suffix
 
 
@@ -248,9 +334,19 @@ def _validate_rebin_axis(axis_values: np.ndarray, rebin_mode: str) -> np.ndarray
     return axis_values
 
 
-def _create_linear_bin_edges(axis_values: np.ndarray, bin_width: float, full_bins_only: bool = False) -> np.ndarray:
+def _create_linear_bin_edges(
+    axis_values: np.ndarray,
+    bin_width: float,
+    full_bins_only: bool = False,
+    snap_to_native_grid: bool = False,
+) -> np.ndarray:
     if bin_width is None or bin_width <= 0:
         raise ValueError("Linear rebinning requires a strictly positive bin width.")
+    bin_width = _snap_linear_bin_width_to_native_axis(
+        axis_values=axis_values,
+        bin_width=bin_width,
+        snap_to_native_grid=snap_to_native_grid,
+    )
     new_axis = np.arange(axis_values[0], axis_values[-1], bin_width, dtype=np.float64)
     if len(new_axis) == 0:
         new_axis = np.array([axis_values[0]], dtype=np.float64)
@@ -258,6 +354,58 @@ def _create_linear_bin_edges(axis_values: np.ndarray, bin_width: float, full_bin
     if (not full_bins_only) or (next_edge <= axis_values[-1] + 1e-12):
         new_axis = np.append(new_axis, next_edge)
     return new_axis
+
+
+def _estimate_native_axis_step(axis_values: np.ndarray) -> float | None:
+    axis_values = np.asarray(axis_values, dtype=np.float64)
+    diffs = np.diff(axis_values)
+    positive_diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if len(positive_diffs) == 0:
+        return None
+
+    median_step = float(np.median(positive_diffs))
+    if median_step <= 0:
+        return None
+
+    # TPX1 axes can contain large chopper/frame gaps; those should not define
+    # the native frame spacing used for fixed-width bin snapping.
+    native_like_diffs = positive_diffs[positive_diffs <= (5.0 * median_step)]
+    if len(native_like_diffs) == 0:
+        native_like_diffs = positive_diffs
+    native_step = float(np.median(native_like_diffs))
+    return native_step if native_step > 0 else None
+
+
+def _snap_linear_bin_width_to_native_axis(
+    axis_values: np.ndarray,
+    bin_width: float,
+    snap_to_native_grid: bool = False,
+) -> float:
+    if not snap_to_native_grid:
+        return bin_width
+
+    native_step = _estimate_native_axis_step(axis_values)
+    if native_step is None:
+        return bin_width
+
+    native_frame_count = max(1, int(round(bin_width / native_step)))
+    return native_frame_count * native_step
+
+
+def _snap_native_grid_full_bin_filter(
+    bin_groups: list[list[int]],
+    bin_edges: np.ndarray,
+    axis_values: np.ndarray,
+) -> list[list[int]]:
+    native_step = _estimate_native_axis_step(axis_values)
+    if native_step is None:
+        return bin_groups
+
+    filtered_groups = []
+    for group, start_edge, end_edge in zip(bin_groups, bin_edges[:-1], bin_edges[1:]):
+        expected_frame_count = max(1, int(round((end_edge - start_edge) / native_step)))
+        filtered_groups.append(group if len(group) == expected_frame_count else [])
+    return filtered_groups
 
 
 def _create_log_bin_edges(
@@ -285,12 +433,19 @@ def _create_log_bin_edges(
 
 
 def _create_linear_bin_edges_between(
-    start_value: float, end_value: float, bin_width: float, full_bins_only: bool = False
+    start_value: float,
+    end_value: float,
+    bin_width: float,
+    full_bins_only: bool = False,
+    native_axis_step: float = None,
 ) -> np.ndarray:
     if bin_width is None or bin_width <= 0:
         raise ValueError("Linear rebinning requires a strictly positive bin width.")
     if end_value <= start_value:
         raise ValueError("Segment end must be greater than the segment start.")
+    if native_axis_step is not None and native_axis_step > 0:
+        native_frame_count = max(1, int(round(bin_width / native_axis_step)))
+        bin_width = native_frame_count * native_axis_step
 
     new_bin_array = [float(start_value)]
     parameter = float(start_value)
@@ -414,9 +569,16 @@ def _create_edges_for_custom_segment(
     step_value: float = None,
     rebin_custom_scale: str = None,
     full_bins_only: bool = False,
+    native_axis_step: float = None,
 ) -> np.ndarray:
     if rebin_custom_scale == RebinCustomScale.linear:
-        return _create_linear_bin_edges_between(start_value, end_value, step_value, full_bins_only=full_bins_only)
+        return _create_linear_bin_edges_between(
+            start_value,
+            end_value,
+            step_value,
+            full_bins_only=full_bins_only,
+            native_axis_step=native_axis_step,
+        )
     if rebin_custom_scale == RebinCustomScale.log:
         return _create_log_bin_edges_between(
             start_value, end_value, step_value, RebinMode.custom_schedule, full_bins_only=full_bins_only
@@ -436,6 +598,7 @@ def _build_custom_schedule_bin_edges(
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
     rebin_full_bins_only: bool = False,
+    rebin_snap_to_native_grid: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     normalized_schedule = _normalize_custom_schedule(rebin_custom_schedule)
 
@@ -460,6 +623,13 @@ def _build_custom_schedule_bin_edges(
 
     axis_start = float(axis_values[0])
     axis_end = float(axis_values[-1])
+    native_axis_step = None
+    if (
+        rebin_snap_to_native_grid
+        and rebin_custom_scale == RebinCustomScale.linear
+        and rebin_custom_basis in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+    ):
+        native_axis_step = _estimate_native_axis_step(axis_values)
 
     custom_bin_edges = [axis_start]
     current_start = axis_start
@@ -487,6 +657,7 @@ def _build_custom_schedule_bin_edges(
             step_value=_convert_custom_step(segment["step"]),
             rebin_custom_scale=rebin_custom_scale,
             full_bins_only=rebin_full_bins_only,
+            native_axis_step=native_axis_step,
         )
         custom_bin_edges.extend(segment_edges[1:])
         current_start = custom_bin_edges[-1]
@@ -501,6 +672,7 @@ def _build_custom_schedule_bin_edges(
             step_value=_convert_custom_step(normalized_schedule[-1]["step"]),
             rebin_custom_scale=rebin_custom_scale,
             full_bins_only=rebin_full_bins_only,
+            native_axis_step=native_axis_step,
         )
         custom_bin_edges.extend(segment_edges[1:])
 
@@ -521,6 +693,7 @@ def build_rebin_bin_groups(
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
     rebin_full_bins_only: bool = False,
+    rebin_snap_to_native_grid: bool = False,
 ) -> tuple[list[list[int]], np.ndarray]:
     if tof_array is None:
         return None, None
@@ -532,12 +705,18 @@ def build_rebin_bin_groups(
     if rebin_mode == RebinMode.linear_tof:
         axis_values = _validate_rebin_axis(tof_array, rebin_mode)
         bin_edges = _create_linear_bin_edges(
-            axis_values, rebin_delta_tof_us * 1e-6, full_bins_only=rebin_full_bins_only
+            axis_values,
+            rebin_delta_tof_us * 1e-6,
+            full_bins_only=rebin_full_bins_only,
+            snap_to_native_grid=rebin_snap_to_native_grid,
         )
     elif rebin_mode == RebinMode.linear_lambda:
         axis_values = _validate_rebin_axis(lambda_array, rebin_mode)
         bin_edges = _create_linear_bin_edges(
-            axis_values, rebin_delta_lambda_a, full_bins_only=rebin_full_bins_only
+            axis_values,
+            rebin_delta_lambda_a,
+            full_bins_only=rebin_full_bins_only,
+            snap_to_native_grid=rebin_snap_to_native_grid,
         )
     elif rebin_mode == RebinMode.log_tof:
         axis_values = _validate_rebin_axis(tof_array, rebin_mode)
@@ -562,6 +741,7 @@ def build_rebin_bin_groups(
             rebin_custom_scale=rebin_custom_scale,
             rebin_custom_schedule=rebin_custom_schedule,
             rebin_full_bins_only=rebin_full_bins_only,
+            rebin_snap_to_native_grid=rebin_snap_to_native_grid,
         )
     else:
         raise ValueError(f"Unsupported rebin mode: {rebin_mode}")
@@ -572,6 +752,21 @@ def build_rebin_bin_groups(
         if group_index < 0 or group_index >= len(bin_groups):
             continue
         bin_groups[group_index].append(frame_index)
+
+    snap_to_native_applies = (
+        rebin_mode in [RebinMode.linear_tof, RebinMode.linear_lambda]
+        or (
+            rebin_mode == RebinMode.custom_schedule
+            and rebin_custom_scale == RebinCustomScale.linear
+            and rebin_custom_basis in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+        )
+    )
+    if rebin_snap_to_native_grid and rebin_full_bins_only and snap_to_native_applies:
+        bin_groups = _snap_native_grid_full_bin_filter(
+            bin_groups=bin_groups,
+            bin_edges=bin_edges,
+            axis_values=axis_values,
+        )
 
     return bin_groups, bin_edges
 
@@ -587,6 +782,7 @@ def build_rebin_bin_metadata(
 
     active_bin_indices = []
     active_frame_groups = []
+    source_frame_counts = []
     starting_tof = []
     ending_tof = []
     mean_tof = []
@@ -604,6 +800,7 @@ def build_rebin_bin_metadata(
         frame_group = np.asarray(frame_group, dtype=int)
         active_bin_indices.append(full_bin_index)
         active_frame_groups.append(frame_group)
+        source_frame_counts.append(len(frame_group))
 
         tof_values = np.asarray(tof_array[frame_group], dtype=np.float64)
         lambda_values = np.asarray(lambda_array[frame_group], dtype=np.float64)
@@ -624,6 +821,7 @@ def build_rebin_bin_metadata(
     return {
         "active_bin_index_array": np.asarray(active_bin_indices, dtype=int),
         "list_file_index_array": active_frame_groups,
+        "source_frame_count_array": np.asarray(source_frame_counts, dtype=int),
         "starting_tof_array": np.asarray(starting_tof, dtype=np.float64),
         "ending_tof_array": np.asarray(ending_tof, dtype=np.float64),
         "mean_tof_array": np.asarray(mean_tof, dtype=np.float64),
@@ -646,6 +844,9 @@ def rebin_array_from_bin_groups(
         return np.asarray(data).copy()
 
     array_data = np.asarray(data)
+    if array_data.ndim == 0:
+        return None
+
     if reducer == "sum":
         reduced_chunks = [np.sum(array_data[_group], axis=0) for _group in active_frame_groups]
     elif reducer == "mean":
@@ -676,6 +877,7 @@ def maybe_rebin_data_and_axes(
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
     rebin_full_bins_only: bool = False,
+    rebin_snap_to_native_grid: bool = False,
 ) -> dict:
     if (time_spectra is None) and (rebin_mode != RebinMode.none):
         raise ValueError(f"{rebin_mode} requires a valid spectra/time axis.")
@@ -697,6 +899,7 @@ def maybe_rebin_data_and_axes(
         rebin_custom_scale=rebin_custom_scale,
         rebin_custom_schedule=rebin_custom_schedule,
         rebin_full_bins_only=rebin_full_bins_only,
+        rebin_snap_to_native_grid=rebin_snap_to_native_grid,
     )
 
     if tof_array is None:
@@ -707,6 +910,10 @@ def maybe_rebin_data_and_axes(
             "ob_data_combined_variance": ob_data_combined_variance,
             "dc_data_combined": dc_data_combined,
             "dc_data_combined_variance": dc_data_combined_variance,
+            "original_tof_array": tof_array,
+            "original_lambda_array": lambda_array,
+            "original_energy_array": energy_array,
+            "active_frame_groups": None,
             "tof_array": None,
             "lambda_array": None,
             "energy_array": None,
@@ -728,6 +935,7 @@ def maybe_rebin_data_and_axes(
         rebin_custom_scale=rebin_custom_scale,
         rebin_custom_schedule=rebin_custom_schedule,
         rebin_full_bins_only=rebin_full_bins_only,
+        rebin_snap_to_native_grid=rebin_snap_to_native_grid,
     )
     bin_metadata = build_rebin_bin_metadata(
         tof_array=tof_array,
@@ -736,6 +944,8 @@ def maybe_rebin_data_and_axes(
         bin_groups=bin_groups,
     )
     active_frame_groups = None if bin_metadata is None else bin_metadata["list_file_index_array"]
+    if bin_metadata is not None:
+        bin_metadata["rebin_snap_to_native_grid"] = bool(rebin_snap_to_native_grid)
 
     return {
         "sample_data": rebin_array_from_bin_groups(sample_data, active_frame_groups, reducer="sum"),
@@ -748,6 +958,10 @@ def maybe_rebin_data_and_axes(
         "dc_data_combined_variance": rebin_array_from_bin_groups(
             dc_data_combined_variance, active_frame_groups, reducer="sum"
         ),
+        "original_tof_array": tof_array,
+        "original_lambda_array": lambda_array,
+        "original_energy_array": energy_array,
+        "active_frame_groups": active_frame_groups,
         "tof_array": None if bin_metadata is None else bin_metadata["mean_tof_array"],
         "lambda_array": None if bin_metadata is None else bin_metadata["mean_lambda_array"],
         "energy_array": None if bin_metadata is None else bin_metadata["mean_energy_array"],
@@ -777,14 +991,231 @@ def calculate_roi_profile(data=None, roi=None):
     if (roi is None) or (data is None):
         return None
 
+    array_data = np.asarray(data)
+    if array_data.ndim < 3:
+        return None
+
     x0 = roi.left
     y0 = roi.top
     width = roi.width
     height = roi.height
     return np.asarray(
-        [np.sum(_data[y0 : y0 + height, x0 : x0 + width], dtype=np.float64) for _data in data],
+        [np.sum(_data[y0 : y0 + height, x0 : x0 + width], dtype=np.float64) for _data in array_data],
         dtype=np.float64,
     )
+
+
+def _load_black_filter_background_shape(background_shape_file: str) -> dict:
+    if not background_shape_file:
+        raise ValueError("Black-filter background correction requires a background shape CSV file.")
+
+    background_shape_path = Path(background_shape_file).expanduser()
+    if not background_shape_path.exists():
+        raise FileNotFoundError(f"Black-filter background shape file not found: {background_shape_path}")
+
+    background_shape = pd.read_csv(background_shape_path)
+    required_columns = {
+        "energy_eV",
+        "sample_background_counts_fit",
+        "ob_background_counts_fit",
+    }
+    missing_columns = required_columns.difference(background_shape.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Black-filter background shape file is missing required columns: {sorted(missing_columns)}"
+        )
+
+    energy = np.asarray(background_shape["energy_eV"], dtype=np.float64)
+    sample_shape = np.asarray(background_shape["sample_background_counts_fit"], dtype=np.float64)
+    ob_shape = np.asarray(background_shape["ob_background_counts_fit"], dtype=np.float64)
+
+    valid = np.isfinite(energy) & np.isfinite(sample_shape) & np.isfinite(ob_shape)
+    valid &= (energy > 0) & (sample_shape > 0) & (ob_shape > 0)
+    if np.count_nonzero(valid) < 2:
+        raise ValueError("Black-filter background shape file does not contain at least two valid positive rows.")
+
+    order = np.argsort(energy[valid])
+    return {
+        "file": str(background_shape_path),
+        "energy": energy[valid][order],
+        "sample": sample_shape[valid][order],
+        "ob": ob_shape[valid][order],
+    }
+
+
+def _evaluate_black_filter_background_shape(
+    energy_array: np.ndarray,
+    shape_energy: np.ndarray,
+    shape_counts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate a positive sampled background shape on the measured energy bins.
+
+    The fitted background file is sampled on a dense energy grid. We interpolate
+    that fitted model in log-log space. Energies outside the fitted range are left
+    uncorrected by returning a zero background there.
+    """
+    measured_energy = np.asarray(energy_array, dtype=np.float64)
+    evaluated_shape = np.zeros_like(measured_energy, dtype=np.float64)
+    in_range = (
+        np.isfinite(measured_energy)
+        & (measured_energy >= shape_energy[0])
+        & (measured_energy <= shape_energy[-1])
+        & (measured_energy > 0)
+    )
+    if np.any(in_range):
+        evaluated_shape[in_range] = np.exp(
+            np.interp(
+                np.log(measured_energy[in_range]),
+                np.log(shape_energy),
+                np.log(shape_counts),
+            )
+        )
+    return evaluated_shape, in_range
+
+
+def calculate_black_filter_background_corrected_spectrum(
+    roi=None,
+    sample_data=None,
+    sample_variance=None,
+    ob_data_combined=None,
+    ob_data_combined_variance=None,
+    energy_array=None,
+    active_frame_groups=None,
+    background_shape_file: str = None,
+    anchor_energy_eV: float = 5.1044,
+) -> dict:
+    """Subtract a scaled black-filter background shape before ROI rebinning.
+
+    Scaling uses one nearest measured energy bin:
+        sample_scale = sample_roi(anchor) / sample_shape(anchor)
+        ob_scale = ob_roi(anchor) / ob_shape(anchor)
+
+    The returned uncertainty propagates only the measured sample/OB counting
+    variance. The fitted background shape and single-bin scale factors are treated
+    as exact model inputs.
+    """
+    if roi is None:
+        raise ValueError("Black-filter background correction requires a ROI.")
+    if sample_data is None or ob_data_combined is None:
+        raise ValueError("Black-filter background correction requires sample and OB data.")
+    if energy_array is None:
+        raise ValueError("Black-filter background correction requires an energy axis.")
+
+    measured_energy = np.asarray(energy_array, dtype=np.float64)
+    sample_roi_counts = calculate_roi_profile(data=sample_data, roi=roi)
+    ob_roi_counts = calculate_roi_profile(data=ob_data_combined, roi=roi)
+    if sample_roi_counts is None or ob_roi_counts is None:
+        raise ValueError("Unable to compute ROI counts for black-filter background correction.")
+    if len(measured_energy) != len(sample_roi_counts):
+        raise ValueError(
+            "Black-filter background correction energy axis length does not match sample ROI profile length."
+        )
+
+    if sample_variance is None:
+        sample_roi_variance = np.asarray(sample_roi_counts, dtype=np.float64)
+    else:
+        sample_roi_variance = calculate_roi_profile(data=sample_variance, roi=roi)
+
+    if ob_data_combined_variance is None:
+        ob_roi_variance = np.asarray(ob_roi_counts, dtype=np.float64)
+    else:
+        ob_roi_variance = calculate_roi_profile(data=ob_data_combined_variance, roi=roi)
+
+    background_shape = _load_black_filter_background_shape(background_shape_file)
+    sample_shape, sample_shape_in_range = _evaluate_black_filter_background_shape(
+        measured_energy,
+        background_shape["energy"],
+        background_shape["sample"],
+    )
+    ob_shape, ob_shape_in_range = _evaluate_black_filter_background_shape(
+        measured_energy,
+        background_shape["energy"],
+        background_shape["ob"],
+    )
+
+    finite_energy = np.isfinite(measured_energy)
+    if not np.any(finite_energy):
+        raise ValueError("Black-filter background correction found no finite measured energies.")
+
+    anchor_index = int(np.nanargmin(np.abs(measured_energy - float(anchor_energy_eV))))
+    anchor_energy = float(measured_energy[anchor_index])
+    if not (sample_shape_in_range[anchor_index] and ob_shape_in_range[anchor_index]):
+        raise ValueError(
+            "Black-filter background anchor is outside the fitted background shape range: "
+            f"anchor request {anchor_energy_eV} eV, nearest measured bin {anchor_energy} eV, "
+            f"shape range [{background_shape['energy'][0]}, {background_shape['energy'][-1]}] eV."
+        )
+    if sample_shape[anchor_index] <= 0 or ob_shape[anchor_index] <= 0:
+        raise ValueError("Black-filter background shape is non-positive at the selected anchor bin.")
+
+    sample_scale = float(sample_roi_counts[anchor_index] / sample_shape[anchor_index])
+    ob_scale = float(ob_roi_counts[anchor_index] / ob_shape[anchor_index])
+
+    sample_background = sample_shape * sample_scale
+    ob_background = ob_shape * ob_scale
+    sample_corrected = sample_roi_counts - sample_background
+    ob_corrected = ob_roi_counts - ob_background
+
+    rebinned_sample_background = rebin_array_from_bin_groups(sample_background, active_frame_groups, reducer="sum")
+    rebinned_ob_background = rebin_array_from_bin_groups(ob_background, active_frame_groups, reducer="sum")
+    rebinned_sample_corrected = rebin_array_from_bin_groups(sample_corrected, active_frame_groups, reducer="sum")
+    rebinned_ob_corrected = rebin_array_from_bin_groups(ob_corrected, active_frame_groups, reducer="sum")
+    rebinned_sample_variance = rebin_array_from_bin_groups(sample_roi_variance, active_frame_groups, reducer="sum")
+    rebinned_ob_variance = rebin_array_from_bin_groups(ob_roi_variance, active_frame_groups, reducer="sum")
+
+    corrected_normalization = np.divide(
+        rebinned_sample_corrected,
+        rebinned_ob_corrected,
+        out=np.zeros_like(rebinned_sample_corrected, dtype=np.float64),
+        where=rebinned_ob_corrected != 0,
+    )
+
+    corrected_variance = np.zeros_like(rebinned_sample_corrected, dtype=np.float64)
+    valid = rebinned_ob_corrected != 0
+    corrected_variance[valid] = (
+        rebinned_sample_variance[valid] / (rebinned_ob_corrected[valid] ** 2)
+        + ((rebinned_sample_corrected[valid] ** 2) * rebinned_ob_variance[valid])
+        / (rebinned_ob_corrected[valid] ** 4)
+    )
+
+    out_of_shape_range = int(
+        np.count_nonzero(~(sample_shape_in_range & ob_shape_in_range) & finite_energy)
+    )
+    return {
+        "black_filter_background_sample_roi_counts": rebinned_sample_background,
+        "black_filter_background_ob_roi_counts": rebinned_ob_background,
+        "black_filter_background_corrected_sample_roi_counts": rebinned_sample_corrected,
+        "black_filter_background_corrected_sample_roi_uncertainty": np.sqrt(
+            np.clip(rebinned_sample_variance, 0, None)
+        ),
+        "black_filter_background_corrected_ob_roi_counts": rebinned_ob_corrected,
+        "black_filter_background_corrected_ob_roi_uncertainty": np.sqrt(
+            np.clip(rebinned_ob_variance, 0, None)
+        ),
+        "black_filter_background_corrected_spectrum_normalization": corrected_normalization,
+        "black_filter_background_corrected_spectrum_normalization_uncertainty": np.sqrt(
+            np.clip(corrected_variance, 0, None)
+        ),
+        "black_filter_background_metadata": {
+            "enabled": True,
+            "shape_file": background_shape["file"],
+            "scale_anchor_requested_eV": float(anchor_energy_eV),
+            "scale_anchor_nearest_energy_eV": anchor_energy,
+            "sample_scale_factor": sample_scale,
+            "ob_scale_factor": ob_scale,
+            "sample_anchor_roi_counts": float(sample_roi_counts[anchor_index]),
+            "ob_anchor_roi_counts": float(ob_roi_counts[anchor_index]),
+            "sample_shape_at_anchor": float(sample_shape[anchor_index]),
+            "ob_shape_at_anchor": float(ob_shape[anchor_index]),
+            "shape_energy_min_eV": float(background_shape["energy"][0]),
+            "shape_energy_max_eV": float(background_shape["energy"][-1]),
+            "uncertainty_note": (
+                "Corrected uncertainty propagates measured sample/OB ROI counting variance only; "
+                "background-shape and scale-factor uncertainty are not included."
+            ),
+            "out_of_shape_range_frame_count": out_of_shape_range,
+        },
+    }
 
 
 def _extract_primary_shutter_count(shutter_counts=None) -> float:
@@ -866,10 +1297,9 @@ def calculate_combined_data_variance(
     if use_proton_charge:
         list_proton_charges = [master_dict[_run_number][MasterDictKeys.proton_charge] for _run_number in run_numbers]
         sum_proton_charge = np.sum(list_proton_charges)
-        coeff = np.mean(list_proton_charges)
+        scale_factor = 1.0 / sum_proton_charge
     else:
-        sum_proton_charge = 1.0
-        coeff = 1.0
+        scale_factor = 1.0 / len(run_numbers)
 
     full_variance = []
     for _run_number in run_numbers:
@@ -879,11 +1309,6 @@ def calculate_combined_data_variance(
             shutter_counts=master_dict[_run_number].get(MasterDictKeys.shutter_counts),
             use_experimental_uncertainties=use_experimental_uncertainties,
         )
-        if use_proton_charge:
-            proton_charge = master_dict[_run_number][MasterDictKeys.proton_charge]
-            scale_factor = (proton_charge / sum_proton_charge) / coeff
-        else:
-            scale_factor = 1.0
         full_variance.append(variance * scale_factor**2)
 
     return np.sum(np.asarray(full_variance), axis=0)
@@ -898,6 +1323,107 @@ def calculate_dc_combined_variance(dc_master_dict: dict = None) -> np.ndarray:
         for _dc_run_number in dc_master_dict.keys()
     ]
     return np.sum(np.asarray(full_variance), axis=0) / (len(full_variance) ** 2)
+
+
+def calculate_ratio_and_uncertainty(
+    numerator: np.ndarray,
+    denominator: np.ndarray,
+    numerator_variance: np.ndarray,
+    denominator_variance: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    numerator = np.asarray(numerator, dtype=np.float64)
+    denominator = np.asarray(denominator, dtype=np.float64)
+    numerator_variance = np.asarray(numerator_variance, dtype=np.float64)
+    denominator_variance = np.asarray(denominator_variance, dtype=np.float64)
+
+    ratio = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator, dtype=np.float64),
+        where=denominator != 0,
+    )
+    variance = np.zeros_like(numerator, dtype=np.float64)
+    valid = denominator != 0
+    variance[valid] = (
+        numerator_variance[valid] / (denominator[valid] ** 2)
+        + ((numerator[valid] ** 2) * denominator_variance[valid]) / (denominator[valid] ** 4)
+    )
+    return ratio, np.sqrt(np.clip(variance, 0, None))
+
+
+def calculate_bragg_edge_cd_background_profile(
+    roi=None,
+    raw_sample_data=None,
+    raw_sample_variance=None,
+    raw_ob_data=None,
+    raw_ob_variance=None,
+    sample_background_data=None,
+    sample_background_variance=None,
+    ob_background_data=None,
+    ob_background_variance=None,
+    mode: str = "Cd-filter background correction for Bragg edge mode",
+    column_label: str = "Cd-filter",
+    key_prefix: str = "bragg_edge_cd",
+) -> dict:
+    if roi is None:
+        return None
+
+    raw_sample_roi_counts = calculate_roi_profile(data=raw_sample_data, roi=roi)
+    raw_ob_roi_counts = calculate_roi_profile(data=raw_ob_data, roi=roi)
+    sample_background_roi_counts = calculate_roi_profile(data=sample_background_data, roi=roi)
+    ob_background_roi_counts = calculate_roi_profile(data=ob_background_data, roi=roi)
+
+    raw_sample_roi_variance = calculate_roi_profile(data=raw_sample_variance, roi=roi)
+    raw_ob_roi_variance = calculate_roi_profile(data=raw_ob_variance, roi=roi)
+    sample_background_roi_variance = calculate_roi_profile(data=sample_background_variance, roi=roi)
+    ob_background_roi_variance = calculate_roi_profile(data=ob_background_variance, roi=roi)
+
+    corrected_sample_roi_counts = raw_sample_roi_counts - sample_background_roi_counts
+    corrected_ob_roi_counts = raw_ob_roi_counts - ob_background_roi_counts
+    corrected_sample_roi_variance = raw_sample_roi_variance + sample_background_roi_variance
+    corrected_ob_roi_variance = raw_ob_roi_variance + ob_background_roi_variance
+
+    uncorrected_norm, uncorrected_unc = calculate_ratio_and_uncertainty(
+        raw_sample_roi_counts,
+        raw_ob_roi_counts,
+        raw_sample_roi_variance,
+        raw_ob_roi_variance,
+    )
+    corrected_norm, corrected_unc = calculate_ratio_and_uncertainty(
+        corrected_sample_roi_counts,
+        corrected_ob_roi_counts,
+        corrected_sample_roi_variance,
+        corrected_ob_roi_variance,
+    )
+
+    return {
+        f"{key_prefix}_raw_sample_roi_counts": raw_sample_roi_counts,
+        f"{key_prefix}_raw_sample_roi_uncertainty": np.sqrt(np.clip(raw_sample_roi_variance, 0, None)),
+        f"{key_prefix}_raw_ob_roi_counts": raw_ob_roi_counts,
+        f"{key_prefix}_raw_ob_roi_uncertainty": np.sqrt(np.clip(raw_ob_roi_variance, 0, None)),
+        f"{key_prefix}_sample_background_roi_counts": sample_background_roi_counts,
+        f"{key_prefix}_sample_background_roi_uncertainty": np.sqrt(
+            np.clip(sample_background_roi_variance, 0, None)
+        ),
+        f"{key_prefix}_ob_background_roi_counts": ob_background_roi_counts,
+        f"{key_prefix}_ob_background_roi_uncertainty": np.sqrt(np.clip(ob_background_roi_variance, 0, None)),
+        f"{key_prefix}_corrected_sample_roi_counts": corrected_sample_roi_counts,
+        f"{key_prefix}_corrected_sample_roi_uncertainty": np.sqrt(
+            np.clip(corrected_sample_roi_variance, 0, None)
+        ),
+        f"{key_prefix}_corrected_ob_roi_counts": corrected_ob_roi_counts,
+        f"{key_prefix}_corrected_ob_roi_uncertainty": np.sqrt(np.clip(corrected_ob_roi_variance, 0, None)),
+        f"{key_prefix}_uncorrected_spectrum_normalization": uncorrected_norm,
+        f"{key_prefix}_uncorrected_spectrum_normalization_uncertainty": uncorrected_unc,
+        f"{key_prefix}_corrected_spectrum_normalization": corrected_norm,
+        f"{key_prefix}_corrected_spectrum_normalization_uncertainty": corrected_unc,
+        f"{key_prefix}_background_metadata": {
+            "enabled": True,
+            "mode": mode,
+            "column_label": column_label,
+            "key_prefix": key_prefix,
+        },
+    }
 
 
 def extract_spectrum_normalization_values(spectrum_profile=None):
@@ -917,7 +1443,10 @@ def extract_spectrum_normalization_uncertainty(spectrum_profile=None):
 def  calculate_ob_data_combined_used_by_spectrum_normalization(roi=None, ob_data_combined=None, verbose=False):
 
     logging.info(f"Calculating the ob_data_combined for spectrum normalization")
-    if roi is not None:
+    if ob_data_combined is None:
+        logging.info("\tno OB data provided. Skipping OB spectrum profile.")
+        ob_data_combined_for_spectrum = None
+    elif roi is not None:
         logging.info(f"\t{roi =}")
         ob_data_combined_for_spectrum = calculate_roi_profile(data=ob_data_combined, roi=roi)
         logging.info(f"\t{np.shape(ob_data_combined_for_spectrum) = }")
@@ -927,7 +1456,7 @@ def  calculate_ob_data_combined_used_by_spectrum_normalization(roi=None, ob_data
         logging.info(f"\tno roi provided! Skipping the normalization of spectrum.")
         ob_data_combined_for_spectrum = None
 
-    if verbose:
+    if verbose and ob_data_combined is not None:
         display(HTML(f"{ob_data_combined.shape = }"))
 
     return ob_data_combined_for_spectrum
@@ -948,7 +1477,8 @@ def correct_chips_alignment(data_combined=None, correct_chips_alignment_config=N
     if verbose:
         display(HTML("Correcting chips alignment ..."))
 
-    if TimepixGeometryCorrection is None:
+    timepix_geometry_correction_class = _get_timepix_geometry_correction()
+    if timepix_geometry_correction_class is None:
         raise ModuleNotFoundError(
             "timepix_geometry_correction is required when chip alignment correction is enabled."
         )
@@ -957,8 +1487,8 @@ def correct_chips_alignment(data_combined=None, correct_chips_alignment_config=N
 
     data_combined_corrected = np.zeros_like(data_combined)
     for _index, _data in enumerate(data_combined):
-        o_corrector = TimepixGeometryCorrection(raw_images=_data,
-                                                config=correct_chips_alignment_config)
+        o_corrector = timepix_geometry_correction_class(raw_images=_data,
+                                                        config=correct_chips_alignment_config)
         data_corrected = o_corrector.correct()
     
         # remove useless dimension
@@ -1015,15 +1545,37 @@ def preview_normalized_data(_sample_data, ob_data_combined, dc_data_combined,
                             detector_delay_us, _sample_run_number,
                             combine_samples=False,
                             _spectrum_normalized_data=None,
-                            roi=None):
+                            roi=None,
+                            bin_metadata: dict = None):
    
     """preview normalized data"""
+    def _source_frame_counts_for(data):
+        if not bin_metadata or "source_frame_count_array" not in bin_metadata:
+            return None
+        source_frame_counts = np.asarray(bin_metadata["source_frame_count_array"], dtype=np.float64)
+        if data is None or len(source_frame_counts) != np.asarray(data).shape[0]:
+            return None
+        return source_frame_counts
+
+    def _data_per_source_frame(data):
+        source_frame_counts = _source_frame_counts_for(data)
+        if source_frame_counts is None:
+            return data
+        return np.asarray(data, dtype=np.float64) / source_frame_counts[:, None, None]
+
+    def _profile_per_source_frame(profile, data):
+        source_frame_counts = _source_frame_counts_for(data)
+        if source_frame_counts is None:
+            return profile, "Integrated counts"
+        return profile / source_frame_counts, "Integrated counts per source frame"
+
+    profile_xaxis_title = "Rebinned bin index" if bin_metadata is not None else "File image index"
 
     # display preview of normalized data
     fig = make_subplots(rows=1, cols=2, 
                        subplot_titles=["Integrated Sample data", "Sample Profile"],
                        horizontal_spacing=0.15)
-    sample_data_integrated = np.nanmean(_sample_data, axis=0)
+    sample_data_integrated = np.nanmean(_data_per_source_frame(_sample_data), axis=0)
     
     # Calculate 2-98% percentile range for better contrast
     vmin, vmax = np.percentile(sample_data_integrated, [2, 98])
@@ -1040,50 +1592,57 @@ def preview_normalized_data(_sample_data, ob_data_combined, dc_data_combined,
 
     sample_integrated1 = np.nansum(_sample_data, axis=1)
     sample_integrated = np.nansum(sample_integrated1, axis=1)
+    sample_integrated, sample_profile_yaxis = _profile_per_source_frame(sample_integrated, _sample_data)
     fig.add_trace(go.Scatter(y=sample_integrated, 
                            mode='markers',
                            marker=dict(size=MARKERSIZE),
                            name="Sample"), row=1, col=2)
-    fig.update_xaxes(title_text="File image index", row=1, col=2)
-    fig.update_yaxes(title_text="Transmission (a.u.)", row=1, col=2)
+    fig.update_xaxes(title_text=profile_xaxis_title, row=1, col=2)
+    fig.update_yaxes(title_text=sample_profile_yaxis, row=1, col=2)
     # Ensure equal aspect ratio for heatmap (square pixels)
-    fig.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
+    # Match the detector-image convention used by Matplotlib:
+    # pixel row 0 is displayed at the top of the image.
+    fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1, row=1, col=1)
     fig.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
     fig.show()
 
-    fig2 = make_subplots(rows=1, cols=2, 
-                        subplot_titles=["OB integrated data", "OB Profile"],
-                        horizontal_spacing=0.15)
-    ob_data_integrated = np.nanmean(ob_data_combined, axis=0)
-    
-    # Calculate 2-98% percentile range for better contrast
-    vmin, vmax = np.percentile(ob_data_integrated, [2, 98])
-    fig2.add_trace(go.Heatmap(z=ob_data_integrated, 
-                            colorscale="gray",
-                            zmin=vmin,
-                            zmax=vmax,
-                            showscale=True,
-                            showlegend=False,
-                            colorbar=dict(x=0.45)), row=1, col=1)
+    if ob_data_combined is not None:
+        fig2 = make_subplots(rows=1, cols=2,
+                            subplot_titles=["OB integrated data", "OB Profile"],
+                            horizontal_spacing=0.15)
+        ob_data_integrated = np.nanmean(_data_per_source_frame(ob_data_combined), axis=0)
 
-    ob_integrated1 = np.nansum(ob_data_combined, axis=1)
-    ob_integrated = np.nansum(ob_integrated1, axis=1)
-    fig2.add_trace(go.Scatter(y=ob_integrated, 
-                            mode='markers',
-                            marker=dict(size=MARKERSIZE),
-                            name="OB"), row=1, col=2)
-    fig2.update_xaxes(title_text="File image index", row=1, col=2)
-    fig2.update_yaxes(title_text="Transmission (a.u.)", row=1, col=2)
-    # Ensure equal aspect ratio for heatmap (square pixels)
-    fig2.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
-    fig2.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
-    fig2.show()
+        # Calculate 2-98% percentile range for better contrast
+        vmin, vmax = np.percentile(ob_data_integrated, [2, 98])
+        fig2.add_trace(go.Heatmap(z=ob_data_integrated,
+                                colorscale="gray",
+                                zmin=vmin,
+                                zmax=vmax,
+                                showscale=True,
+                                showlegend=False,
+                                colorbar=dict(x=0.45)), row=1, col=1)
+
+        ob_integrated1 = np.nansum(ob_data_combined, axis=1)
+        ob_integrated = np.nansum(ob_integrated1, axis=1)
+        ob_integrated, ob_profile_yaxis = _profile_per_source_frame(ob_integrated, ob_data_combined)
+        fig2.add_trace(go.Scatter(y=ob_integrated,
+                                mode='markers',
+                                marker=dict(size=MARKERSIZE),
+                                name="OB"), row=1, col=2)
+        fig2.update_xaxes(title_text=profile_xaxis_title, row=1, col=2)
+        fig2.update_yaxes(title_text=ob_profile_yaxis, row=1, col=2)
+        # Ensure equal aspect ratio for heatmap (square pixels)
+        fig2.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
+        fig2.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
+        fig2.show()
+    else:
+        display(HTML("<span style='color:blue'>No OB run was provided; skipping OB preview.</span>"))
 
     if dc_data_combined is not None:
         fig3 = make_subplots(rows=1, cols=2, 
                            subplot_titles=["DC integrated data", "DC Profile"],
                            horizontal_spacing=0.15)
-        dc_data_integrated = np.nanmean(dc_data_combined, axis=0)
+        dc_data_integrated = np.nanmean(_data_per_source_frame(dc_data_combined), axis=0)
         
         # Calculate 2-98% percentile range for better contrast
         vmin, vmax = np.percentile(dc_data_integrated, [2, 98])
@@ -1097,12 +1656,13 @@ def preview_normalized_data(_sample_data, ob_data_combined, dc_data_combined,
 
         dc_integrated1 = np.nansum(dc_data_combined, axis=1)
         dc_integrated = np.nansum(dc_integrated1, axis=1)
+        dc_integrated, dc_profile_yaxis = _profile_per_source_frame(dc_integrated, dc_data_combined)
         fig3.add_trace(go.Scatter(y=dc_integrated, 
                                 mode='markers',
                                 marker=dict(size=MARKERSIZE),
                                 name="DC"), row=1, col=2)
-        fig3.update_xaxes(title_text="File image index", row=1, col=2)
-        fig3.update_yaxes(title_text="Transmission (a.u.)", row=1, col=2)
+        fig3.update_xaxes(title_text=profile_xaxis_title, row=1, col=2)
+        fig3.update_yaxes(title_text=dc_profile_yaxis, row=1, col=2)
         # Ensure equal aspect ratio for heatmap (square pixels)
         fig3.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
         fig3.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
@@ -1383,6 +1943,289 @@ def make_tiff(data: list, filename: str = "", metadata: dict = None) -> None:
         new_image.save(filename, tiffinfo=metadata)
     else:
         new_image.save(filename)
+
+
+def _safe_write_integrated_preview_png(
+    output_file: str,
+    integrated_image: np.ndarray,
+    profile: np.ndarray = None,
+    roi: Roi = None,
+    vmin: float = None,
+    vmax: float = None,
+    profile_xaxis_title: str = "File image index",
+    profile_title: str = None,
+) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+
+        if profile is None:
+            fig, axis = plt.subplots(1, 1, figsize=(7, 6), constrained_layout=True)
+            image_axis = axis
+        else:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 6), constrained_layout=True)
+            image_axis = axes[0]
+
+        image = image_axis.imshow(
+            integrated_image,
+            cmap="gray",
+            vmin=vmin,
+            vmax=vmax,
+            origin="upper",
+            aspect="equal",
+        )
+        image_axis.set_title("Integrated Normalized data")
+        fig.colorbar(image, ax=image_axis, fraction=0.046, pad=0.04)
+        if roi is not None:
+            image_axis.add_patch(
+                Rectangle(
+                    (roi.left, roi.top),
+                    roi.width,
+                    roi.height,
+                    linewidth=2,
+                    edgecolor="red",
+                    facecolor="none",
+                )
+            )
+
+        if profile is not None:
+            profile_axis = axes[1]
+            profile_axis.plot(np.arange(len(profile)), profile, ".", markersize=MARKERSIZE)
+            profile_axis.set_title(profile_title or (
+                "pixel by pixel normalization profile of ROI"
+                if roi is not None
+                else "pixel by pixel normalization profile of full image"
+            ))
+            profile_axis.set_xlabel(profile_xaxis_title)
+            profile_axis.set_ylabel("Transmission (a.u.)")
+            profile_axis.grid(True, alpha=0.25)
+
+        fig.savefig(output_file, dpi=150)
+        plt.close(fig)
+    except Exception as error:
+        logging.warning(
+            "Unable to export integrated normalized preview PNG %s. Error: %s",
+            output_file,
+            error,
+        )
+
+
+def _extract_spectrum_normalization_profile(spectrum_normalized_data=None):
+    if spectrum_normalized_data is None:
+        return None
+
+    if isinstance(spectrum_normalized_data, dict):
+        for key in (
+            "spectrum_normalization",
+            "black_filter_background_corrected_spectrum_normalization",
+        ):
+            if spectrum_normalized_data.get(key) is not None:
+                return np.asarray(spectrum_normalized_data[key], dtype=np.float64)
+
+        for key in sorted(spectrum_normalized_data):
+            if key.endswith("_corrected_spectrum_normalization"):
+                values = spectrum_normalized_data.get(key)
+                if values is not None:
+                    return np.asarray(values, dtype=np.float64)
+        return None
+
+    return np.asarray(spectrum_normalized_data, dtype=np.float64)
+
+
+def export_integrated_normalized_preview(
+    output_folder: str,
+    integrated_normalized_image: np.ndarray,
+    normalized_stack: np.ndarray = None,
+    roi: Roi = None,
+    bin_metadata: dict = None,
+    spectrum_normalized_data=None,
+) -> None:
+    """Export the integrated-normalized preview plot and its underlying arrays."""
+    os.makedirs(output_folder, exist_ok=True)
+
+    integrated_image = np.asarray(integrated_normalized_image, dtype=np.float64)
+    data_file = os.path.join(output_folder, "normalized_integrated_data.txt")
+    np.savetxt(
+        data_file,
+        integrated_image,
+        fmt="%.8e",
+        header="Integrated normalized image used for the preview heatmap.",
+    )
+    logging.info(f"\t -> Exported integrated normalized preview data to {data_file}")
+
+    pixel_profile = None
+    pixel_profile_label = None
+    if normalized_stack is not None:
+        stack = np.asarray(normalized_stack, dtype=np.float64)
+        if roi is not None:
+            x0 = roi.left
+            y0 = roi.top
+            width = roi.width
+            height = roi.height
+            profile_step1 = np.nanmean(stack[:, y0:y0 + height, x0:x0 + width], axis=1)
+            pixel_profile = np.nanmean(profile_step1, axis=1)
+            pixel_profile_label = "ROI mean pixel-normalized intensity"
+        else:
+            profile_step1 = np.nanmean(stack, axis=1)
+            pixel_profile = np.nanmean(profile_step1, axis=1)
+            pixel_profile_label = "full-image mean pixel-normalized intensity"
+
+    spectrum_profile = _extract_spectrum_normalization_profile(spectrum_normalized_data)
+    if spectrum_profile is not None and pixel_profile is not None and len(spectrum_profile) != len(pixel_profile):
+        logging.warning(
+            "Integrated preview spectrum profile length (%s) does not match pixel profile length (%s); "
+            "falling back to the pixel profile.",
+            len(spectrum_profile),
+            len(pixel_profile),
+        )
+        spectrum_profile = None
+
+    profile = pixel_profile if pixel_profile is not None else spectrum_profile
+    profile_label = (
+        pixel_profile_label
+        if pixel_profile is not None
+        else "ROI summed-count transmission"
+    )
+    if profile is not None:
+        profile_xaxis_title = "Rebinned bin index" if bin_metadata is not None else "File image index"
+        profile_dict = {
+            "profile_index": np.arange(len(profile), dtype=int),
+            "integrated_normalized_profile": profile,
+        }
+        if spectrum_profile is not None:
+            profile_dict["roi_summed_count_transmission"] = spectrum_profile
+        if pixel_profile is not None:
+            profile_dict["pixel_mean_normalized_intensity"] = pixel_profile
+        if bin_metadata is not None:
+            profile_dict.update(
+                {
+                    "source_frame_count": bin_metadata.get("source_frame_count_array"),
+                    "starting_tof (micros)": bin_metadata.get("starting_tof_array") * 1e6,
+                    "ending_tof (micros)": bin_metadata.get("ending_tof_array") * 1e6,
+                    "mean_tof (micros)": bin_metadata.get("mean_tof_array") * 1e6,
+                    "mean_lambda (Angstroms)": bin_metadata.get("mean_lambda_array"),
+                    "mean_energy (eV)": bin_metadata.get("mean_energy_array"),
+                }
+            )
+        profile_dataframe = pd.DataFrame(profile_dict)
+        profile_dataframe.attrs["profile description"] = profile_label
+        if roi is not None:
+            profile_dataframe.attrs["roi [left, top, width, height]"] = (
+                f"{roi.left}, {roi.top}, {roi.width}, {roi.height}"
+            )
+        profile_file = os.path.join(output_folder, "normalized_integrated_profile.txt")
+        with open(profile_file, "w") as profile_handle:
+            for key, value in profile_dataframe.attrs.items():
+                profile_handle.write(f"# {key}: {value}\n")
+            profile_dataframe.to_csv(profile_handle, index=False)
+        logging.info(f"\t -> Exported integrated normalized preview profile to {profile_file}")
+
+    finite_values = integrated_image[np.isfinite(integrated_image)]
+    if finite_values.size:
+        vmin, vmax = np.percentile(finite_values, [2, 98])
+        vmin = max(vmin, 0)
+        vmax = min(vmax, 1)
+    else:
+        vmin, vmax = 0, 1
+
+    if profile is None:
+        fig = make_subplots(rows=1, cols=1, subplot_titles=["Integrated Normalized data"])
+        fig.add_trace(
+            go.Heatmap(
+                z=integrated_image,
+                colorscale="gray",
+                zmin=vmin,
+                zmax=vmax,
+                showscale=True,
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+    else:
+        profile_title = "ROI normalization profiles" if roi is not None else (
+            "full-image normalization profiles"
+        )
+        fig = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=["Integrated Normalized data", profile_title],
+            horizontal_spacing=0.15,
+        )
+        fig.add_trace(
+            go.Heatmap(
+                z=integrated_image,
+                colorscale="gray",
+                zmin=vmin,
+                zmax=vmax,
+                showscale=True,
+                showlegend=False,
+                colorbar=dict(x=0.45),
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                y=profile,
+                mode="markers",
+                marker=dict(size=MARKERSIZE),
+                name=profile_label,
+                showlegend=spectrum_profile is not None and pixel_profile is not None,
+            ),
+            row=1,
+            col=2,
+        )
+        if spectrum_profile is not None and pixel_profile is not None:
+            fig.add_trace(
+                go.Scatter(
+                    y=spectrum_profile,
+                    mode="markers",
+                    marker=dict(size=MARKERSIZE, opacity=0.45),
+                    name="ROI summed-count transmission",
+                ),
+                row=1,
+                col=2,
+            )
+        fig.update_xaxes(
+            title_text=profile_xaxis_title,
+            row=1,
+            col=2,
+        )
+        fig.update_yaxes(title_text="Transmission (a.u.)", row=1, col=2)
+
+    if roi is not None:
+        fig.add_shape(
+            type="rect",
+            x0=roi.left,
+            y0=roi.top,
+            x1=roi.left + roi.width,
+            y1=roi.top + roi.height,
+            line=dict(color="red", width=2),
+            fillcolor="rgba(0,0,0,0)",
+            row=1,
+            col=1,
+        )
+    # Match the detector-image convention used by Matplotlib:
+    # pixel row 0 is displayed at the top of the image.
+    fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1, row=1, col=1)
+    fig.update_layout(height=600, width=1200, margin=dict(l=50, r=50, t=80, b=50))
+
+    html_file = os.path.join(output_folder, "normalized_integrated_preview.html")
+    fig.write_html(html_file, include_plotlyjs="cdn")
+    logging.info(f"\t -> Exported integrated normalized preview HTML to {html_file}")
+    _safe_write_integrated_preview_png(
+        output_file=os.path.join(output_folder, "normalized_integrated_preview.png"),
+        integrated_image=integrated_image,
+        profile=profile,
+        roi=roi,
+        vmin=vmin,
+        vmax=vmax,
+        profile_xaxis_title=profile_xaxis_title if profile is not None else "File image index",
+        profile_title=profile_label if profile is not None else None,
+    )
 
 
 def isolate_run_number_from_full_path(run_number_full_path: str) -> str:
@@ -1979,7 +2822,8 @@ def combine_images(
     full_data_corrected = []
 
     if use_proton_charge:
-        # used for the weighted sum of the ob data
+        # Combined run is the total counts divided by total proton charge.
+        # This is equivalent to exposure-time normalization for unequal-charge runs.
         logging.info(f"Getting proton charge for each {data_type} run number:")
         list_proton_charges = []
         for _run_number in master_dict.keys():
@@ -2009,16 +2853,6 @@ def combine_images(
         logging.info(f"\t minimum of {data_type} data: {np.min(data)}")
         logging.info("**********************************")
 
-        if use_proton_charge:
-            logging.info("\t -> Normalized by proton charge")
-            proton_charge = master_dict[_run_number][MasterDictKeys.proton_charge]
-            logging.info(f"\t\t proton charge: {proton_charge} C")
-            logging.info(f"\t\t{type(proton_charge) = }")
-            logging.info(f"\t\tbefore division: {proton_charge.dtype = }")
-            data *= (proton_charge / sum_proton_charge) # weighted sum
-            logging.info(f"\t\tafter division: {data.dtype = }")
-            logging.info(f"{data.shape = }")
-
         if replace_zeros_by_local_median:
             data = replace_zero_with_local_median(data, 
                                                 kernel_size=kernel_size_for_local_median, 
@@ -2030,11 +2864,9 @@ def combine_images(
     logging.info("Combining all ob images is done!")
     logging.info(f"\tbefore: {len(full_data_corrected) = }")
     if use_proton_charge:
-        coeff = np.mean(list_proton_charges)
+        data_combined = np.array(full_data_corrected).sum(axis=0) / sum_proton_charge
     else:
-        coeff = 1
-            
-    data_combined = np.array(full_data_corrected).sum(axis=0) / coeff
+        data_combined = np.array(full_data_corrected).mean(axis=0)
     
     # if use_proton_charge:
     #     data_combined = np.array(full_data_corrected).sum(axis=0)
@@ -2126,6 +2958,16 @@ def combine_images(
 
 
 def perform_normalization(_sample_data=None, ob_data_combined=None, dc_data_combined=None):
+    if ob_data_combined is None:
+        if dc_data_combined is not None:
+            raise ValueError("Dark-current subtraction requires an open-beam reference.")
+        logging.info("normalization without OB: treating sample data as already normalized")
+        _normalized_data = np.asarray(_sample_data).copy()
+        _integrated_normalized_data = np.nanmean(_normalized_data, axis=0)
+        return {
+            'normalized_data': _normalized_data,
+            'integrated_normalized_data': _integrated_normalized_data,
+        }
     
     # working on each image (TOF) independently
     if dc_data_combined is not None:
@@ -2168,6 +3010,9 @@ def perform_spectrum_normalization(
     dc_data_combined_for_spectrum=None,
     dc_data_combined_variance=None,
     dc_data_combined_variance_for_spectrum=None,
+    black_filter_background_profile=None,
+    bragg_edge_cd_background_profile=None,
+    measured_background_profiles=None,
 ):
     if roi is None:
         return None
@@ -2178,10 +3023,15 @@ def perform_spectrum_normalization(
     else:
         sample_roi_variance = calculate_roi_profile(data=sample_variance, roi=roi)
 
-    ob_roi_counts = np.asarray(ob_data_combined_for_spectrum, dtype=np.float64)
-    if ob_data_combined_variance_for_spectrum is None:
-        ob_roi_variance = np.asarray(ob_roi_counts, dtype=np.float64)
+    if ob_data_combined_for_spectrum is None:
+        roi_pixel_count = float(roi.width * roi.height)
+        ob_roi_counts = np.full_like(sample_roi_counts, roi_pixel_count, dtype=np.float64)
+        ob_roi_variance = np.zeros_like(sample_roi_counts, dtype=np.float64)
     else:
+        ob_roi_counts = np.asarray(ob_data_combined_for_spectrum, dtype=np.float64)
+    if ob_data_combined_for_spectrum is not None and ob_data_combined_variance_for_spectrum is None:
+        ob_roi_variance = np.asarray(ob_roi_counts, dtype=np.float64)
+    elif ob_data_combined_for_spectrum is not None:
         ob_roi_variance = np.asarray(ob_data_combined_variance_for_spectrum, dtype=np.float64)
 
     spectrum_result = {
@@ -2256,6 +3106,13 @@ def perform_spectrum_normalization(
     spectrum_result["spectrum_normalization_uncertainty"] = np.sqrt(
         np.clip(spectrum_normalization_variance, 0, None)
     )
+    if black_filter_background_profile is not None:
+        spectrum_result.update(black_filter_background_profile)
+    if bragg_edge_cd_background_profile is not None:
+        spectrum_result.update(bragg_edge_cd_background_profile)
+    for measured_background_profile in measured_background_profiles or []:
+        if measured_background_profile is not None:
+            spectrum_result.update(measured_background_profile)
     logging.info(f"{np.shape(spectrum_result['spectrum_normalization']) = }")
     return spectrum_result
 
@@ -2283,9 +3140,12 @@ def export_normalized_data(ob_master_dict=None,
 
     list_ob_runs = list(ob_master_dict.keys())
     str_ob_runs = "_".join([str(_ob_run_number) for _ob_run_number in list_ob_runs])
+    if not str_ob_runs:
+        str_ob_runs = "no_open_beam"
     full_output_folder = os.path.join(
-        output_folder, f"normalized_sample_{_sample_run_number}_obs_{str_ob_runs}{output_suffix}"
-    )  # issue for WEI here !
+        output_folder,
+        _safe_normalization_output_basename(_sample_run_number, str_ob_runs, output_suffix),
+    )
     full_output_folder = os.path.abspath(full_output_folder)
     os.makedirs(full_output_folder, exist_ok=True)
 
@@ -2299,17 +3159,32 @@ def export_normalized_data(ob_master_dict=None,
         full_file_name = os.path.join(full_output_folder, "spectrum_normalization_profile.txt")
         if bin_metadata is not None:
             bin_index_array = bin_metadata["active_bin_index_array"]
+            source_frame_count_array = bin_metadata.get(
+                "source_frame_count_array",
+                np.ones(len(bin_index_array), dtype=int),
+            )
+            starting_tof_micros = bin_metadata["starting_tof_array"] * 1e6
+            ending_tof_micros = bin_metadata["ending_tof_array"] * 1e6
+            effective_tof_span_micros = ending_tof_micros - starting_tof_micros
             mean_tof_micros = bin_metadata["mean_tof_array"] * 1e6
             mean_lambda = bin_metadata["mean_lambda_array"]
             mean_energy = bin_metadata["mean_energy_array"]
         else:
             bin_index_array = np.arange(len(lambda_array))
+            source_frame_count_array = np.ones(len(bin_index_array), dtype=int)
+            starting_tof_micros = None if tof_array is None else np.asarray(tof_array, dtype=np.float64) * 1e6
+            ending_tof_micros = None if tof_array is None else np.asarray(tof_array, dtype=np.float64) * 1e6
+            effective_tof_span_micros = np.zeros(len(bin_index_array), dtype=np.float64)
             mean_tof_micros = None if tof_array is None else np.asarray(tof_array, dtype=np.float64) * 1e6
             mean_lambda = lambda_array
             mean_energy = energy_array
 
         pd_dataframe_dict = {
             "bin index": bin_index_array,
+            "source frame count": source_frame_count_array,
+            "starting_tof (micros)": starting_tof_micros,
+            "ending_tof (micros)": ending_tof_micros,
+            "effective_tof_span (micros)": effective_tof_span_micros,
             "mean_tof (micros)": mean_tof_micros,
             "mean_lambda (Angstroms)": mean_lambda,
             "mean_energy (eV)": mean_energy,
@@ -2329,7 +3204,111 @@ def export_normalized_data(ob_master_dict=None,
                 ("ob_minus_dc_roi_uncertainty", "OB minus DC ROI uncertainty"),
                 ("spectrum_normalization", "spectrum normalization"),
                 ("spectrum_normalization_uncertainty", "spectrum normalization uncertainty"),
+                ("black_filter_background_sample_roi_counts", "black-filter background sample ROI counts"),
+                ("black_filter_background_ob_roi_counts", "black-filter background OB ROI counts"),
+                (
+                    "black_filter_background_corrected_sample_roi_counts",
+                    "black-filter corrected sample ROI counts",
+                ),
+                (
+                    "black_filter_background_corrected_sample_roi_uncertainty",
+                    "black-filter corrected sample ROI uncertainty",
+                ),
+                (
+                    "black_filter_background_corrected_ob_roi_counts",
+                    "black-filter corrected OB ROI counts",
+                ),
+                (
+                    "black_filter_background_corrected_ob_roi_uncertainty",
+                    "black-filter corrected OB ROI uncertainty",
+                ),
+                (
+                    "black_filter_background_corrected_spectrum_normalization",
+                    "black-filter corrected spectrum normalization",
+                ),
+                (
+                    "black_filter_background_corrected_spectrum_normalization_uncertainty",
+                    "black-filter corrected spectrum normalization uncertainty",
+                ),
             ]
+            measured_background_metadata = []
+            for metadata_key, metadata in _spectrum_normalized_data.items():
+                if (
+                    metadata_key.endswith("_background_metadata")
+                    and metadata_key != "black_filter_background_metadata"
+                    and isinstance(metadata, dict)
+                ):
+                    prefix = metadata.get("key_prefix") or metadata_key.removesuffix("_background_metadata")
+                    measured_background_metadata.append((prefix, metadata))
+
+            for background_prefix, background_metadata in measured_background_metadata:
+                background_column_label = background_metadata.get("column_label", "Cd-filter")
+                ordered_columns += [
+                    (
+                        f"{background_prefix}_raw_sample_roi_counts",
+                        f"{background_column_label} raw sample ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_raw_sample_roi_uncertainty",
+                        f"{background_column_label} raw sample ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_raw_ob_roi_counts",
+                        f"{background_column_label} raw OB ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_raw_ob_roi_uncertainty",
+                        f"{background_column_label} raw OB ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_sample_background_roi_counts",
+                        f"{background_column_label} sample background ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_sample_background_roi_uncertainty",
+                        f"{background_column_label} sample background ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_ob_background_roi_counts",
+                        f"{background_column_label} OB background ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_ob_background_roi_uncertainty",
+                        f"{background_column_label} OB background ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_sample_roi_counts",
+                        f"{background_column_label} corrected sample ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_sample_roi_uncertainty",
+                        f"{background_column_label} corrected sample ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_ob_roi_counts",
+                        f"{background_column_label} corrected OB ROI counts",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_ob_roi_uncertainty",
+                        f"{background_column_label} corrected OB ROI uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_uncorrected_spectrum_normalization",
+                        f"{background_column_label} uncorrected spectrum normalization",
+                    ),
+                    (
+                        f"{background_prefix}_uncorrected_spectrum_normalization_uncertainty",
+                        f"{background_column_label} uncorrected spectrum normalization uncertainty",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_spectrum_normalization",
+                        f"{background_column_label} corrected spectrum normalization",
+                    ),
+                    (
+                        f"{background_prefix}_corrected_spectrum_normalization_uncertainty",
+                        f"{background_column_label} corrected spectrum normalization uncertainty",
+                    ),
+                ]
             for source_key, output_key in ordered_columns:
                 values = _spectrum_normalized_data.get(source_key)
                 if values is not None:
@@ -2342,6 +3321,28 @@ def export_normalized_data(ob_master_dict=None,
         pd_dataframe.attrs['uncertainty model'] = uncertainty_model_label or (
             "Poisson counting statistics; proton charge treated as an exact scale factor"
         )
+        if bin_metadata is not None:
+            pd_dataframe.attrs["rebin snap to native grid"] = bin_metadata.get(
+                "rebin_snap_to_native_grid",
+                False,
+            )
+        if isinstance(_spectrum_normalized_data, dict):
+            black_filter_background_metadata = _spectrum_normalized_data.get("black_filter_background_metadata")
+            if black_filter_background_metadata:
+                for key, value in black_filter_background_metadata.items():
+                    pd_dataframe.attrs[f"black-filter background {key}"] = value
+            for metadata_key, metadata in _spectrum_normalized_data.items():
+                if (
+                    metadata_key.endswith("_background_metadata")
+                    and metadata_key != "black_filter_background_metadata"
+                    and isinstance(metadata, dict)
+                ):
+                    metadata_prefix = metadata.get(
+                        "mode",
+                        "Cd-filter background correction for Bragg edge mode",
+                    )
+                    for key, value in metadata.items():
+                        pd_dataframe.attrs[f"{metadata_prefix} {key}"] = value
                         
         with open(full_file_name, 'w') as f:
             for key, value in pd_dataframe.attrs.items():
@@ -2355,6 +3356,14 @@ def export_normalized_data(ob_master_dict=None,
         logging.info(f"\t -> Exporting integrated normalized data to {full_file_name} ...")
         make_tiff(data=integrated_normalized_data[_sample_run_number], filename=full_file_name)
         logging.info(f"\t -> Exporting integrated normalized data to {full_file_name} is done!")
+        export_integrated_normalized_preview(
+            output_folder=full_output_folder,
+            integrated_normalized_image=integrated_normalized_data[_sample_run_number],
+            normalized_stack=normalized_data.get(_sample_run_number) if normalized_data is not None else None,
+            roi=roi,
+            bin_metadata=bin_metadata,
+            spectrum_normalized_data=_spectrum_normalized_data,
+        )
 
     if export_corrected_stack_of_normalized_data:
         output_stack_folder = os.path.join(full_output_folder, "stack")
@@ -2516,26 +3525,20 @@ def save_container_roi_file(output_folder:str,
     return container_roi_file
     
     
-def normalize_by_container_roi(sample_data: np.ndarray, 
-                               container_roi: Roi,
-                               container_roi_file: str,
-                               output_folder: str,
-                               sample_run_number: str) -> np.ndarray:
-    """normalize sample data subtracting by container roi"""
+def calculate_container_roi_value_array(
+    sample_data: np.ndarray,
+    container_roi: Roi,
+    container_roi_file: str,
+    output_folder: str,
+    sample_run_number: str,
+) -> tuple[np.ndarray, str]:
+    """Return the per-frame mean intensity in the selected container ROI."""
 
-    logging.info(f"in normalize_by_container_roi:")
+    logging.info(f"in calculate_container_roi_value_array:")
     if container_roi_file is not None:
         logging.info(f"\t {container_roi_file = }")
-        _container_value_array: float = read_container_roi_file(container_roi_file=container_roi_file)
+        _container_value_array = read_container_roi_file(container_roi_file=container_roi_file)
         logging.info(f"\t{_container_value_array =}")
-        
-        _normalized_sample = np.empty_like(sample_data)
-        for i, _sample in enumerate(sample_data):
-            _container_value = _container_value_array[i]
-            _log_sample = -np.log(_sample)
-            _log_container_value = -np.log(_container_value)
-            _log_normalized_sample = _log_sample - _log_container_value
-            _normalized_sample[i] = np.exp(- _log_normalized_sample)
 
     else:
         logging.info(f"\t {container_roi = }")
@@ -2544,15 +3547,10 @@ def normalize_by_container_roi(sample_data: np.ndarray,
         width: int = container_roi.width
         height: int = container_roi.height
         
-        _normalized_sample = np.empty_like(sample_data)
         list_container_values = []
         for i, _sample in enumerate(sample_data):
             _container_value = np.mean(np.mean(_sample[y0:y0 + height, x0:x0 + width], axis=0), axis=0)            
             list_container_values.append(_container_value)
-            _log_sample = -np.log(_sample)
-            _log_container_value = -np.log(_container_value)
-            _log_normalized_sample = _log_sample - _log_container_value
-            _normalized_sample[i] = np.exp(- _log_normalized_sample)
         
         # save the container roi file
         container_roi_file = save_container_roi_file(output_folder=output_folder, 
@@ -2560,7 +3558,58 @@ def normalize_by_container_roi(sample_data: np.ndarray,
                                                     container_roi=container_roi,
                                                     list_container_values=list_container_values,
                                                     integrated_image=np.sum(sample_data, axis=0))    
-        
+
+        _container_value_array = list_container_values
+
+    _container_value_array = np.asarray(_container_value_array, dtype=np.float64)
+    if _container_value_array.shape[0] != np.asarray(sample_data).shape[0]:
+        raise ValueError(
+            "Container ROI profile length does not match the sample stack length: "
+            f"{_container_value_array.shape[0]} container values for {np.asarray(sample_data).shape[0]} frames."
+        )
+    return _container_value_array, container_roi_file
+
+
+def normalize_by_container_value_array(
+    sample_data: np.ndarray,
+    container_value_array: np.ndarray,
+) -> np.ndarray:
+    array_data = np.asarray(sample_data, dtype=np.float64)
+    container_values = np.asarray(container_value_array, dtype=np.float64)
+    if container_values.shape[0] != array_data.shape[0]:
+        raise ValueError(
+            "Container ROI profile length does not match the sample stack length: "
+            f"{container_values.shape[0]} container values for {array_data.shape[0]} frames."
+        )
+    denominator_shape = (container_values.shape[0],) + (1,) * (array_data.ndim - 1)
+    denominator = container_values.reshape(denominator_shape)
+    return np.divide(
+        array_data,
+        denominator,
+        out=np.zeros_like(array_data, dtype=np.float64),
+        where=denominator != 0,
+    )
+
+
+def normalize_by_container_roi(sample_data: np.ndarray,
+                               container_roi: Roi,
+                               container_roi_file: str,
+                               output_folder: str,
+                               sample_run_number: str) -> np.ndarray:
+    """Normalize sample data by the mean intensity in a container-only ROI."""
+
+    logging.info(f"in normalize_by_container_roi:")
+    _container_value_array, container_roi_file = calculate_container_roi_value_array(
+        sample_data=sample_data,
+        container_roi=container_roi,
+        container_roi_file=container_roi_file,
+        output_folder=output_folder,
+        sample_run_number=sample_run_number,
+    )
+    _normalized_sample = normalize_by_container_value_array(
+        sample_data=sample_data,
+        container_value_array=_container_value_array,
+    )
     return _normalized_sample, container_roi_file
 
 

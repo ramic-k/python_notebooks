@@ -141,6 +141,92 @@ Current defaults:
 - TPX1: experimental uncertainties on by default
 - TPX3: experimental uncertainties off by default
 
+## Black-filter background correction
+
+This is optional and should only be enabled for ROI spectrum profiles from production data that included the Ag black notch used to scale the fitted background shape.
+
+Enable it:
+
+```bash
+--black-filter-background
+```
+
+The default shape CSV is bundled with this repo:
+
+```text
+notebooks/__code/normalization_tof/data/hdperpi_background_constrained_poly_curve.csv
+```
+
+Override it if needed:
+
+```bash
+--black-filter-background-file /path/to/background_shape.csv
+```
+
+Set the single scaling anchor energy:
+
+```bash
+--black-filter-anchor-energy-ev 5.1044
+```
+
+What it does:
+- extracts unrebinned sample and OB ROI counts
+- scales the sample and OB background shapes independently at the nearest measured bin to the anchor energy
+- subtracts the scaled backgrounds before TOF rebinning
+- exports corrected sample counts, corrected OB counts, and corrected transmission columns
+
+Main corrected columns in `spectrum_normalization_profile.txt`:
+- `black-filter corrected sample ROI counts`
+- `black-filter corrected OB ROI counts`
+- `black-filter corrected spectrum normalization`
+- `black-filter corrected spectrum normalization uncertainty`
+
+Important limitations:
+- full image stacks are not background-corrected by this option
+- corrected uncertainty currently propagates sample/OB counting variance only
+- background-shape and single-anchor scale-factor uncertainty are not included
+
+## Measured background correction for Bragg-edge mode
+
+This is optional and disabled by default. Use it when you measured separate sample-side and OB-side background runs, such as Cd-filter or closed-slits backgrounds.
+
+Enable the modes you want:
+
+```bash
+--bragg-edge-cd-background
+--closed-slits-background
+```
+
+For one selected mode, the older generic background inputs still work:
+
+```bash
+--bragg-edge-cd-background \
+--sample-bg-run 19537 \
+--ob-bg-run 19536
+```
+
+For combined modes, use the mode-specific inputs:
+
+```bash
+--bragg-edge-cd-background \
+--closed-slits-background \
+--cd-sample-bg-run 19537 \
+--cd-ob-bg-run 19536 \
+--closed-slits-sample-bg-run 19534 \
+--closed-slits-ob-bg-run 19535
+```
+
+When both modes are selected, this subtracts both measured backgrounds:
+
+```text
+sample_corrected = sample - Cd - closed_slits
+OB_corrected     = OB     - Cd - closed_slits
+```
+
+The subtraction is applied on the native frame grid before any requested TOF rebinning, so the corrected sample and OB arrays are what get rebinned.
+
+Uncertainty propagation treats every measured background as independent and adds the variances from the selected background terms.
+
 ## Rebin modes
 
 Valid modes:
@@ -165,6 +251,15 @@ custom-schedule
 
 ```bash
 --rebin-mode linear-tof --delta-tof-us 30
+```
+
+By default the CLI snaps fixed-width bins to the native TOF grid. For TPX1 data
+with a native spacing of about 5.12 microseconds, a requested `30 us` bin becomes
+6 native frames, or about `30.72 us`. This avoids alternating 5-frame and
+6-frame output bins in raw-count diagnostics. Disable it with:
+
+```bash
+--no-snap-to-native-rebin-grid
 ```
 
 ### 3. Linear lambda
@@ -212,6 +307,9 @@ Example:
 --segment 5500,50 \
 --segment ,40
 ```
+
+For `--custom-scale linear` with `tof` or `lambda` basis, each segment step is
+also snapped to an integer number of native source frames by default.
 
 This means:
 - `TOF_min -> 560 us` with `70 us` bins
@@ -334,6 +432,8 @@ cd /SNS/users/ykr/Desktop/VENUS_python_notebooks_normalization
   --segment ,40 \
   --full-bins-only \
   --experimental-uncertainties \
+  --black-filter-background \
+  --black-filter-anchor-energy-ev 5.1044 \
   --export-normalized-integrated
 ```
 

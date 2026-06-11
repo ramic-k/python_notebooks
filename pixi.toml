@@ -1,6 +1,7 @@
 [workspace]
 authors = ["Chen Zhang <zhangc@ornl.gov>"]
 channels = ["neutronimaging", "oncat", "conda-forge"]
+conda-pypi-map = { neutronimaging = "pixi-conda-pypi-map.json", oncat = "pixi-conda-pypi-map.json", conda-forge = "pixi-conda-pypi-map.json" }
 name = "python_notebooks_development"
 platforms = ["linux-64", "osx-64", "osx-arm64"]
 version = "0.1.0"

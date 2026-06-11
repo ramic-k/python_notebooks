@@ -62,7 +62,10 @@ def load_runtime_dependencies():
     from __code.normalization_tof.normalization_for_timepix1_timepix3 import (
         normalization_with_list_of_full_path,
     )
-    from __code.normalization_tof.utilities import retrieve_list_of_tif
+    from __code.normalization_tof.utilities import (
+        DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE,
+        retrieve_list_of_tif,
+    )
 
     return {
         "extract_file_path_from_nexus": extract_file_path_from_nexus,
@@ -75,6 +78,7 @@ def load_runtime_dependencies():
         "raw_dir": raw_dir,
         "normalization_with_list_of_full_path": normalization_with_list_of_full_path,
         "retrieve_list_of_tif": retrieve_list_of_tif,
+        "DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE": DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE,
     }
 
 
@@ -116,6 +120,96 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ob-path", action="append", default=[], help="Full OB run folder path")
     parser.add_argument("--dc-run", action="append", default=[], help="Dark-current run number")
     parser.add_argument("--dc-path", action="append", default=[], help="Full dark-current run folder path")
+    parser.add_argument(
+        "--bragg-edge-cd-background",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable Cd-filter background correction for Bragg edge mode. "
+            "Requires sample and OB Cd-filter background runs."
+        ),
+    )
+    parser.add_argument(
+        "--closed-slits-background",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable closed-slits background correction for Bragg edge mode. "
+            "Requires sample and OB closed-slits background runs."
+        ),
+    )
+    parser.add_argument(
+        "--sample-bg-run",
+        action="append",
+        default=[],
+        help="Sample measured-background run number for the selected Bragg edge background mode",
+    )
+    parser.add_argument(
+        "--sample-bg-path",
+        action="append",
+        default=[],
+        help="Full sample measured-background run folder path for the selected Bragg edge background mode",
+    )
+    parser.add_argument(
+        "--ob-bg-run",
+        action="append",
+        default=[],
+        help="OB measured-background run number for the selected Bragg edge background mode",
+    )
+    parser.add_argument(
+        "--ob-bg-path",
+        action="append",
+        default=[],
+        help="Full OB measured-background run folder path for the selected Bragg edge background mode",
+    )
+    parser.add_argument(
+        "--cd-sample-bg-run",
+        action="append",
+        default=[],
+        help="Sample Cd-filter background run number",
+    )
+    parser.add_argument(
+        "--cd-sample-bg-path",
+        action="append",
+        default=[],
+        help="Full sample Cd-filter background run folder path",
+    )
+    parser.add_argument(
+        "--cd-ob-bg-run",
+        action="append",
+        default=[],
+        help="OB Cd-filter background run number",
+    )
+    parser.add_argument(
+        "--cd-ob-bg-path",
+        action="append",
+        default=[],
+        help="Full OB Cd-filter background run folder path",
+    )
+    parser.add_argument(
+        "--closed-slits-sample-bg-run",
+        action="append",
+        default=[],
+        help="Sample closed-slits background run number",
+    )
+    parser.add_argument(
+        "--closed-slits-sample-bg-path",
+        action="append",
+        default=[],
+        help="Full sample closed-slits background run folder path",
+    )
+    parser.add_argument(
+        "--closed-slits-ob-bg-run",
+        action="append",
+        default=[],
+        help="OB closed-slits background run number",
+    )
+    parser.add_argument(
+        "--closed-slits-ob-bg-path",
+        action="append",
+        default=[],
+        help="Full OB closed-slits background run folder path",
+    )
 
     parser.add_argument("--output-folder", required=True)
     parser.add_argument("--combine-samples", action=argparse.BooleanOptionalAction, default=False)
@@ -136,6 +230,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=200,
         help="Centered square ROI size when --roi is not provided",
+    )
+    parser.add_argument(
+        "--container-roi",
+        default=None,
+        help=(
+            "Container-only reference ROI as left,top,width,height. "
+            "When no OB run/path is provided, this enables container-only normalization."
+        ),
+    )
+    parser.add_argument(
+        "--container-roi-file",
+        default=None,
+        help="Previously exported container ROI JSON file to reuse for container normalization.",
     )
 
     parser.add_argument(
@@ -193,6 +300,37 @@ def parse_args() -> argparse.Namespace:
         "--full-bins-only",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--snap-to-native-rebin-grid",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For fixed-width rebin modes, round the requested bin width to an integer "
+            "number of native source frames. Applies to linear TOF, linear lambda, and "
+            "linear custom schedules on TOF/lambda."
+        ),
+    )
+
+    parser.add_argument(
+        "--black-filter-background",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable ROI-spectrum black-filter background correction. Use only for data containing "
+            "the Ag black notch used to scale the fitted background shape."
+        ),
+    )
+    parser.add_argument(
+        "--black-filter-background-file",
+        default=None,
+        help="Background shape CSV. Defaults to the built-in HDPErpi degree-8 cdmax0.3 shape path.",
+    )
+    parser.add_argument(
+        "--black-filter-anchor-energy-ev",
+        type=float,
+        default=5.1044,
+        help="Nearest measured energy bin used to scale the sample and OB background shapes.",
     )
 
     parser.add_argument(
@@ -298,6 +436,7 @@ def resolve_input_paths(
     autoreduce_dir,
     raw_dir,
     detector_type_constants,
+    allow_empty: bool = False,
 ) -> list[Path]:
     resolved = [Path(path) for path in explicit_paths]
     for run_number in run_numbers:
@@ -315,7 +454,7 @@ def resolve_input_paths(
             )
         )
 
-    if not resolved:
+    if not resolved and not allow_empty:
         raise ValueError(f"No {label} inputs were provided.")
 
     missing = [str(path) for path in resolved if not path.exists()]
@@ -455,6 +594,7 @@ def main() -> int:
     extract_file_path_from_nexus = runtime["extract_file_path_from_nexus"]
     normalization_with_list_of_full_path = runtime["normalization_with_list_of_full_path"]
     retrieve_list_of_tif = runtime["retrieve_list_of_tif"]
+    default_black_filter_background_shape_file = runtime["DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE"]
 
     instrument = args.instrument.upper()
     ipts = normalize_ipts(args.ipts)
@@ -488,6 +628,7 @@ def main() -> int:
         autoreduce_dir=autoreduce_dir,
         raw_dir=raw_dir,
         detector_type_constants=DetectorType,
+        allow_empty=bool(args.container_roi or args.container_roi_file),
     )
     dc_paths = resolve_input_paths(
         run_numbers=args.dc_run,
@@ -502,11 +643,118 @@ def main() -> int:
         raw_dir=raw_dir,
         detector_type_constants=DetectorType,
     ) if (args.dc_run or args.dc_path) else []
+    def resolve_optional_background_paths(run_numbers, explicit_paths, label):
+        if not (run_numbers or explicit_paths):
+            return []
+        return resolve_input_paths(
+            run_numbers=run_numbers,
+            explicit_paths=explicit_paths,
+            instrument=instrument,
+            ipts=ipts,
+            working_dir=working_dir,
+            detector_type=detector_type,
+            label=label,
+            extract_file_path_from_nexus=extract_file_path_from_nexus,
+            autoreduce_dir=autoreduce_dir,
+            raw_dir=raw_dir,
+            detector_type_constants=DetectorType,
+        )
+
+    generic_sample_bg_paths = resolve_optional_background_paths(
+        args.sample_bg_run,
+        args.sample_bg_path,
+        "sample background",
+    )
+    generic_ob_bg_paths = resolve_optional_background_paths(
+        args.ob_bg_run,
+        args.ob_bg_path,
+        "OB background",
+    )
+    measured_background_specs = [
+        {
+            "key": "cd",
+            "key_prefix": "bragg_edge_cd",
+            "flag": args.bragg_edge_cd_background,
+            "mode": "Cd-filter background correction for Bragg edge mode",
+            "column_label": "Cd-filter",
+            "sample_paths": resolve_optional_background_paths(
+                args.cd_sample_bg_run,
+                args.cd_sample_bg_path,
+                "sample Cd-filter background",
+            ),
+            "ob_paths": resolve_optional_background_paths(
+                args.cd_ob_bg_run,
+                args.cd_ob_bg_path,
+                "OB Cd-filter background",
+            ),
+        },
+        {
+            "key": "closed_slits",
+            "key_prefix": "closed_slits",
+            "flag": args.closed_slits_background,
+            "mode": "Closed-slits background correction for Bragg edge mode",
+            "column_label": "closed-slits",
+            "sample_paths": resolve_optional_background_paths(
+                args.closed_slits_sample_bg_run,
+                args.closed_slits_sample_bg_path,
+                "sample closed-slits background",
+            ),
+            "ob_paths": resolve_optional_background_paths(
+                args.closed_slits_ob_bg_run,
+                args.closed_slits_ob_bg_path,
+                "OB closed-slits background",
+            ),
+        },
+    ]
+
+    for background_spec in measured_background_specs:
+        background_spec["has_dedicated_inputs"] = bool(
+            background_spec["sample_paths"] or background_spec["ob_paths"]
+        )
+        background_spec["enabled"] = bool(
+            background_spec["flag"] or background_spec["has_dedicated_inputs"]
+        )
+
+    enabled_background_specs = [
+        background_spec
+        for background_spec in measured_background_specs
+        if background_spec["enabled"]
+    ]
+    if generic_sample_bg_paths or generic_ob_bg_paths:
+        if len(enabled_background_specs) != 1:
+            raise ValueError(
+                "Generic --sample-bg-* and --ob-bg-* inputs can only be used when exactly one "
+                "measured background mode is selected. For combined corrections, use the "
+                "mode-specific --cd-* and --closed-slits-* inputs."
+            )
+        generic_target = enabled_background_specs[0]
+        if generic_target["has_dedicated_inputs"]:
+            raise ValueError(
+                "Do not mix generic --sample-bg-* / --ob-bg-* with mode-specific measured "
+                "background inputs for the same run."
+            )
+        generic_target["sample_paths"] = generic_sample_bg_paths
+        generic_target["ob_paths"] = generic_ob_bg_paths
+        generic_target["has_dedicated_inputs"] = True
+
+    for background_spec in enabled_background_specs:
+        if not background_spec["sample_paths"] or not background_spec["ob_paths"]:
+            raise ValueError(
+                f"{background_spec['mode']} requires both sample and OB background inputs."
+            )
+
+    for background_spec in enabled_background_specs:
+        background_spec["weight"] = 1.0
+
+    all_background_paths = []
+    for background_spec in enabled_background_specs:
+        all_background_paths += background_spec["sample_paths"]
+        all_background_paths += background_spec["ob_paths"]
 
     spectra_array = resolve_spectra_array(
         sample_paths=sample_paths,
         ob_paths=ob_paths,
-        dc_paths=dc_paths,
+        dc_paths=dc_paths + all_background_paths,
         tof_bin_size_ns=args.tof_bin_size_ns,
         retrieve_list_of_tif=retrieve_list_of_tif,
     )
@@ -519,6 +767,8 @@ def main() -> int:
         )
     else:
         roi = None
+    container_roi = parse_roi(args.container_roi, Roi) if args.container_roi else None
+    container_roi_file = args.container_roi_file
 
     experimental_uncertainties_flag = (
         args.experimental_uncertainties
@@ -528,12 +778,63 @@ def main() -> int:
 
     rebin_mode = getattr(RebinMode, REBIN_MODE_ALIASES[args.rebin_mode])
     rebin_custom_schedule = parse_custom_segments(args.segment) if rebin_mode == RebinMode.custom_schedule else None
+    rebin_custom_basis = (
+        getattr(RebinCustomBasis, CUSTOM_BASIS_ALIASES[args.custom_basis])
+        if rebin_mode == RebinMode.custom_schedule
+        else None
+    )
+    rebin_custom_scale = (
+        getattr(RebinCustomScale, CUSTOM_SCALE_ALIASES[args.custom_scale])
+        if rebin_mode == RebinMode.custom_schedule
+        else None
+    )
+    snap_to_native_rebin_grid = bool(
+        args.snap_to_native_rebin_grid
+        and (
+            rebin_mode in [RebinMode.linear_tof, RebinMode.linear_lambda]
+            or (
+                rebin_mode == RebinMode.custom_schedule
+                and rebin_custom_scale == RebinCustomScale.linear
+                and rebin_custom_basis in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+            )
+        )
+    )
     export_mode = default_export_mode(args)
     kernel_size = parse_kernel_size(args.kernel_size)
-
+    black_filter_background_config = None
+    if args.black_filter_background:
+        black_filter_background_config = {
+            "enabled": True,
+            "background_shape_file": args.black_filter_background_file
+            or default_black_filter_background_shape_file,
+            "anchor_energy_eV": args.black_filter_anchor_energy_ev,
+        }
     sample_dict = build_data_dictionary(sample_paths, working_dir, instrument, detector_type)
     ob_dict = build_data_dictionary(ob_paths, working_dir, instrument, detector_type)
     dc_dict = build_data_dictionary(dc_paths, working_dir, instrument, detector_type) if dc_paths else {}
+    measured_background_correction_configs = []
+    for background_spec in enabled_background_specs:
+        measured_background_correction_configs.append(
+            {
+                "enabled": True,
+                "mode": background_spec["mode"],
+                "column_label": background_spec["column_label"],
+                "key_prefix": background_spec["key_prefix"],
+                "weight": background_spec["weight"],
+                "sample_background_dict": build_data_dictionary(
+                    background_spec["sample_paths"],
+                    working_dir,
+                    instrument,
+                    detector_type,
+                ),
+                "ob_background_dict": build_data_dictionary(
+                    background_spec["ob_paths"],
+                    working_dir,
+                    instrument,
+                    detector_type,
+                ),
+            }
+        )
 
     print("Running normalization_tof with:")
     print(f"  working_dir: {working_dir}")
@@ -541,12 +842,27 @@ def main() -> int:
     print(f"  sample paths: {[str(path) for path in sample_paths]}")
     print(f"  ob paths: {[str(path) for path in ob_paths]}")
     print(f"  dc paths: {[str(path) for path in dc_paths]}")
+    for background_spec in enabled_background_specs:
+        print(
+            "  measured background: "
+            f"{background_spec['column_label']} weight={background_spec['weight']:g} "
+            f"sample={[str(path) for path in background_spec['sample_paths']]} "
+            f"OB={[str(path) for path in background_spec['ob_paths']]}"
+        )
     print(f"  output folder: {output_folder}")
     print(f"  roi: {roi}")
+    print(f"  container roi: {container_roi}")
+    print(f"  container roi file: {container_roi_file}")
     print(f"  rebin mode: {rebin_mode}")
     print(f"  custom schedule: {rebin_custom_schedule}")
+    print(f"  snap fixed-width rebin to native grid: {snap_to_native_rebin_grid}")
     print(f"  experimental uncertainties: {experimental_uncertainties_flag}")
     print(f"  proton charge: {args.proton_charge}")
+    print(f"  black-filter background correction: {black_filter_background_config}")
+    print(
+        "  measured background correction for Bragg edge mode: "
+        f"{measured_background_correction_configs}"
+    )
 
     normalized = normalization_with_list_of_full_path(
         sample_dict=sample_dict,
@@ -567,8 +883,8 @@ def main() -> int:
         correct_chips_alignment_config=None,
         export_mode=export_mode,
         roi=roi,
-        container_roi=None,
-        container_roi_file=None,
+        container_roi=container_roi,
+        container_roi_file=container_roi_file,
         rebin_mode=rebin_mode,
         rebin_delta_tof_us=args.delta_tof_us if rebin_mode == RebinMode.linear_tof else None,
         rebin_delta_lambda_a=args.delta_lambda_a if rebin_mode == RebinMode.linear_lambda else None,
@@ -581,19 +897,14 @@ def main() -> int:
         rebin_delta_lambda_squared_a2=(
             args.delta_lambda_squared_a2 if rebin_mode == RebinMode.inverse_log_lambda else None
         ),
-        rebin_custom_basis=(
-            getattr(RebinCustomBasis, CUSTOM_BASIS_ALIASES[args.custom_basis])
-            if rebin_mode == RebinMode.custom_schedule
-            else None
-        ),
-        rebin_custom_scale=(
-            getattr(RebinCustomScale, CUSTOM_SCALE_ALIASES[args.custom_scale])
-            if rebin_mode == RebinMode.custom_schedule
-            else None
-        ),
+        rebin_custom_basis=rebin_custom_basis,
+        rebin_custom_scale=rebin_custom_scale,
         rebin_custom_schedule=rebin_custom_schedule,
         rebin_full_bins_only=args.full_bins_only if rebin_mode != RebinMode.none else False,
+        rebin_snap_to_native_grid=snap_to_native_rebin_grid,
         experimental_uncertainties_flag=experimental_uncertainties_flag,
+        black_filter_background_config=black_filter_background_config,
+        measured_background_correction_configs=measured_background_correction_configs,
     )
 
     print("Normalization completed.")
