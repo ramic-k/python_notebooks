@@ -51,6 +51,10 @@ def _layout(width: str = "220px") -> widgets.Layout:
     return widgets.Layout(width=width)
 
 
+def _wrapping_row_layout() -> widgets.Layout:
+    return widgets.Layout(display="flex", flex_flow="row wrap", align_items="center")
+
+
 def _show_full_descriptions(controls: list[widgets.Widget]) -> None:
     for control in controls:
         style = getattr(control, "style", None)
@@ -425,18 +429,17 @@ class FrameEditor:
             for widget in all_widgets:
                 widget.observe(on_change, names="value")
 
-        wrapping_row = widgets.Layout(display="flex", flex_flow="row wrap", align_items="center")
-        roi_row = widgets.HBox(
+        self.roi_row = widgets.HBox(
             [self.roi_left, self.roi_top, self.roi_width, self.roi_height],
-            layout=wrapping_row,
+            layout=_wrapping_row_layout(),
         )
-        roi_preview_row = widgets.HBox(
+        self.roi_preview_row = widgets.HBox(
             [self.roi_preview_images, self.roi_preview_button],
-            layout=wrapping_row,
+            layout=_wrapping_row_layout(),
         )
-        axis_row = widgets.HBox(
+        self.axis_row = widgets.HBox(
             [self.distance, self.detector_delay, self.auto_detector_delay, self.manual_tof],
-            layout=wrapping_row,
+            layout=_wrapping_row_layout(),
         )
         flags_row = widgets.HBox(
             [
@@ -445,11 +448,11 @@ class FrameEditor:
                 self.combine_sample_runs,
                 self.correct_chips_alignment,
             ],
-            layout=wrapping_row,
+            layout=_wrapping_row_layout(),
         )
-        rebin_flags = widgets.HBox(
+        self.rebin_flags_row = widgets.HBox(
             [self.full_bins_only, self.snap_to_native],
-            layout=wrapping_row,
+            layout=_wrapping_row_layout(),
         )
         median_box = widgets.VBox(
             [
@@ -461,7 +464,7 @@ class FrameEditor:
                         self.median_kernel_tof,
                         self.median_iterations,
                     ],
-                    layout=wrapping_row,
+                    layout=_wrapping_row_layout(),
                 ),
             ]
         )
@@ -472,11 +475,14 @@ class FrameEditor:
                 self.container_width,
                 self.container_height,
             ],
-            layout=wrapping_row,
+            layout=_wrapping_row_layout(),
         )
         self.container_file_box = widgets.VBox(
             [
-                widgets.HBox([self.container_file, self.container_file_browse], layout=wrapping_row),
+                widgets.HBox(
+                    [self.container_file, self.container_file_browse],
+                    layout=_wrapping_row_layout(),
+                ),
                 self.container_file_browser_output,
             ]
         )
@@ -500,7 +506,7 @@ class FrameEditor:
             [
                 widgets.HBox(
                     [self.cd_background_enabled, self.cd_background_weight],
-                    layout=wrapping_row,
+                    layout=_wrapping_row_layout(),
                 ),
                 self.cd_sample_input.widget,
                 self.cd_ob_input.widget,
@@ -510,7 +516,7 @@ class FrameEditor:
             [
                 widgets.HBox(
                     [self.closed_background_enabled, self.closed_background_weight],
-                    layout=wrapping_row,
+                    layout=_wrapping_row_layout(),
                 ),
                 self.closed_sample_input.widget,
                 self.closed_ob_input.widget,
@@ -536,14 +542,14 @@ class FrameEditor:
                 self.sample_input.widget,
                 self.ob_input.widget,
                 widgets.HTML("<b>ROI</b>"),
-                roi_row,
-                roi_preview_row,
+                self.roi_row,
+                self.roi_preview_row,
                 self.roi_preview_output,
-                axis_row,
+                self.axis_row,
                 widgets.HTML("<b>Proposed rebinning</b>"),
                 self.rebin_mode,
                 self.rebin_parameters,
-                rebin_flags,
+                self.rebin_flags_row,
                 widgets.HTML("<b>Corrections and normalization options</b>"),
                 corrections,
             ],
@@ -974,10 +980,12 @@ class MultiFrameNormalizationTof:
         self._update_run_button()
 
     def display(self) -> None:
-        wrapping_row = widgets.Layout(display="flex", flex_flow="row wrap", align_items="center")
         header = widgets.VBox(
             [
-                widgets.HBox([self.add_frame_button, self.remove_frame_button], layout=wrapping_row),
+                widgets.HBox(
+                    [self.add_frame_button, self.remove_frame_button],
+                    layout=_wrapping_row_layout(),
+                ),
                 self.output_root,
                 self.cache_dir,
                 self.recipe_file,
@@ -988,13 +996,22 @@ class MultiFrameNormalizationTof:
             [
                 widgets.HBox(
                     [self.inspect_frames, self.overlap_min, self.overlap_max],
-                    layout=wrapping_row,
+                    layout=_wrapping_row_layout(),
                 ),
-                widgets.HBox([self.show_native, self.show_errors, self.force_reload], layout=wrapping_row),
-                widgets.HBox([self.preview_button, self.replot_button], layout=wrapping_row),
+                widgets.HBox(
+                    [self.show_native, self.show_errors, self.force_reload],
+                    layout=_wrapping_row_layout(),
+                ),
+                widgets.HBox(
+                    [self.preview_button, self.replot_button],
+                    layout=_wrapping_row_layout(),
+                ),
             ]
         )
-        full_run_controls = widgets.HBox([self.arm_full_run, self.run_button], layout=wrapping_row)
+        full_run_controls = widgets.HBox(
+            [self.arm_full_run, self.run_button],
+            layout=_wrapping_row_layout(),
+        )
         display(
             widgets.VBox(
                 [

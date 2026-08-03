@@ -147,6 +147,12 @@ def test_new_frame_defaults_match_single_frame_notebook():
     assert editor.container_enabled.value is False
     assert editor.sample_runs.style.description_width == "initial"
     assert editor.manual_tof.style.description_width == "initial"
+    assert editor.container_roi_box.layout.display == "none"
+    assert editor.roi_row.layout.display == "flex"
+    assert editor.roi_preview_row.layout.display == "flex"
+    assert editor.axis_row.layout.display == "flex"
+    assert editor.rebin_flags_row.layout.display == "flex"
+    assert editor.roi_preview_button.description == "Preview/select ROI"
     assert recipe.export_mode == {
         "sample_stack": False,
         "ob_stack": False,
