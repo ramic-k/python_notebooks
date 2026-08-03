@@ -31,6 +31,7 @@ from __code.normalization_tof.multiple_frames import (
     RoiProfileCache,
     RunSpec,
     calculate_overlap_diagnostics,
+    convert_tof_schedule_to_energy_schedule,
     load_integrated_image_preview,
     load_native_roi_profile,
     parse_run_numbers,
@@ -237,6 +238,70 @@ def test_energy_edge_tof_width_schedule_rejects_out_of_frame_edge():
             rebin_custom_scale=RebinCustomScale.linear,
             rebin_custom_schedule=[{"end_value": 4.0, "step": 100.0}],
         )
+
+
+def test_tof_schedule_conversion_reverses_edges_and_preserves_physical_widths():
+    tof_s = np.arange(0.0, 1.1e-3, 1.0e-4)
+    energy_eV = np.arange(11.0, 0.0, -1.0)
+
+    converted = convert_tof_schedule_to_energy_schedule(
+        (
+            (200.0, 20.0),
+            (500.0, 30.0),
+            (800.0, 40.0),
+            (None, 50.0),
+        ),
+        tof_s,
+        energy_eV,
+    )
+
+    assert converted == (
+        (3.0, 50.0),
+        (6.0, 40.0),
+        (9.0, 30.0),
+        (None, 20.0),
+    )
+
+
+def test_named_frame_starts_with_earlier_tof_recipe_for_automatic_conversion():
+    editor = FrameEditor(_empty_frame("6.3 A", DetectorType.tpx1), "/SNS/VENUS/IPTS-36914")
+
+    assert editor.custom_basis.value == RebinCustomBasis.tof
+    assert editor.custom_schedule.value == "886, 70\n4015, 100\n, 150"
+
+
+def test_frame_editor_bin_preview_converts_legacy_tof_schedule(tmp_path, monkeypatch):
+    sample_frames = [np.full((2, 2), 20 + index, dtype=np.uint16) for index in range(8)]
+    ob_frames = [np.full((2, 2), 40 + index, dtype=np.uint16) for index in range(8)]
+    sample_path, sample_nexus = _write_run(tmp_path, "721", sample_frames)
+    ob_path, ob_nexus = _write_run(tmp_path, "722", ob_frames)
+    frame = _frame(
+        "legacy preview",
+        [("721", sample_path, sample_nexus)],
+        [("722", ob_path, ob_nexus)],
+        RoiConfig(left=0, top=0, width=2, height=2),
+        rebin=RebinConfig(
+            mode=RebinMode.custom_schedule,
+            custom_basis=RebinCustomBasis.tof,
+            custom_scale=RebinCustomScale.linear,
+            custom_schedule=((2.5, 1.0), (5.5, 2.0), (None, 1.0)),
+            full_bins_only=False,
+            snap_to_native_grid=False,
+        ),
+    )
+    editor = FrameEditor(frame, str(tmp_path))
+    editor.use_proton_charge.value = False
+    captured = []
+    monkeypatch.setattr(go.Figure, "show", lambda figure: captured.append(figure))
+
+    editor._preview_bins()
+
+    assert len(captured) == 2, editor.rebin_bin_summary.value
+    assert editor.custom_basis.value == RebinCustomBasis.energy_tof
+    converted = editor.to_config().rebin.custom_schedule
+    assert [edge for edge, _ in converted[:-1]] == sorted(edge for edge, _ in converted[:-1])
+    assert [width for _, width in converted] == [1.0, 2.0, 1.0]
+    assert "converted 2 earlier TOF boundaries" in editor.rebin_bin_summary.value
 
 
 def test_ob_roi_can_be_unlinked_and_saved_independently():

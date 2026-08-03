@@ -217,6 +217,82 @@ class RebinConfig:
         }
 
 
+def convert_tof_schedule_to_energy_schedule(
+    tof_schedule: Iterable[tuple[float | None, float]],
+    tof_s: np.ndarray,
+    energy_eV: np.ndarray,
+) -> tuple[tuple[float | None, float], ...]:
+    """Translate a linear TOF-region recipe to energy edges with TOF widths.
+
+    Legacy TOF schedules are ordered from short to long TOF, while energy-edge
+    schedules are ordered from low to high energy. The region widths therefore
+    have to be reversed along with the converted boundaries.
+    """
+    schedule = tuple(tof_schedule)
+    if not schedule:
+        raise ValueError("The earlier TOF schedule needs at least one segment.")
+
+    tof_values_us = np.asarray(tof_s, dtype=np.float64) * 1e6
+    energy_values = np.asarray(energy_eV, dtype=np.float64)
+    if tof_values_us.ndim != 1 or energy_values.ndim != 1:
+        raise ValueError("TOF-schedule conversion requires one-dimensional TOF and energy axes.")
+    if tof_values_us.shape != energy_values.shape or len(tof_values_us) < 2:
+        raise ValueError("TOF-schedule conversion requires matching non-empty TOF and energy axes.")
+    if np.any(~np.isfinite(tof_values_us)) or np.any(np.diff(tof_values_us) <= 0):
+        raise ValueError("TOF-schedule conversion requires a strictly increasing finite TOF axis.")
+    if np.any(~np.isfinite(energy_values)) or np.any(energy_values <= 0):
+        raise ValueError("TOF-schedule conversion requires finite positive energies.")
+    if np.any(np.diff(energy_values) > 0):
+        raise ValueError("TOF-schedule conversion requires energy to decrease as TOF increases.")
+
+    none_indices = [index for index, (end_value, _) in enumerate(schedule) if end_value is None]
+    if len(none_indices) > 1 or (none_indices and none_indices[0] != len(schedule) - 1):
+        raise ValueError("The open-ended TOF segment must appear at most once, on the final line.")
+
+    finite_segments = [(float(end_value), float(step)) for end_value, step in schedule if end_value is not None]
+    all_steps = [float(step) for _, step in schedule]
+    if any(not np.isfinite(step) or step <= 0 for step in all_steps):
+        raise ValueError("Every TOF schedule width must be finite and strictly positive.")
+
+    requested_tof_edges_us = np.asarray(
+        [end_value for end_value, _ in finite_segments],
+        dtype=np.float64,
+    )
+    if len(requested_tof_edges_us):
+        if np.any(np.diff(requested_tof_edges_us) <= 0):
+            raise ValueError("Earlier TOF schedule boundaries must be strictly increasing.")
+        tof_min_us = float(tof_values_us[0])
+        tof_max_us = float(tof_values_us[-1])
+        if np.any(requested_tof_edges_us <= tof_min_us) or np.any(
+            requested_tof_edges_us >= tof_max_us
+        ):
+            raise ValueError(
+                "Earlier TOF schedule edges must lie strictly inside this frame's TOF range "
+                f"({tof_min_us:.6g}, {tof_max_us:.6g}) us."
+            )
+
+    finite_widths_us = [step for _, step in finite_segments]
+    low_energy_width_us = (
+        float(schedule[-1][1])
+        if schedule[-1][0] is None
+        else finite_widths_us[-1]
+    )
+    tof_region_widths_us = [*finite_widths_us, low_energy_width_us]
+    converted_energy_edges = np.interp(
+        requested_tof_edges_us,
+        tof_values_us,
+        energy_values,
+    )[::-1]
+    energy_region_widths_us = tof_region_widths_us[::-1]
+
+    converted = [
+        (float(edge), float(width))
+        for edge, width in zip(converted_energy_edges, energy_region_widths_us[:-1])
+    ]
+    converted.append((None, float(energy_region_widths_us[-1])))
+    return tuple(converted)
+
+
 @dataclass(frozen=True)
 class FrameConfig:
     name: str

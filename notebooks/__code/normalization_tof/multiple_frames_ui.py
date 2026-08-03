@@ -29,6 +29,7 @@ from __code.normalization_tof.multiple_frames import (
     RoiConfig,
     RunSpec,
     calculate_overlap_diagnostics,
+    convert_tof_schedule_to_energy_schedule,
     load_integrated_image_preview,
     overlap_ratio_arrays,
     parse_run_numbers,
@@ -48,6 +49,38 @@ _REBIN_MODES = [
     RebinMode.inverse_log_lambda,
     RebinMode.custom_schedule,
 ]
+
+
+_EARLIER_FRAME_TOF_SCHEDULES_US: dict[str, tuple[tuple[float | None, float], ...]] = {
+    "6.3 a": ((886.0, 70.0), (4015.0, 100.0), (None, 150.0)),
+    "6.5 a": ((886.0, 70.0), (4015.0, 100.0), (None, 150.0)),
+    "4.5 a": (
+        (1081.0, 100.0),
+        (3500.0, 80.0),
+        (12174.0, 120.0),
+        (None, 100.0),
+    ),
+    "2.5 a": (
+        (313.0, 70.0),
+        (866.0, 25.0),
+        (13681.0, 120.0),
+        (None, 80.0),
+    ),
+    "0.3 a": (
+        (2130.0, 60.0),
+        (3380.0, 30.0),
+        (14261.0, 60.0),
+        (14768.0, 25.0),
+        (None, 100.0),
+    ),
+    "resonance": (
+        (560.0, 60.0),
+        (2700.0, 60.0),
+        (4000.0, 40.0),
+        (5500.0, 30.0),
+        (None, 100.0),
+    ),
+}
 
 
 def _layout(width: str = "220px") -> widgets.Layout:
@@ -407,7 +440,18 @@ class FrameEditor:
         self.delta_lambda_squared = widgets.FloatText(
             value=rebin.delta_lambda_squared_a2 or 0.01, description="delta lambda^2 (A^2)"
         )
-        default_custom_basis = rebin.custom_basis or RebinCustomBasis.energy_tof
+        earlier_tof_schedule = _EARLIER_FRAME_TOF_SCHEDULES_US.get(
+            config.name.strip().lower()
+        )
+        if rebin.custom_schedule:
+            default_custom_basis = rebin.custom_basis or RebinCustomBasis.energy_tof
+            initial_custom_schedule = rebin.custom_schedule
+        elif earlier_tof_schedule:
+            default_custom_basis = RebinCustomBasis.tof
+            initial_custom_schedule = earlier_tof_schedule
+        else:
+            default_custom_basis = rebin.custom_basis or RebinCustomBasis.energy_tof
+            initial_custom_schedule = ()
         self.custom_basis = widgets.Dropdown(
             options=[
                 ("Energy edges / TOF widths", RebinCustomBasis.energy_tof),
@@ -425,14 +469,7 @@ class FrameEditor:
             description="Custom scale",
         )
         self.custom_schedule = widgets.Textarea(
-            value=(
-                _format_schedule(rebin.custom_schedule)
-                or (
-                    "0.108, 100\n0.199, 30\n, 60"
-                    if default_custom_basis == RebinCustomBasis.energy_tof
-                    else "560, 70\n2700, 60\n5500, 50\n, 40"
-                )
-            ),
+            value=_format_schedule(initial_custom_schedule),
             placeholder="0.108, 100\n0.199, 30\n, 60",
             description="Schedule",
             layout=widgets.Layout(width="520px", height="120px"),
@@ -810,7 +847,9 @@ class FrameEditor:
             else:
                 self.custom_schedule_help.value = (
                     "<span style='font-size:12px'>Legacy schedule: "
-                    "<code>upper axis edge, step on that same axis</code>.</span>"
+                    "<code>upper axis edge, step on that same axis</code>. "
+                    "For a linear TOF schedule, <b>Preview bins</b> automatically converts "
+                    "these earlier TOF boundaries to this frame's energy boundaries.</span>"
                 )
             controls = [
                 self.custom_basis,
@@ -838,6 +877,31 @@ class FrameEditor:
             message = "Settings changed. Preview bins to update the active-bin count and plots."
         self.rebin_bin_summary.value = f"<span style='font-size:12px'>{message}</span>"
 
+    def prepare_rebin_for_native(self, frame: FrameConfig, native) -> tuple[FrameConfig, str | None]:
+        """Convert a legacy linear TOF recipe after the frame axis is known."""
+        if not (
+            frame.rebin.mode == RebinMode.custom_schedule
+            and frame.rebin.custom_basis == RebinCustomBasis.tof
+            and frame.rebin.custom_scale == RebinCustomScale.linear
+        ):
+            return frame, None
+
+        converted_schedule = convert_tof_schedule_to_energy_schedule(
+            frame.rebin.custom_schedule,
+            native.tof_s,
+            native.energy_eV,
+        )
+        finite_edge_count = sum(end_value is not None for end_value, _ in converted_schedule)
+        self.custom_scale.value = RebinCustomScale.linear
+        self.custom_schedule.value = _format_schedule(converted_schedule)
+        self.custom_basis.value = RebinCustomBasis.energy_tof
+        converted_frame = self.to_config()
+        note = (
+            f"{frame.name}: converted {finite_edge_count} earlier TOF boundaries to "
+            "frame-specific energy boundaries using the loaded TOF/energy axis."
+        )
+        return converted_frame, note
+
     def _preview_bins(self, _button=None) -> None:
         self.preview_bins_button.disabled = True
         with self.rebin_preview_output:
@@ -852,6 +916,7 @@ class FrameEditor:
                 MultiFrameRecipe(working_dir=self.working_dir, frames=[frame])
             )
             native = engine.load_frame(frame)
+            frame, conversion_note = self.prepare_rebin_for_native(frame, native)
             preview = engine.rebin_frame(frame, native=native)
             groups, bin_edges = build_rebin_bin_groups(
                 tof_array=native.tof_s,
@@ -894,7 +959,8 @@ class FrameEditor:
             )
             self.rebin_bin_summary.value = (
                 "<span style='font-size:12px; color:#176b36'>"
-                f"Native bins: {len(native.tof_s)}; active output bins: {len(preview.tof_s)}; "
+                + (f"{_escape(conversion_note)} " if conversion_note else "")
+                + f"Native bins: {len(native.tof_s)}; active output bins: {len(preview.tof_s)}; "
                 f"{frame_count_summary}. {width_summary}.</span>"
             )
 
@@ -1538,9 +1604,32 @@ class MultiFrameNormalizationTof:
                 recipe = self.recipe()
                 self.engine = MultiFramePreviewEngine(recipe)
                 display(HTML("Loading ROI profiles..."))
-                self.engine.preview_all(force_reload=self.force_reload.value)
-                self.loaded_frame_configs = {frame.name: frame for frame in recipe.frames if frame.enabled}
+                conversion_notes = []
+                for editor, frame in zip(self.frame_editors, recipe.frames):
+                    if not frame.enabled:
+                        continue
+                    native = self.engine.load_frame(
+                        frame,
+                        force_reload=self.force_reload.value,
+                    )
+                    frame, note = editor.prepare_rebin_for_native(frame, native)
+                    if note:
+                        conversion_notes.append(note)
+                    self.engine.rebin_frame(frame, native=native)
+                recipe = self.recipe()
+                self.engine.recipe = recipe
+                self.loaded_frame_configs = {
+                    frame.name: frame for frame in recipe.frames if frame.enabled
+                }
                 clear_output(wait=True)
+                if conversion_notes:
+                    display(
+                        HTML(
+                            "<div style='color:#176b36; margin-bottom:8px'>"
+                            + "<br>".join(_escape(note) for note in conversion_notes)
+                            + "</div>"
+                        )
+                    )
                 self._display_profile_status()
                 self._draw_plot()
             except Exception as error:
@@ -1557,7 +1646,8 @@ class MultiFrameNormalizationTof:
                 old_native = self.engine.native_profiles
                 self.engine = MultiFramePreviewEngine(recipe)
                 self.engine.native_profiles.update(old_native)
-                for frame in recipe.frames:
+                conversion_notes = []
+                for editor, frame in zip(self.frame_editors, recipe.frames):
                     if not frame.enabled:
                         continue
                     old_frame = self.loaded_frame_configs.get(frame.name)
@@ -1569,8 +1659,23 @@ class MultiFrameNormalizationTof:
                     native = self.engine.native_profiles.get(frame.name) if source_unchanged else None
                     if native is None:
                         native = self.engine.load_frame(frame)
+                    frame, note = editor.prepare_rebin_for_native(frame, native)
+                    if note:
+                        conversion_notes.append(note)
                     self.engine.rebin_frame(frame, native=native)
-                self.loaded_frame_configs = {frame.name: frame for frame in recipe.frames if frame.enabled}
+                recipe = self.recipe()
+                self.engine.recipe = recipe
+                self.loaded_frame_configs = {
+                    frame.name: frame for frame in recipe.frames if frame.enabled
+                }
+                if conversion_notes:
+                    display(
+                        HTML(
+                            "<div style='color:#176b36; margin-bottom:8px'>"
+                            + "<br>".join(_escape(note) for note in conversion_notes)
+                            + "</div>"
+                        )
+                    )
                 self._display_profile_status()
                 self._draw_plot()
             except Exception as error:
@@ -1818,7 +1923,7 @@ class MultiFrameNormalizationTof:
 def _format_schedule(schedule: tuple[tuple[float | None, float], ...]) -> str:
     lines = []
     for end_value, step in schedule:
-        end_text = "" if end_value is None else f"{end_value:g}"
+        end_text = "" if end_value is None else f"{end_value:.10g}"
         lines.append(f"{end_text}, {step:g}")
     return "\n".join(lines)
 
