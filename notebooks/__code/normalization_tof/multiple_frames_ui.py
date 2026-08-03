@@ -933,10 +933,15 @@ class MultiFrameNormalizationTof:
         self.show_native = widgets.Checkbox(value=True, description="Show native profiles", indent=False)
         self.show_errors = widgets.Checkbox(value=True, description="Show error bars", indent=False)
         self.force_reload = widgets.Checkbox(value=False, description="Ignore cached profiles", indent=False)
-        self.overlap_min = widgets.FloatText(value=0.0, description="Overlap min (eV)")
-        self.overlap_max = widgets.FloatText(value=0.0, description="Overlap max (eV)")
-        self.reference = widgets.Dropdown(options=[], description="Reference")
-        self.comparison = widgets.Dropdown(options=[], description="Comparison")
+        self.overlap_min = widgets.FloatText(value=0.0, description="Manual min (2 frames, eV)")
+        self.overlap_max = widgets.FloatText(value=0.0, description="Manual max (2 frames, eV)")
+        self.inspect_frames = widgets.SelectMultiple(
+            options=[],
+            value=(),
+            description="Frames to inspect",
+            rows=5,
+            layout=widgets.Layout(width="560px", height="130px"),
+        )
         self.add_frame_button = widgets.Button(description="Add frame", icon="plus")
         self.remove_frame_button = widgets.Button(description="Remove last", icon="minus")
         self.preview_button = widgets.Button(description="Load ROI profiles and preview", icon="line-chart")
@@ -959,8 +964,7 @@ class MultiFrameNormalizationTof:
                 self.recipe_file,
                 self.overlap_min,
                 self.overlap_max,
-                self.reference,
-                self.comparison,
+                self.inspect_frames,
             ]
         )
 
@@ -983,7 +987,7 @@ class MultiFrameNormalizationTof:
         overlap_controls = widgets.VBox(
             [
                 widgets.HBox(
-                    [self.reference, self.comparison, self.overlap_min, self.overlap_max],
+                    [self.inspect_frames, self.overlap_min, self.overlap_max],
                     layout=wrapping_row,
                 ),
                 widgets.HBox([self.show_native, self.show_errors, self.force_reload], layout=wrapping_row),
@@ -1028,8 +1032,9 @@ class MultiFrameNormalizationTof:
         self.load_button.on_click(self._load_recipe)
         self.run_button.on_click(self._run_full_normalization)
         self.arm_full_run.observe(self._update_run_button, names="value")
-        self.reference.observe(self._pair_changed, names="value")
-        self.comparison.observe(self._pair_changed, names="value")
+        self.inspect_frames.observe(self._overlap_selection_changed, names="value")
+        self.overlap_min.observe(self._plot_setting_changed, names="value")
+        self.overlap_max.observe(self._plot_setting_changed, names="value")
         self.show_native.observe(self._plot_setting_changed, names="value")
         self.show_errors.observe(self._plot_setting_changed, names="value")
 
@@ -1042,26 +1047,19 @@ class MultiFrameNormalizationTof:
         for index, editor in enumerate(self.frame_editors):
             self.frame_box.set_title(index, editor.name.value or f"frame {index + 1}")
         self.frame_box.selected_index = 0 if self.frame_editors else None
-        self._refresh_pair_options()
+        self._refresh_overlap_options()
 
-    def _refresh_pair_options(self) -> None:
+    def _refresh_overlap_options(self) -> None:
         names = [editor.name.value for editor in self.frame_editors if editor.enabled.value and editor.name.value]
-        old_reference, old_comparison = self.reference.value, self.comparison.value
-        self.reference.options = names
-        self.comparison.options = names
-        if old_reference in names:
-            self.reference.value = old_reference
-        elif names:
-            self.reference.value = names[0]
-        if old_comparison in names and old_comparison != self.reference.value:
-            self.comparison.value = old_comparison
-        elif len(names) > 1:
-            self.comparison.value = names[1]
+        old_selection = tuple(name for name in self.inspect_frames.value if name in names)
+        self.inspect_frames.options = names
+        self.inspect_frames.value = old_selection or tuple(names)
+        self._update_manual_overlap_state()
 
     def _frame_changed(self, _change=None) -> None:
         for index, editor in enumerate(self.frame_editors):
             self.frame_box.set_title(index, editor.name.value or f"frame {index + 1}")
-        self._refresh_pair_options()
+        self._refresh_overlap_options()
 
     def _add_frame(self, _button) -> None:
         index = len(self.frame_editors) + 1
@@ -1154,17 +1152,29 @@ class MultiFrameNormalizationTof:
     def _draw_plot(self) -> None:
         if self.engine is None or not self.engine.previews:
             return
+        selected_names = self._selected_frame_names()
+        overlap_pairs = list(zip(selected_names[:-1], selected_names[1:]))
+        row_count = 1 + len(overlap_pairs)
+        row_heights = [0.5] + ([0.5 / len(overlap_pairs)] * len(overlap_pairs) if overlap_pairs else [])
         figure = make_subplots(
-            rows=2,
+            rows=row_count,
             cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.08,
-            row_heights=[0.7, 0.3],
-            subplot_titles=("Frame transmission previews", "Selected overlap ratio"),
+            shared_xaxes=False,
+            vertical_spacing=min(0.06, 0.18 / row_count),
+            row_heights=row_heights,
+            subplot_titles=(
+                ["Selected frame transmission previews"]
+                + [f"{comparison} / {reference} overlap" for reference, comparison in overlap_pairs]
+            ),
         )
         palette = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf"]
-        for index, (name, preview) in enumerate(self.engine.previews.items()):
-            color = palette[index % len(palette)]
+        color_by_name = {
+            name: palette[index % len(palette)]
+            for index, name in enumerate(self.engine.previews)
+        }
+        for name in selected_names:
+            preview = self.engine.previews[name]
+            color = color_by_name[name]
             if self.show_native.value:
                 native_order = np.argsort(preview.native.energy_eV)
                 figure.add_trace(
@@ -1204,72 +1214,85 @@ class MultiFrameNormalizationTof:
                 col=1,
             )
 
-        reference_name, comparison_name = self.reference.value, self.comparison.value
-        if reference_name and comparison_name and reference_name != comparison_name:
-            window = self._energy_window()
+        manual_window = self._energy_window() if len(selected_names) == 2 else None
+        for pair_index, (reference_name, comparison_name) in enumerate(overlap_pairs, start=2):
             reference = self.engine.previews.get(reference_name)
             comparison = self.engine.previews.get(comparison_name)
             if reference is not None and comparison is not None:
                 try:
-                    energy, ratio, uncertainty = overlap_ratio_arrays(reference, comparison, window)
-                    diagnostics = calculate_overlap_diagnostics(reference, comparison, window)
+                    energy, ratio, uncertainty = overlap_ratio_arrays(reference, comparison, manual_window)
+                    diagnostics = calculate_overlap_diagnostics(reference, comparison, manual_window)
                     figure.add_trace(
                         go.Scatter(
                             x=energy,
                             y=ratio,
                             mode="markers",
-                            marker=dict(color="#111", size=5),
+                            marker=dict(color=color_by_name[comparison_name], size=5),
                             error_y=(
                                 dict(type="data", array=uncertainty, visible=True, thickness=0.8, width=0)
                                 if self.show_errors.value
                                 else None
                             ),
                             name=f"{comparison_name} / {reference_name}",
+                            showlegend=False,
                         ),
-                        row=2,
+                        row=pair_index,
                         col=1,
                     )
-                    figure.add_hline(y=1.0, line_color="#666", line_width=1, row=2, col=1)
+                    figure.add_hline(y=1.0, line_color="#666", line_width=1, row=pair_index, col=1)
                     figure.add_vrect(
                         x0=diagnostics.energy_min_eV,
                         x1=diagnostics.energy_max_eV,
                         fillcolor="#999",
                         opacity=0.08,
                         line_width=0,
-                        row="all",
+                        row=1,
                         col=1,
                     )
+                    figure.add_vrect(
+                        x0=diagnostics.energy_min_eV,
+                        x1=diagnostics.energy_max_eV,
+                        fillcolor="#999",
+                        opacity=0.08,
+                        line_width=0,
+                        row=pair_index,
+                        col=1,
+                    )
+                    axis_suffix = str(pair_index)
                     figure.add_annotation(
                         x=0.01,
                         y=0.98,
-                        xref="x2 domain",
-                        yref="y2 domain",
+                        xref=f"x{axis_suffix} domain",
+                        yref=f"y{axis_suffix} domain",
                         xanchor="left",
                         yanchor="top",
                         showarrow=False,
                         text=(
-                            f"comparison/reference={diagnostics.comparison_over_reference:.5g}; "
-                            f"diagnostic scale={diagnostics.scale_comparison_to_reference:.5g} +/- "
+                            f"ratio={diagnostics.comparison_over_reference:.5g}; "
+                            f"scale={diagnostics.scale_comparison_to_reference:.5g} +/- "
                             f"{diagnostics.scale_uncertainty:.2g}; reduced chi2={diagnostics.reduced_chi_square:.3g}"
                         ),
                     )
                 except Exception as error:
+                    axis_suffix = str(pair_index)
                     figure.add_annotation(
                         x=0.5,
                         y=0.5,
-                        xref="x2 domain",
-                        yref="y2 domain",
+                        xref=f"x{axis_suffix} domain",
+                        yref=f"y{axis_suffix} domain",
                         text=f"Overlap unavailable: {_escape(error)}",
                         showarrow=False,
                     )
 
-        figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)", row=2, col=1)
+        figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)", row=1, col=1)
         figure.update_yaxes(title_text="Transmission", row=1, col=1)
-        figure.update_yaxes(title_text="Ratio", row=2, col=1)
+        for row in range(2, row_count + 1):
+            figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)", row=row, col=1)
+            figure.update_yaxes(title_text="Ratio", row=row, col=1)
         figure.update_layout(
             template="plotly_white",
-            height=820,
-            hovermode="x unified",
+            height=max(700, 470 + 210 * len(overlap_pairs)),
+            hovermode="closest",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
             margin=dict(l=70, r=30, t=100, b=60),
         )
@@ -1284,7 +1307,18 @@ class MultiFrameNormalizationTof:
             return self.overlap_min.value, self.overlap_max.value
         return None
 
-    def _pair_changed(self, _change=None) -> None:
+    def _selected_frame_names(self) -> list[str]:
+        selected = set(self.inspect_frames.value)
+        ordered = [str(name) for name in self.inspect_frames.options]
+        return [name for name in ordered if name in selected]
+
+    def _update_manual_overlap_state(self) -> None:
+        disabled = len(self.inspect_frames.value) != 2
+        self.overlap_min.disabled = disabled
+        self.overlap_max.disabled = disabled
+
+    def _overlap_selection_changed(self, _change=None) -> None:
+        self._update_manual_overlap_state()
         if self.engine is not None and self.engine.previews:
             self._draw_plot()
 

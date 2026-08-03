@@ -2,9 +2,11 @@ import json
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
+import plotly.graph_objects as go
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -28,7 +30,12 @@ from __code.normalization_tof.multiple_frames import (
     load_native_roi_profile,
     parse_run_numbers,
 )
-from __code.normalization_tof.multiple_frames_ui import FrameEditor, RunInputEditor, _empty_frame
+from __code.normalization_tof.multiple_frames_ui import (
+    FrameEditor,
+    MultiFrameNormalizationTof,
+    RunInputEditor,
+    _empty_frame,
+)
 from __code.normalization_tof.utilities import calculate_detector_corrected_variance
 
 
@@ -167,6 +174,20 @@ def test_direct_folder_override_can_infer_run_number(tmp_path):
     specs = editor.specs()
     assert specs == (RunSpec(run_number="19558", data_path=str(run_path)),)
     assert editor.runs.value == "19558"
+
+
+def test_overlap_inspection_selects_all_frames_and_supports_focused_pair():
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+    names = ("6.3 A", "4.5 A", "2.5 A", "0.3 A", "resonance")
+    assert ui.inspect_frames.value == names
+    assert ui._selected_frame_names() == list(names)
+    assert ui.overlap_min.disabled is True
+    assert ui.overlap_max.disabled is True
+
+    ui.inspect_frames.value = names[:2]
+    assert ui._selected_frame_names() == list(names[:2])
+    assert ui.overlap_min.disabled is False
+    assert ui.overlap_max.disabled is False
 
 
 def test_integrated_roi_preview_uses_production_orientation_and_subsampling(tmp_path):
@@ -363,6 +384,30 @@ def _preview(name, energy, transmission, uncertainty):
         source_frame_count=np.ones(len(energy), dtype=int),
         native=native,
     )
+
+
+def test_draw_plot_creates_adjacent_overlap_panel_for_every_selected_frame(monkeypatch):
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+    ui.show_native.value = False
+    names = list(ui.inspect_frames.value)
+    previews = {
+        name: _preview(
+            name,
+            [0.01, 0.02, 0.03, 0.04],
+            np.asarray([0.5, 0.6, 0.7, 0.8]) * (1.0 + 0.01 * index),
+            [0.01] * 4,
+        )
+        for index, name in enumerate(names)
+    }
+    ui.engine = SimpleNamespace(previews=previews)
+    captured = []
+    monkeypatch.setattr(go.Figure, "show", lambda figure: captured.append(figure))
+    ui._draw_plot()
+
+    assert len(captured) == 1
+    figure = captured[0]
+    assert len(figure.data) == 2 * len(names) - 1
+    assert figure.layout.yaxis5.title.text == "Ratio"
 
 
 def test_overlap_diagnostic_reports_scale_without_applying_it():
