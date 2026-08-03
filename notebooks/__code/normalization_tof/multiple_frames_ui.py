@@ -33,6 +33,10 @@ from __code.normalization_tof.multiple_frames import (
     overlap_ratio_arrays,
     parse_run_numbers,
 )
+from __code.normalization_tof.utilities import (
+    build_rebin_bin_groups,
+    build_rebin_bin_metadata,
+)
 
 
 _REBIN_MODES = [
@@ -403,10 +407,17 @@ class FrameEditor:
         self.delta_lambda_squared = widgets.FloatText(
             value=rebin.delta_lambda_squared_a2 or 0.01, description="delta lambda^2 (A^2)"
         )
+        default_custom_basis = rebin.custom_basis or RebinCustomBasis.energy_tof
         self.custom_basis = widgets.Dropdown(
-            options=[RebinCustomBasis.tof, RebinCustomBasis.lambda_, RebinCustomBasis.lambda_squared],
-            value=rebin.custom_basis or RebinCustomBasis.tof,
+            options=[
+                ("Energy edges / TOF widths", RebinCustomBasis.energy_tof),
+                ("TOF edges / TOF widths (legacy)", RebinCustomBasis.tof),
+                ("Lambda edges / lambda widths (legacy)", RebinCustomBasis.lambda_),
+                ("Lambda^2 edges / lambda^2 widths (legacy)", RebinCustomBasis.lambda_squared),
+            ],
+            value=default_custom_basis,
             description="Custom basis",
+            layout=_layout("430px"),
         )
         self.custom_scale = widgets.Dropdown(
             options=[RebinCustomScale.linear, RebinCustomScale.log, RebinCustomScale.reverse_log],
@@ -414,21 +425,55 @@ class FrameEditor:
             description="Custom scale",
         )
         self.custom_schedule = widgets.Textarea(
-            value=_format_schedule(rebin.custom_schedule) or "560, 70\n2700, 60\n5500, 50\n, 40",
-            placeholder="560, 60\n2700, 60\n, 100",
+            value=(
+                _format_schedule(rebin.custom_schedule)
+                or (
+                    "0.108, 100\n0.199, 30\n, 60"
+                    if default_custom_basis == RebinCustomBasis.energy_tof
+                    else "560, 70\n2700, 60\n5500, 50\n, 40"
+                )
+            ),
+            placeholder="0.108, 100\n0.199, 30\n, 60",
             description="Schedule",
             layout=widgets.Layout(width="520px", height="120px"),
         )
+        self.custom_schedule_help = widgets.HTML()
         self.full_bins_only = widgets.Checkbox(
             value=rebin.full_bins_only, description="Full bins only", indent=False
         )
         self.snap_to_native = widgets.Checkbox(
             value=rebin.snap_to_native_grid, description="Snap widths to native grid", indent=False
         )
+        self.preview_bins_button = widgets.Button(
+            description="Preview bins",
+            icon="bar-chart",
+            button_style="info",
+            layout=_layout("180px"),
+        )
+        self.preview_bins_button.on_click(self._preview_bins)
+        self.rebin_bin_summary = widgets.HTML(
+            "<span style='font-size:12px'>Preview bins to calculate the active-bin count.</span>"
+        )
+        self.rebin_preview_output = widgets.Output()
 
         self.rebin_parameters = widgets.VBox()
         self.rebin_mode.observe(self._update_rebin_parameters, names="value")
+        self.custom_basis.observe(self._update_rebin_parameters, names="value")
         self.custom_scale.observe(self._update_rebin_parameters, names="value")
+        for rebin_widget in (
+            self.rebin_mode,
+            self.delta_tof,
+            self.delta_lambda,
+            self.delta_tof_relative,
+            self.delta_lambda_relative,
+            self.delta_lambda_squared,
+            self.custom_basis,
+            self.custom_scale,
+            self.custom_schedule,
+            self.full_bins_only,
+            self.snap_to_native,
+        ):
+            rebin_widget.observe(self._invalidate_bin_preview, names="value")
         self.auto_detector_delay.observe(self._update_delay_state, names="value")
         self.detector.observe(self._update_detector_state, names="value")
         self.container_enabled.observe(self._update_container_state, names="value")
@@ -591,6 +636,9 @@ class FrameEditor:
                 self.rebin_mode,
                 self.rebin_parameters,
                 self.rebin_flags_row,
+                widgets.HBox([self.preview_bins_button], layout=_wrapping_row_layout()),
+                self.rebin_bin_summary,
+                self.rebin_preview_output,
                 widgets.HTML("<b>Corrections and normalization options</b>"),
                 corrections,
             ],
@@ -748,17 +796,243 @@ class FrameEditor:
         elif mode == RebinMode.inverse_log_lambda:
             controls = [self.delta_lambda_squared]
         elif mode == RebinMode.custom_schedule:
-            controls = [self.custom_basis, self.custom_scale, self.custom_schedule]
+            energy_tof = self.custom_basis.value == RebinCustomBasis.energy_tof
+            if energy_tof and self.custom_scale.value != RebinCustomScale.linear:
+                self.custom_scale.value = RebinCustomScale.linear
+            self.custom_scale.disabled = energy_tof
+            if energy_tof:
+                self.custom_schedule_help.value = (
+                    "<span style='font-size:12px'>One row per energy region: "
+                    "<code>upper energy edge (eV), TOF width (us)</code>. "
+                    "List energy edges in increasing order and leave the final edge blank "
+                    "to cover the remaining high-energy data.</span>"
+                )
+            else:
+                self.custom_schedule_help.value = (
+                    "<span style='font-size:12px'>Legacy schedule: "
+                    "<code>upper axis edge, step on that same axis</code>.</span>"
+                )
+            controls = [
+                self.custom_basis,
+                self.custom_scale,
+                self.custom_schedule,
+                self.custom_schedule_help,
+            ]
         else:
             controls = [widgets.HTML("Native TOF bins will be used.")]
+            self.custom_scale.disabled = False
         self.rebin_parameters.children = tuple(controls)
         rebin_enabled = mode != RebinMode.none
         self.full_bins_only.disabled = not rebin_enabled
+        self.preview_bins_button.disabled = not rebin_enabled
         fixed_width_mode = mode in (RebinMode.linear_tof, RebinMode.linear_lambda)
         custom_fixed_width = (
             mode == RebinMode.custom_schedule and self.custom_scale.value == RebinCustomScale.linear
         )
         self.snap_to_native.disabled = not (fixed_width_mode or custom_fixed_width)
+
+    def _invalidate_bin_preview(self, _change=None) -> None:
+        if self.rebin_mode.value == RebinMode.none:
+            message = "Native TOF bins will be used; no rebin preview is needed."
+        else:
+            message = "Settings changed. Preview bins to update the active-bin count and plots."
+        self.rebin_bin_summary.value = f"<span style='font-size:12px'>{message}</span>"
+
+    def _preview_bins(self, _button=None) -> None:
+        self.preview_bins_button.disabled = True
+        with self.rebin_preview_output:
+            clear_output(wait=True)
+            display(HTML("Loading the sample and OB ROI profiles for this frame..."))
+        try:
+            frame = self.to_config()
+            if frame.rebin.mode == RebinMode.none:
+                raise ValueError("Select a rebin mode before previewing bins.")
+
+            engine = MultiFramePreviewEngine(
+                MultiFrameRecipe(working_dir=self.working_dir, frames=[frame])
+            )
+            native = engine.load_frame(frame)
+            preview = engine.rebin_frame(frame, native=native)
+            groups, bin_edges = build_rebin_bin_groups(
+                tof_array=native.tof_s,
+                lambda_array=native.lambda_a,
+                energy_array=native.energy_eV,
+                **frame.rebin.engine_kwargs(),
+            )
+            metadata = build_rebin_bin_metadata(
+                tof_array=native.tof_s,
+                lambda_array=native.lambda_a,
+                energy_array=native.energy_eV,
+                bin_groups=groups,
+            )
+            if len(preview.tof_s) == 0:
+                raise ValueError("The current settings produced no active output bins.")
+
+            source_counts = np.asarray(metadata["source_frame_count_array"], dtype=int)
+            native_tof_diffs = np.diff(np.asarray(native.tof_s, dtype=np.float64))
+            positive_native_tof_diffs = native_tof_diffs[
+                np.isfinite(native_tof_diffs) & (native_tof_diffs > 0)
+            ]
+            native_tof_step_s = (
+                float(np.median(positive_native_tof_diffs))
+                if len(positive_native_tof_diffs)
+                else 0.0
+            )
+            tof_widths_us = (
+                np.asarray(metadata["ending_tof_array"], dtype=np.float64)
+                - np.asarray(metadata["starting_tof_array"], dtype=np.float64)
+                + native_tof_step_s
+            ) * 1e6
+            unique_counts, count_frequency = np.unique(source_counts, return_counts=True)
+            frame_count_summary = ", ".join(
+                f"{int(count)} native frames: {int(frequency)} bins"
+                for count, frequency in zip(unique_counts, count_frequency)
+            )
+            width_summary = (
+                f"TOF span min/median/max: {np.min(tof_widths_us):.4g} / "
+                f"{np.median(tof_widths_us):.4g} / {np.max(tof_widths_us):.4g} us"
+            )
+            self.rebin_bin_summary.value = (
+                "<span style='font-size:12px; color:#176b36'>"
+                f"Native bins: {len(native.tof_s)}; active output bins: {len(preview.tof_s)}; "
+                f"{frame_count_summary}. {width_summary}.</span>"
+            )
+
+            transmission_figure = go.Figure()
+            native_order = np.argsort(native.energy_eV)
+            transmission_figure.add_trace(
+                go.Scattergl(
+                    x=native.energy_eV[native_order],
+                    y=native.transmission[native_order],
+                    mode="lines",
+                    line=dict(color="#777", width=1),
+                    opacity=0.55,
+                    name="native transmission",
+                )
+            )
+            preview_order = np.argsort(preview.energy_eV)
+            low_energy_edges = np.minimum(
+                metadata["starting_energy_array"],
+                metadata["ending_energy_array"],
+            )
+            high_energy_edges = np.maximum(
+                metadata["starting_energy_array"],
+                metadata["ending_energy_array"],
+            )
+            if frame.rebin.custom_basis == RebinCustomBasis.energy_tof:
+                all_edge_energies = np.interp(
+                    np.asarray(bin_edges, dtype=np.float64),
+                    native.tof_s,
+                    native.energy_eV,
+                )
+                active_bin_indices = np.asarray(metadata["active_bin_index_array"], dtype=int)
+                first_edge_energy = all_edge_energies[active_bin_indices]
+                second_edge_energy = all_edge_energies[active_bin_indices + 1]
+                low_energy_edges = np.minimum(first_edge_energy, second_edge_energy)
+                high_energy_edges = np.maximum(first_edge_energy, second_edge_energy)
+
+            preview_customdata = np.column_stack(
+                [
+                    low_energy_edges[preview_order],
+                    high_energy_edges[preview_order],
+                    tof_widths_us[preview_order],
+                    source_counts[preview_order],
+                ]
+            )
+            transmission_figure.add_trace(
+                go.Scatter(
+                    x=preview.energy_eV[preview_order],
+                    y=preview.transmission[preview_order],
+                    error_y=dict(
+                        type="data",
+                        array=preview.uncertainty[preview_order],
+                        visible=True,
+                        thickness=0.8,
+                        width=0,
+                    ),
+                    mode="lines+markers",
+                    line=dict(color="#1f77b4", width=1.5),
+                    marker=dict(size=5),
+                    name="rebinned transmission",
+                    customdata=preview_customdata,
+                    hovertemplate=(
+                        "Mean energy: %{x:.6g} eV<br>"
+                        "Transmission: %{y:.6g}<br>"
+                        "Energy bin: %{customdata[0]:.6g} to %{customdata[1]:.6g} eV<br>"
+                        "TOF span: %{customdata[2]:.6g} us<br>"
+                        "Native frames: %{customdata[3]}<extra></extra>"
+                    ),
+                )
+            )
+            if len(preview.energy_eV) <= 80:
+                for index, (low_edge, high_edge) in enumerate(
+                    zip(low_energy_edges, high_energy_edges)
+                ):
+                    if index % 2 == 0 and low_edge > 0:
+                        transmission_figure.add_vrect(
+                            x0=float(low_edge),
+                            x1=float(high_edge),
+                            fillcolor="#4c78a8",
+                            opacity=0.07,
+                            line_width=0,
+                            layer="below",
+                        )
+            transmission_figure.update_layout(
+                title=f"{frame.name}: proposed bins over ROI transmission",
+                template="plotly_white",
+                height=520,
+                margin=dict(l=70, r=30, t=75, b=60),
+                hovermode="closest",
+            )
+            transmission_figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)")
+            transmission_figure.update_yaxes(title_text="Transmission")
+
+            construction_figure = go.Figure()
+            construction_figure.add_trace(
+                go.Bar(
+                    x=preview.energy_eV[preview_order],
+                    y=source_counts[preview_order],
+                    name="native frames per bin",
+                    marker_color="#4c78a8",
+                    opacity=0.65,
+                )
+            )
+            construction_figure.add_trace(
+                go.Scatter(
+                    x=preview.energy_eV[preview_order],
+                    y=tof_widths_us[preview_order],
+                    mode="lines+markers",
+                    name="actual TOF span",
+                    line=dict(color="#e45756", width=1.5),
+                    marker=dict(size=4),
+                    yaxis="y2",
+                )
+            )
+            construction_figure.update_layout(
+                title=f"{frame.name}: output-bin construction",
+                template="plotly_white",
+                height=380,
+                margin=dict(l=70, r=70, t=70, b=60),
+                xaxis=dict(type="log", title="Incident neutron energy (eV)"),
+                yaxis=dict(title="Native frames per output bin"),
+                yaxis2=dict(title="Actual TOF span (us)", overlaying="y", side="right"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                hovermode="closest",
+            )
+
+            with self.rebin_preview_output:
+                clear_output(wait=True)
+                transmission_figure.show()
+                construction_figure.show()
+        except Exception as error:
+            self.rebin_bin_summary.value = (
+                "<span style='font-size:12px; color:#b00020'>"
+                f"Bin preview unavailable: {_escape(error)}</span>"
+            )
+            with self.rebin_preview_output:
+                clear_output(wait=True)
+        finally:
+            self.preview_bins_button.disabled = self.rebin_mode.value == RebinMode.none
 
     def _show_sample_roi_selector(self, _button) -> None:
         self._show_roi_selector("sample")

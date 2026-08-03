@@ -46,6 +46,7 @@ class RebinMode:
 
 
 class RebinCustomBasis:
+    energy_tof = "energy edges / TOF widths"
     tof = "tof"
     lambda_ = "lambda"
     lambda_squared = "lambda^2"

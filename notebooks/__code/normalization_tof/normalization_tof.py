@@ -1259,7 +1259,11 @@ class NormalizationTof:
         return (
             selected_mode == RebinMode.custom_schedule
             and self.rebin_custom_scale_ui.value == RebinCustomScale.linear
-            and self.rebin_custom_basis_ui.value in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+            and self.rebin_custom_basis_ui.value in [
+                RebinCustomBasis.energy_tof,
+                RebinCustomBasis.tof,
+                RebinCustomBasis.lambda_,
+            ]
         )
 
     def _update_rebin_snap_to_native_grid_state(self):
@@ -1268,7 +1272,10 @@ class NormalizationTof:
         self.rebin_snap_to_native_grid_ui.disabled = not self._fixed_width_rebin_mode_supports_native_snap()
 
     def _get_custom_schedule_scale_options(self):
-        if self.rebin_custom_basis_ui.value == RebinCustomBasis.lambda_squared:
+        if self.rebin_custom_basis_ui.value in [
+            RebinCustomBasis.energy_tof,
+            RebinCustomBasis.lambda_squared,
+        ]:
             return [RebinCustomScale.linear]
         return [RebinCustomScale.linear, RebinCustomScale.log, RebinCustomScale.reverse_log]
 
@@ -1286,7 +1293,14 @@ class NormalizationTof:
         basis = self.rebin_custom_basis_ui.value
         scale = self.rebin_custom_scale_ui.value
 
-        if basis == RebinCustomBasis.tof:
+        if basis == RebinCustomBasis.energy_tof:
+            end_label = "upper_energy_edge_eV"
+            step_label = "delta_tof_us"
+            boundary_help = (
+                "Energy boundaries must be listed in strictly increasing order. "
+                "Each TOF width applies from the previous energy edge through the listed edge."
+            )
+        elif basis == RebinCustomBasis.tof:
             end_label = "end_tof_us"
             step_label = "delta_us" if scale == RebinCustomScale.linear else "dt/t"
             boundary_help = "TOF boundaries must be listed in strictly increasing order, from the minimum TOF upward."
@@ -1594,7 +1608,10 @@ class NormalizationTof:
         if rebin_mode == RebinMode.inverse_log_lambda:
             return np.square(lambda_array), "Lambda^2 (Angstroms^2)"
         if rebin_mode == RebinMode.custom_schedule:
-            if self.rebin_custom_basis_ui.value == RebinCustomBasis.tof:
+            if self.rebin_custom_basis_ui.value in [
+                RebinCustomBasis.energy_tof,
+                RebinCustomBasis.tof,
+            ]:
                 return tof_array * 1e6, "TOF (micros)"
             if self.rebin_custom_basis_ui.value == RebinCustomBasis.lambda_:
                 return lambda_array, "Lambda (Angstroms)"
@@ -1606,7 +1623,13 @@ class NormalizationTof:
             return None
         if rebin_mode in [RebinMode.linear_tof, RebinMode.log_tof]:
             return np.asarray(bin_edges, dtype=np.float64) * 1e6
-        if rebin_mode == RebinMode.custom_schedule and self.rebin_custom_basis_ui.value == RebinCustomBasis.tof:
+        if (
+            rebin_mode == RebinMode.custom_schedule
+            and self.rebin_custom_basis_ui.value in [
+                RebinCustomBasis.energy_tof,
+                RebinCustomBasis.tof,
+            ]
+        ):
             return np.asarray(bin_edges, dtype=np.float64) * 1e6
         return np.asarray(bin_edges, dtype=np.float64)
 
@@ -2072,11 +2095,16 @@ class NormalizationTof:
         display(self.rebin_snap_to_native_grid_ui)
 
         self.rebin_custom_basis_ui = widgets.Dropdown(
-            options=[RebinCustomBasis.tof, RebinCustomBasis.lambda_, RebinCustomBasis.lambda_squared],
-            value=RebinCustomBasis.tof,
+            options=[
+                ("Energy edges / TOF widths", RebinCustomBasis.energy_tof),
+                ("TOF edges / TOF widths (legacy)", RebinCustomBasis.tof),
+                ("Lambda edges / lambda widths (legacy)", RebinCustomBasis.lambda_),
+                ("Lambda^2 edges / lambda^2 widths (legacy)", RebinCustomBasis.lambda_squared),
+            ],
+            value=RebinCustomBasis.energy_tof,
             description="basis:",
             disabled=True,
-            layout=widgets.Layout(width="240px"),
+            layout=widgets.Layout(width="420px"),
         )
         self.rebin_custom_basis_ui.observe(self._on_custom_schedule_basis_change, names="value")
 
@@ -2090,7 +2118,7 @@ class NormalizationTof:
         self.rebin_custom_scale_ui.observe(self._on_custom_schedule_scale_change, names="value")
 
         self.rebin_custom_schedule_ui = widgets.Textarea(
-            value="560, 70\n2700, 60\n5500, 50\n, 40",
+            value="0.108, 100\n0.199, 30\n, 60",
             description="segments:",
             disabled=True,
             layout=widgets.Layout(width="520px", height="110px"),

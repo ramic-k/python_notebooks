@@ -265,6 +265,7 @@ def create_rebin_output_suffix(
 
     elif rebin_mode == RebinMode.custom_schedule:
         basis_token = {
+            RebinCustomBasis.energy_tof: "energyedges_tofwidths",
             RebinCustomBasis.tof: "tof",
             RebinCustomBasis.lambda_: "lambda",
             RebinCustomBasis.lambda_squared: "lambda2",
@@ -286,7 +287,11 @@ def create_rebin_output_suffix(
         or (
             rebin_mode == RebinMode.custom_schedule
             and rebin_custom_scale == RebinCustomScale.linear
-            and rebin_custom_basis in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+            and rebin_custom_basis in [
+                RebinCustomBasis.energy_tof,
+                RebinCustomBasis.tof,
+                RebinCustomBasis.lambda_,
+            ]
         )
     )
     if rebin_snap_to_native_grid and snap_to_native_applies:
@@ -594,6 +599,7 @@ def _create_edges_for_custom_segment(
 def _build_custom_schedule_bin_edges(
     tof_array: np.ndarray = None,
     lambda_array: np.ndarray = None,
+    energy_array: np.ndarray = None,
     rebin_custom_basis: str = None,
     rebin_custom_scale: str = None,
     rebin_custom_schedule: list = None,
@@ -601,6 +607,17 @@ def _build_custom_schedule_bin_edges(
     rebin_snap_to_native_grid: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     normalized_schedule = _normalize_custom_schedule(rebin_custom_schedule)
+
+    if rebin_custom_basis == RebinCustomBasis.energy_tof:
+        if rebin_custom_scale != RebinCustomScale.linear:
+            raise ValueError("Energy-edge/TOF-width schedules only support linear TOF widths.")
+        return _build_energy_edge_tof_width_bin_edges(
+            tof_array=tof_array,
+            energy_array=energy_array,
+            normalized_schedule=normalized_schedule,
+            rebin_full_bins_only=rebin_full_bins_only,
+            rebin_snap_to_native_grid=rebin_snap_to_native_grid,
+        )
 
     def _convert_custom_step(step_value: float) -> float:
         if rebin_custom_basis == RebinCustomBasis.tof and rebin_custom_scale == RebinCustomScale.linear:
@@ -679,6 +696,87 @@ def _build_custom_schedule_bin_edges(
     return axis_values, np.asarray(custom_bin_edges, dtype=np.float64)
 
 
+def _build_energy_edge_tof_width_bin_edges(
+    tof_array: np.ndarray,
+    energy_array: np.ndarray,
+    normalized_schedule: list[dict],
+    rebin_full_bins_only: bool = False,
+    rebin_snap_to_native_grid: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build TOF bins from increasing energy-region edges and TOF widths.
+
+    A row ``energy_upper_edge_eV, delta_tof_us`` applies that TOF width from
+    the previous energy edge up to the listed edge. A final blank edge covers
+    the remaining high-energy range. Since neutron energy decreases with TOF,
+    the energy regions are reversed before constructing the ascending TOF bins.
+    """
+    tof_values = _validate_rebin_axis(tof_array, RebinMode.custom_schedule)
+    energy_values = np.asarray(energy_array, dtype=np.float64)
+    if energy_values.shape != tof_values.shape:
+        raise ValueError("Energy-edge/TOF-width schedules require matching TOF and energy arrays.")
+    if np.any(~np.isfinite(energy_values)) or np.any(energy_values <= 0):
+        raise ValueError("Energy-edge/TOF-width schedules require finite positive energies.")
+    if np.any(np.diff(energy_values) > 0):
+        raise ValueError("Energy-edge/TOF-width schedules require energy to decrease as TOF increases.")
+
+    finite_segments = [segment for segment in normalized_schedule if segment["end_value"] is not None]
+    requested_energy_edges = np.asarray(
+        [float(segment["end_value"]) for segment in finite_segments],
+        dtype=np.float64,
+    )
+    energy_min = float(np.min(energy_values))
+    energy_max = float(np.max(energy_values))
+    if np.any(requested_energy_edges <= energy_min) or np.any(requested_energy_edges >= energy_max):
+        raise ValueError(
+            "Energy schedule edges must lie strictly inside this frame's energy range "
+            f"({energy_min:.6g}, {energy_max:.6g}) eV."
+        )
+
+    low_to_high_widths_us = [float(segment["step"]) for segment in finite_segments]
+    open_segment = next(
+        (segment for segment in normalized_schedule if segment["end_value"] is None),
+        None,
+    )
+    high_energy_width_us = (
+        float(open_segment["step"])
+        if open_segment is not None
+        else float(normalized_schedule[-1]["step"])
+    )
+    low_to_high_widths_us.append(high_energy_width_us)
+
+    requested_tof_edges = np.interp(
+        requested_energy_edges,
+        energy_values[::-1],
+        tof_values[::-1],
+    )
+    tof_region_ends = [*requested_tof_edges[::-1], float(tof_values[-1])]
+    high_to_low_widths_us = low_to_high_widths_us[::-1]
+    native_axis_step = (
+        _estimate_native_axis_step(tof_values)
+        if rebin_snap_to_native_grid
+        else None
+    )
+
+    custom_bin_edges = [float(tof_values[0])]
+    current_start = custom_bin_edges[0]
+    for segment_end, width_us in zip(tof_region_ends, high_to_low_widths_us):
+        if segment_end <= current_start:
+            continue
+        segment_edges = _create_linear_bin_edges_between(
+            start_value=current_start,
+            end_value=float(segment_end),
+            bin_width=float(width_us) * 1e-6,
+            full_bins_only=rebin_full_bins_only,
+            native_axis_step=native_axis_step,
+        )
+        custom_bin_edges.extend(segment_edges[1:])
+        current_start = custom_bin_edges[-1]
+
+    if len(custom_bin_edges) < 2:
+        raise ValueError("The energy-edge/TOF-width schedule produced no complete output bins.")
+    return tof_values, np.asarray(custom_bin_edges, dtype=np.float64)
+
+
 def build_rebin_bin_groups(
     rebin_mode: str = RebinMode.none,
     tof_array: np.ndarray = None,
@@ -737,6 +835,7 @@ def build_rebin_bin_groups(
         axis_values, bin_edges = _build_custom_schedule_bin_edges(
             tof_array=tof_array,
             lambda_array=lambda_array,
+            energy_array=energy_array,
             rebin_custom_basis=rebin_custom_basis,
             rebin_custom_scale=rebin_custom_scale,
             rebin_custom_schedule=rebin_custom_schedule,
@@ -758,7 +857,11 @@ def build_rebin_bin_groups(
         or (
             rebin_mode == RebinMode.custom_schedule
             and rebin_custom_scale == RebinCustomScale.linear
-            and rebin_custom_basis in [RebinCustomBasis.tof, RebinCustomBasis.lambda_]
+            and rebin_custom_basis in [
+                RebinCustomBasis.energy_tof,
+                RebinCustomBasis.tof,
+                RebinCustomBasis.lambda_,
+            ]
         )
     )
     if rebin_snap_to_native_grid and rebin_full_bins_only and snap_to_native_applies:

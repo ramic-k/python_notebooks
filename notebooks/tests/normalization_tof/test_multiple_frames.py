@@ -11,7 +11,12 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from __code.normalization_tof import DetectorType, RebinMode
+from __code.normalization_tof import (
+    DetectorType,
+    RebinCustomBasis,
+    RebinCustomScale,
+    RebinMode,
+)
 from __code.normalization_tof.multiple_frames import (
     BlackFilterBackgroundConfig,
     FrameConfig,
@@ -37,6 +42,7 @@ from __code.normalization_tof.multiple_frames_ui import (
     _empty_frame,
 )
 from __code.normalization_tof.utilities import (
+    build_rebin_bin_groups,
     calculate_detector_corrected_variance,
     perform_spectrum_normalization,
 )
@@ -142,6 +148,8 @@ def test_new_frame_defaults_match_single_frame_notebook():
     assert editor.ob_roi_height.value == 200
     assert editor.ob_roi_left.disabled is True
     assert editor.rebin_mode.value == RebinMode.none
+    assert editor.custom_basis.value == RebinCustomBasis.energy_tof
+    assert editor.preview_bins_button.disabled is True
     assert editor.delta_tof.value == 30.0
     assert editor.delta_lambda.value == 0.01
     assert editor.delta_tof_relative.value == 0.01
@@ -186,6 +194,49 @@ def test_new_frame_defaults_match_single_frame_notebook():
     editor.detector.value = DetectorType.tpx1
     assert editor.experimental_uncertainties.value is True
     assert editor.experimental_uncertainties.disabled is False
+
+
+def test_energy_edge_tof_width_schedule_reverses_regions_onto_tof_axis():
+    tof_us = np.arange(1, 22, dtype=np.float64) * 100.0
+    tof_s = tof_us * 1e-6
+    energy_eV = np.linspace(2.1, 0.1, len(tof_s))
+    lambda_a = np.linspace(0.1, 2.1, len(tof_s))
+
+    groups, edges = build_rebin_bin_groups(
+        rebin_mode=RebinMode.custom_schedule,
+        tof_array=tof_s,
+        lambda_array=lambda_a,
+        energy_array=energy_eV,
+        rebin_custom_basis=RebinCustomBasis.energy_tof,
+        rebin_custom_scale=RebinCustomScale.linear,
+        rebin_custom_schedule=[
+            {"end_value": 0.7, "step": 300.0},
+            {"end_value": 1.3, "step": 100.0},
+            {"end_value": None, "step": 200.0},
+        ],
+        rebin_full_bins_only=False,
+        rebin_snap_to_native_grid=False,
+    )
+
+    np.testing.assert_allclose(
+        edges * 1e6,
+        [100, 300, 500, 700, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1800, 2100],
+        atol=1e-9,
+    )
+    assert sum(len(group) for group in groups) == len(tof_s) - 1
+
+
+def test_energy_edge_tof_width_schedule_rejects_out_of_frame_edge():
+    with np.testing.assert_raises_regex(ValueError, "strictly inside this frame's energy range"):
+        build_rebin_bin_groups(
+            rebin_mode=RebinMode.custom_schedule,
+            tof_array=np.asarray([1.0, 2.0, 3.0]) * 1e-3,
+            lambda_array=np.asarray([1.0, 2.0, 3.0]),
+            energy_array=np.asarray([3.0, 2.0, 1.0]),
+            rebin_custom_basis=RebinCustomBasis.energy_tof,
+            rebin_custom_scale=RebinCustomScale.linear,
+            rebin_custom_schedule=[{"end_value": 4.0, "step": 100.0}],
+        )
 
 
 def test_ob_roi_can_be_unlinked_and_saved_independently():
@@ -303,6 +354,37 @@ def test_frame_preview_uses_distinct_sample_and_ob_rois(tmp_path):
     np.testing.assert_allclose(profile.sample_counts, [10.0, 20.0])
     np.testing.assert_allclose(profile.ob_counts, [5.0, 10.0])
     np.testing.assert_allclose(profile.transmission, [2.0, 2.0])
+
+
+def test_frame_editor_bin_preview_reports_counts_and_shows_two_plots(tmp_path, monkeypatch):
+    sample_frames = [np.full((2, 2), 20 + index, dtype=np.uint16) for index in range(6)]
+    ob_frames = [np.full((2, 2), 40 + index, dtype=np.uint16) for index in range(6)]
+    sample_path, sample_nexus = _write_run(tmp_path, "711", sample_frames)
+    ob_path, ob_nexus = _write_run(tmp_path, "712", ob_frames)
+    frame = _frame(
+        "preview frame",
+        [("711", sample_path, sample_nexus)],
+        [("712", ob_path, ob_nexus)],
+        RoiConfig(left=0, top=0, width=2, height=2),
+        rebin=RebinConfig(
+            mode=RebinMode.linear_tof,
+            delta_tof_us=2.0,
+            full_bins_only=False,
+            snap_to_native_grid=False,
+        ),
+    )
+    editor = FrameEditor(frame, str(tmp_path))
+    editor.use_proton_charge.value = False
+    captured = []
+    monkeypatch.setattr(go.Figure, "show", lambda figure: captured.append(figure))
+
+    editor._preview_bins()
+
+    assert len(captured) == 2, editor.rebin_bin_summary.value
+    assert "active output bins: 3" in editor.rebin_bin_summary.value
+    assert captured[0].layout.xaxis.type == "log"
+    assert captured[1].layout.yaxis2.title.text == "Actual TOF span (us)"
+    assert editor.preview_bins_button.disabled is False
 
 
 def test_spectrum_normalization_uses_distinct_dc_rois_and_covariance():
