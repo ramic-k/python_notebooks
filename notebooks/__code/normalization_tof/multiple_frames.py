@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,9 @@ from __code.normalization_tof.normalization_for_timepix1_timepix3 import (
     normalization_with_list_of_full_path,
 )
 from __code.normalization_tof.utilities import (
+    DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE,
+    _evaluate_black_filter_background_shape,
+    _load_black_filter_background_shape,
     build_rebin_bin_groups,
     build_rebin_bin_metadata,
     calculate_ratio_and_uncertainty,
@@ -111,6 +115,59 @@ class RunSpec:
 
 
 @dataclass(frozen=True)
+class BlackFilterBackgroundConfig:
+    enabled: bool = False
+    shape_file: str = DEFAULT_BLACK_FILTER_BACKGROUND_SHAPE_FILE
+    anchor_energy_eV: float = 5.1044
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any] | None) -> "BlackFilterBackgroundConfig":
+        return cls(**(values or {}))
+
+
+@dataclass(frozen=True)
+class MeasuredBackgroundConfig:
+    key: str
+    enabled: bool = False
+    sample_runs: tuple[RunSpec, ...] = ()
+    ob_runs: tuple[RunSpec, ...] = ()
+    weight: float = 1.0
+    mode: str | None = None
+    column_label: str | None = None
+    key_prefix: str | None = None
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "MeasuredBackgroundConfig":
+        values = dict(values)
+        values["sample_runs"] = tuple(RunSpec.from_value(item) for item in values.get("sample_runs", ()))
+        values["ob_runs"] = tuple(RunSpec.from_value(item) for item in values.get("ob_runs", ()))
+        return cls(**values)
+
+    def normalized_labels(self) -> tuple[str, str, str]:
+        defaults = {
+            "bragg_edge_cd": (
+                "Cd-filter background correction for Bragg edge mode",
+                "Cd-filter",
+                "bragg_edge_cd",
+            ),
+            "closed_slits": (
+                "Closed-slits background correction for Bragg edge mode",
+                "closed-slits",
+                "closed_slits",
+            ),
+        }
+        default_mode, default_label, default_prefix = defaults.get(
+            self.key,
+            (f"Measured background correction: {self.key}", self.key, self.key),
+        )
+        return (
+            self.mode or default_mode,
+            self.column_label or default_label,
+            self.key_prefix or default_prefix,
+        )
+
+
+@dataclass(frozen=True)
 class RebinConfig:
     mode: str = RebinMode.none
     delta_tof_us: float | None = None
@@ -121,8 +178,8 @@ class RebinConfig:
     custom_basis: str | None = None
     custom_scale: str | None = None
     custom_schedule: tuple[tuple[float | None, float], ...] = ()
-    full_bins_only: bool = False
-    snap_to_native_grid: bool = False
+    full_bins_only: bool = True
+    snap_to_native_grid: bool = True
 
     @classmethod
     def from_dict(cls, values: dict[str, Any] | None) -> "RebinConfig":
@@ -167,12 +224,22 @@ class FrameConfig:
     sample_runs: tuple[RunSpec, ...]
     ob_runs: tuple[RunSpec, ...]
     roi: RoiConfig
+    container_roi: RoiConfig | None = None
+    container_roi_file: str | None = None
+    dc_runs: tuple[RunSpec, ...] = ()
+    black_filter_background: BlackFilterBackgroundConfig = field(default_factory=BlackFilterBackgroundConfig)
+    measured_backgrounds: tuple[MeasuredBackgroundConfig, ...] = ()
     rebin: RebinConfig = field(default_factory=RebinConfig)
     distance_source_detector_m: float = 25.0
     detector_delay_us: float | None = None
     manual_tof_bin_size_ns: float | None = None
     use_proton_charge: bool = True
     use_experimental_uncertainties: bool = True
+    combine_sample_runs: bool = False
+    correct_chips_alignment: bool | None = None
+    replace_ob_zeros_by_local_median: bool | None = None
+    local_median_kernel: tuple[int, int, int] | None = (3, 3, 1)
+    local_median_max_iterations: int | None = 2
     enabled: bool = True
 
     @classmethod
@@ -180,8 +247,20 @@ class FrameConfig:
         values = dict(values)
         values["sample_runs"] = tuple(RunSpec.from_value(item) for item in values.get("sample_runs", ()))
         values["ob_runs"] = tuple(RunSpec.from_value(item) for item in values.get("ob_runs", ()))
+        values["dc_runs"] = tuple(RunSpec.from_value(item) for item in values.get("dc_runs", ()))
         values["roi"] = RoiConfig(**values.get("roi", {}))
+        if values.get("container_roi") is not None:
+            values["container_roi"] = RoiConfig(**values["container_roi"])
+        values["black_filter_background"] = BlackFilterBackgroundConfig.from_dict(
+            values.get("black_filter_background")
+        )
+        values["measured_backgrounds"] = tuple(
+            MeasuredBackgroundConfig.from_dict(item)
+            for item in values.get("measured_backgrounds", ())
+        )
         values["rebin"] = RebinConfig.from_dict(values.get("rebin"))
+        if values.get("local_median_kernel") is not None:
+            values["local_median_kernel"] = tuple(values["local_median_kernel"])
         return cls(**values)
 
     def validate(self) -> None:
@@ -195,7 +274,32 @@ class FrameConfig:
             raise ValueError(f"{self.name}: source-detector distance must be positive.")
         if self.manual_tof_bin_size_ns is not None and self.manual_tof_bin_size_ns <= 0:
             raise ValueError(f"{self.name}: manual TOF bin size must be positive.")
+        enabled_backgrounds = [item for item in self.measured_backgrounds if item.enabled]
+        for background in enabled_backgrounds:
+            if not background.sample_runs or not background.ob_runs:
+                raise ValueError(
+                    f"{self.name}: enabled {background.key} correction requires sample and OB background runs."
+                )
+        if self.black_filter_background.enabled and enabled_backgrounds:
+            raise ValueError(
+                f"{self.name}: black-filter and measured-background corrections cannot be enabled together."
+            )
+        if self.dc_runs and (self.black_filter_background.enabled or enabled_backgrounds):
+            raise ValueError(
+                f"{self.name}: dark-current correction cannot be combined with the selected background correction."
+            )
+        if self.black_filter_background.enabled and not self.black_filter_background.shape_file.strip():
+            raise ValueError(f"{self.name}: black-filter correction requires a background-shape CSV file.")
+        if self.container_roi_file is not None and not self.container_roi_file.strip():
+            raise ValueError(f"{self.name}: saved container ROI file path cannot be empty.")
+        if self.local_median_kernel is not None:
+            if len(self.local_median_kernel) != 3 or any(value <= 0 for value in self.local_median_kernel):
+                raise ValueError(f"{self.name}: local median kernel must contain three positive integers.")
+        if self.local_median_max_iterations is not None and self.local_median_max_iterations <= 0:
+            raise ValueError(f"{self.name}: local median maximum iterations must be positive.")
         self.roi.validate()
+        if self.container_roi is not None:
+            self.container_roi.validate()
 
 
 @dataclass
@@ -212,15 +316,15 @@ class MultiFrameRecipe:
             "normalized_stack": True,
             "sample_integrated": False,
             "ob_integrated": False,
-            "normalized_integrated": True,
+            "normalized_integrated": False,
             "combined_normalized_integrated": False,
             "x_axis": True,
         }
     )
-    correct_chips_alignment: bool = True
+    correct_chips_alignment: bool = False
     replace_ob_zeros_by_local_median: bool = False
-    local_median_kernel: tuple[int, int, int] = (3, 3, 3)
-    local_median_max_iterations: int = 10
+    local_median_kernel: tuple[int, int, int] = (3, 3, 1)
+    local_median_max_iterations: int = 2
     recipe_version: int = RECIPE_VERSION
 
     @classmethod
@@ -287,6 +391,7 @@ class NativeFrameProfile:
     sample_total_proton_charge_c: float | None
     ob_total_proton_charge_c: float | None
     warnings: list[str] = field(default_factory=list)
+    corrections_applied: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -480,6 +585,11 @@ class MultiFramePreviewEngine:
         sample_tof, sample_counts, sample_variance, sample_charge, sample_warnings = self._combine_runs(
             sample_profiles, frame.use_proton_charge, role="sample"
         )
+        if len(sample_profiles) > 1 and not frame.combine_sample_runs:
+            sample_warnings.append(
+                "The fast ROI preview combines the selected sample runs; full normalization will "
+                "process them separately unless 'Combine sample runs' is enabled."
+            )
         ob_tof, ob_counts, ob_variance, ob_charge, ob_warnings = self._combine_runs(
             ob_profiles, frame.use_proton_charge, role="OB"
         )
@@ -509,26 +619,115 @@ class MultiFramePreviewEngine:
             distance_source_detector_m=frame.distance_source_detector_m,
             detector_delay_us=detector_delay_us,
         )
+        sample_counts = np.asarray(sample_counts[:common_length], dtype=np.float64).copy()
+        sample_variance = np.asarray(sample_variance[:common_length], dtype=np.float64).copy()
+        ob_counts = np.asarray(ob_counts[:common_length], dtype=np.float64).copy()
+        ob_variance = np.asarray(ob_variance[:common_length], dtype=np.float64).copy()
+        corrections_applied: list[str] = []
+
+        if frame.dc_runs:
+            dc_runs = [self.resolve_run(spec, frame.detector_type) for spec in frame.dc_runs]
+            dc_profiles = [self._load_run(run, frame, force_reload) for run in dc_runs]
+            dc_tof, dc_counts, dc_variance, _, dc_warnings = self._combine_runs(
+                dc_profiles,
+                use_proton_charge=False,
+                role="dark current",
+            )
+            _require_matching_axis(sample_tof, dc_tof, f"{frame.name} dark current")
+            sample_counts -= dc_counts
+            ob_counts -= dc_counts
+            sample_variance += dc_variance
+            ob_variance += dc_variance
+            sample_warnings.extend(dc_warnings)
+            corrections_applied.append("dark current")
+
+        for background in frame.measured_backgrounds:
+            if not background.enabled:
+                continue
+            sample_background_runs = [
+                self.resolve_run(spec, frame.detector_type) for spec in background.sample_runs
+            ]
+            ob_background_runs = [
+                self.resolve_run(spec, frame.detector_type) for spec in background.ob_runs
+            ]
+            sample_background_profiles = [
+                self._load_run(run, frame, force_reload) for run in sample_background_runs
+            ]
+            ob_background_profiles = [
+                self._load_run(run, frame, force_reload) for run in ob_background_runs
+            ]
+            (
+                sample_background_tof,
+                sample_background_counts,
+                sample_background_variance,
+                _,
+                sample_background_warnings,
+            ) = self._combine_runs(
+                sample_background_profiles,
+                frame.use_proton_charge,
+                role=f"{background.key} sample background",
+            )
+            (
+                ob_background_tof,
+                ob_background_counts,
+                ob_background_variance,
+                _,
+                ob_background_warnings,
+            ) = self._combine_runs(
+                ob_background_profiles,
+                frame.use_proton_charge,
+                role=f"{background.key} OB background",
+            )
+            _require_matching_axis(sample_tof, sample_background_tof, f"{frame.name} sample background")
+            _require_matching_axis(sample_tof, ob_background_tof, f"{frame.name} OB background")
+            weight = float(background.weight)
+            sample_counts -= weight * sample_background_counts
+            ob_counts -= weight * ob_background_counts
+            sample_variance += weight**2 * sample_background_variance
+            ob_variance += weight**2 * ob_background_variance
+            sample_warnings.extend(sample_background_warnings + ob_background_warnings)
+            _, label, _ = background.normalized_labels()
+            corrections_applied.append(f"{label} measured background (weight {weight:g})")
+
+        if frame.black_filter_background.enabled:
+            sample_counts, ob_counts, black_filter_metadata = _apply_black_filter_background_to_profiles(
+                sample_counts=sample_counts,
+                ob_counts=ob_counts,
+                energy_eV=energy_eV,
+                config=frame.black_filter_background,
+            )
+            corrections_applied.append(
+                "black-filter shape "
+                f"(anchor {black_filter_metadata['anchor_energy_eV']:.6g} eV)"
+            )
+
+        if frame.container_roi is not None or frame.container_roi_file:
+            sample_warnings.append(
+                "Container correction is not applied to the fast ROI preview; "
+                "it will be applied during full normalization."
+            )
+
         transmission, uncertainty = _ratio_with_nan(
-            sample_counts[:common_length],
-            ob_counts[:common_length],
-            sample_variance[:common_length],
-            ob_variance[:common_length],
+            sample_counts,
+            ob_counts,
+            sample_variance,
+            ob_variance,
         )
         profile = NativeFrameProfile(
             name=frame.name,
             tof_s=tof_s,
             lambda_a=lambda_a,
             energy_eV=energy_eV,
-            sample_counts=sample_counts[:common_length],
-            sample_variance=sample_variance[:common_length],
-            ob_counts=ob_counts[:common_length],
-            ob_variance=ob_variance[:common_length],
+            sample_counts=sample_counts,
+            sample_variance=sample_variance,
+            ob_counts=ob_counts,
+            ob_variance=ob_variance,
             transmission=transmission,
             uncertainty=uncertainty,
             sample_total_proton_charge_c=sample_charge,
             ob_total_proton_charge_c=ob_charge,
             warnings=sample_warnings + ob_warnings,
+            corrections_applied=corrections_applied,
         )
         self.native_profiles[frame.name] = profile
         return profile
@@ -607,36 +806,90 @@ class MultiFramePreviewEngine:
             frame_output.mkdir(parents=True, exist_ok=False)
             sample_runs = [self.resolve_run(spec, frame.detector_type) for spec in frame.sample_runs]
             ob_runs = [self.resolve_run(spec, frame.detector_type) for spec in frame.ob_runs]
+            dc_runs = [self.resolve_run(spec, frame.detector_type) for spec in frame.dc_runs]
             sample_dict = _normalization_input_dict(sample_runs)
             ob_dict = _normalization_input_dict(ob_runs)
-            spectra_array = self._manual_axis_for_frame(frame, sample_runs + ob_runs)
+            dc_dict = _normalization_input_dict(dc_runs)
+            measured_background_configs = []
+            all_background_runs: list[ResolvedRun] = []
+            for background in frame.measured_backgrounds:
+                if not background.enabled:
+                    continue
+                sample_background_runs = [
+                    self.resolve_run(spec, frame.detector_type) for spec in background.sample_runs
+                ]
+                ob_background_runs = [
+                    self.resolve_run(spec, frame.detector_type) for spec in background.ob_runs
+                ]
+                all_background_runs.extend(sample_background_runs + ob_background_runs)
+                mode, column_label, key_prefix = background.normalized_labels()
+                measured_background_configs.append(
+                    {
+                        "enabled": True,
+                        "mode": mode,
+                        "column_label": column_label,
+                        "key_prefix": key_prefix,
+                        "weight": float(background.weight),
+                        "sample_background_dict": _normalization_input_dict(sample_background_runs),
+                        "ob_background_dict": _normalization_input_dict(ob_background_runs),
+                    }
+                )
+            spectra_array = self._manual_axis_for_frame(
+                frame,
+                sample_runs + ob_runs + dc_runs + all_background_runs,
+            )
             detector_delay_us = frame.detector_delay_us
+            correct_chips_alignment = (
+                self.recipe.correct_chips_alignment
+                if frame.correct_chips_alignment is None
+                else frame.correct_chips_alignment
+            )
             correct_config = None
-            if self.recipe.correct_chips_alignment:
+            if correct_chips_alignment:
                 correct_config = timepix3_config if frame.detector_type == DetectorType.tpx3 else timepix1_config
+            replace_ob_zeros = (
+                self.recipe.replace_ob_zeros_by_local_median
+                if frame.replace_ob_zeros_by_local_median is None
+                else frame.replace_ob_zeros_by_local_median
+            )
+            local_median_kernel = frame.local_median_kernel or self.recipe.local_median_kernel
+            local_median_max_iterations = (
+                frame.local_median_max_iterations or self.recipe.local_median_max_iterations
+            )
+            black_filter_config = None
+            if frame.black_filter_background.enabled:
+                black_filter_config = {
+                    "enabled": True,
+                    "background_shape_file": frame.black_filter_background.shape_file,
+                    "anchor_energy_eV": frame.black_filter_background.anchor_energy_eV,
+                }
 
             normalization_with_list_of_full_path(
                 sample_dict=sample_dict,
-                combine_samples=len(sample_dict) > 1,
+                combine_samples=frame.combine_sample_runs,
                 ob_dict=ob_dict,
-                dc_dict={},
+                dc_dict=dc_dict,
                 spectra_array=spectra_array,
                 output_folder=str(frame_output),
                 verbose=True,
                 proton_charge_flag=frame.use_proton_charge,
-                replace_ob_zeros_by_local_median_flag=self.recipe.replace_ob_zeros_by_local_median,
-                kernel_size_for_local_median=self.recipe.local_median_kernel,
-                max_iterations=self.recipe.local_median_max_iterations,
+                replace_ob_zeros_by_local_median_flag=replace_ob_zeros,
+                kernel_size_for_local_median=local_median_kernel,
+                max_iterations=local_median_max_iterations,
                 output_tif=True,
                 instrument=self.recipe.instrument,
                 detector_delay_us=detector_delay_us,
                 preview=preview,
                 distance_source_detector_m=frame.distance_source_detector_m,
-                correct_chips_alignment_flag=self.recipe.correct_chips_alignment,
+                correct_chips_alignment_flag=correct_chips_alignment,
                 correct_chips_alignment_config=correct_config,
                 export_mode=dict(self.recipe.export_mode),
                 roi=frame.roi.to_roi(),
+                container_roi=(None if frame.container_roi is None else frame.container_roi.to_roi()),
+                container_roi_file=frame.container_roi_file,
                 experimental_uncertainties_flag=frame.use_experimental_uncertainties,
+                black_filter_background_config=black_filter_config,
+                measured_background_correction_configs=measured_background_configs,
                 **frame.rebin.engine_kwargs(),
             )
         return campaign_dir
@@ -646,7 +899,10 @@ class MultiFramePreviewEngine:
             return None
         lengths = [len(retrieve_list_of_tif(str(run.data_path))) for run in runs]
         if len(set(lengths)) != 1:
-            raise ValueError(f"{frame.name}: manual TOF axis requires equal TIFF counts in all sample and OB runs.")
+            raise ValueError(
+                f"{frame.name}: manual TOF axis requires equal TIFF counts in all sample, OB, "
+                "dark-current, and measured-background runs."
+            )
         return (np.arange(lengths[0], dtype=np.float64) + 0.5) * frame.manual_tof_bin_size_ns * 1e-9
 
     def _load_run(self, run: ResolvedRun, frame: FrameConfig, force_reload: bool) -> NativeRunProfile:
@@ -708,6 +964,76 @@ def _normalization_input_dict(runs: list[ResolvedRun]) -> dict[str, dict[str, st
         }
         for run in runs
     }
+
+
+def _require_matching_axis(reference: np.ndarray, candidate: np.ndarray, label: str) -> None:
+    reference = np.asarray(reference, dtype=np.float64)
+    candidate = np.asarray(candidate, dtype=np.float64)
+    if len(reference) != len(candidate) or not np.allclose(reference, candidate, rtol=1e-7, atol=1e-12):
+        raise ValueError(f"{label} TOF axis does not match the sample/OB frame axis.")
+
+
+def _apply_black_filter_background_to_profiles(
+    sample_counts: np.ndarray,
+    ob_counts: np.ndarray,
+    energy_eV: np.ndarray,
+    config: BlackFilterBackgroundConfig,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    shape = _load_black_filter_background_shape(config.shape_file)
+    sample_shape, sample_in_range = _evaluate_black_filter_background_shape(
+        energy_eV,
+        shape["energy"],
+        shape["sample"],
+    )
+    ob_shape, ob_in_range = _evaluate_black_filter_background_shape(
+        energy_eV,
+        shape["energy"],
+        shape["ob"],
+    )
+    anchor_index = int(np.nanargmin(np.abs(np.asarray(energy_eV) - config.anchor_energy_eV)))
+    if not (sample_in_range[anchor_index] and ob_in_range[anchor_index]):
+        raise ValueError(
+            "Black-filter background anchor is outside the fitted shape range for this frame: "
+            f"requested {config.anchor_energy_eV:g} eV, nearest measured bin "
+            f"{energy_eV[anchor_index]:g} eV."
+        )
+    sample_scale = float(sample_counts[anchor_index] / sample_shape[anchor_index])
+    ob_scale = float(ob_counts[anchor_index] / ob_shape[anchor_index])
+    corrected_sample = np.asarray(sample_counts, dtype=np.float64) - sample_scale * sample_shape
+    corrected_ob = np.asarray(ob_counts, dtype=np.float64) - ob_scale * ob_shape
+    return corrected_sample, corrected_ob, {
+        "anchor_energy_eV": float(energy_eV[anchor_index]),
+        "sample_scale": sample_scale,
+        "ob_scale": ob_scale,
+    }
+
+
+def load_integrated_image_preview(
+    data_path: str | os.PathLike[str],
+    max_images: int = 200,
+) -> tuple[np.ndarray, int, int]:
+    """Integrate an evenly sampled subset of a run for interactive ROI selection."""
+    tiffs = [Path(path) for path in retrieve_list_of_tif(str(data_path))]
+    if not tiffs:
+        raise FileNotFoundError(f"No TIFF files found in {data_path}")
+    max_images = max(1, int(max_images))
+    if len(tiffs) > max_images:
+        indices = np.unique(np.linspace(0, len(tiffs) - 1, max_images, dtype=int))
+        selected = [tiffs[index] for index in indices]
+    else:
+        selected = tiffs
+
+    def _load(path: Path) -> np.ndarray:
+        return np.asarray(imread(path), dtype=np.float64).swapaxes(0, 1)
+
+    integrated = None
+    with ThreadPoolExecutor(max_workers=min(len(selected), os.cpu_count() or 1, 8)) as executor:
+        for image in executor.map(_load, selected):
+            if integrated is None:
+                integrated = image
+            else:
+                integrated += image
+    return integrated, len(selected), len(tiffs)
 
 
 def _safe_name(value: str) -> str:

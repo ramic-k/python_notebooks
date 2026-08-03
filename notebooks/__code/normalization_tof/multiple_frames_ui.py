@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ import plotly.graph_objects as go
 from IPython.display import HTML, clear_output, display
 from plotly.subplots import make_subplots
 
+from __code.ipywe.fileselector import FileSelectorPanel
 from __code.normalization_tof import (
     DetectorType,
     RebinCustomBasis,
@@ -19,13 +21,16 @@ from __code.normalization_tof import (
     RebinMode,
 )
 from __code.normalization_tof.multiple_frames import (
+    BlackFilterBackgroundConfig,
     FrameConfig,
+    MeasuredBackgroundConfig,
     MultiFramePreviewEngine,
     MultiFrameRecipe,
     RebinConfig,
     RoiConfig,
     RunSpec,
     calculate_overlap_diagnostics,
+    load_integrated_image_preview,
     overlap_ratio_arrays,
     parse_run_numbers,
 )
@@ -46,9 +51,102 @@ def _layout(width: str = "220px") -> widgets.Layout:
     return widgets.Layout(width=width)
 
 
+def _show_full_descriptions(controls: list[widgets.Widget]) -> None:
+    for control in controls:
+        style = getattr(control, "style", None)
+        if style is not None and hasattr(style, "description_width"):
+            style.description_width = "initial"
+
+
+class RunInputEditor:
+    """Run-number input with an optional direct image-folder override."""
+
+    def __init__(
+        self,
+        label: str,
+        specs: tuple[RunSpec, ...],
+        working_dir: str,
+        on_change=None,
+    ):
+        self.label = label
+        self.working_dir = working_dir
+        self.runs = widgets.Text(
+            value=", ".join(run.run_number for run in specs),
+            description=f"{label} runs",
+            placeholder="19558 or 19419, 19447-19448",
+            layout=_layout("620px"),
+        )
+        direct_paths = [run.data_path for run in specs if run.data_path]
+        self.folders = widgets.Textarea(
+            value="\n".join(direct_paths),
+            description=f"{label} folders",
+            placeholder="Optional direct image folder; one folder per run",
+            layout=widgets.Layout(width="760px", height="70px"),
+        )
+        self.browse = widgets.Button(description=f"Browse {label} folders", icon="folder-open")
+        self.browser_output = widgets.Output()
+        self.browse.on_click(self._show_browser)
+        if on_change is not None:
+            self.runs.observe(on_change, names="value")
+            self.folders.observe(on_change, names="value")
+        _show_full_descriptions([self.runs, self.folders])
+        self.widget = widgets.VBox(
+            [
+                self.runs,
+                widgets.HBox([self.folders, self.browse]),
+                self.browser_output,
+            ]
+        )
+
+    @property
+    def value_widgets(self) -> list[widgets.Widget]:
+        return [self.runs, self.folders]
+
+    def specs(self) -> tuple[RunSpec, ...]:
+        run_numbers = parse_run_numbers(self.runs.value)
+        folders = [line.strip() for line in self.folders.value.splitlines() if line.strip()]
+        if not folders:
+            return tuple(RunSpec(run_number) for run_number in run_numbers)
+        if run_numbers and len(run_numbers) != len(folders):
+            raise ValueError(
+                f"{self.label}: provide one direct folder for each run number, or clear the run-number field."
+            )
+        if not run_numbers:
+            run_numbers = [_run_number_from_folder(folder) for folder in folders]
+            self.runs.value = ", ".join(run_numbers)
+        return tuple(
+            RunSpec(run_number=run_number, data_path=folder)
+            for run_number, folder in zip(run_numbers, folders, strict=True)
+        )
+
+    def _show_browser(self, _button) -> None:
+        with self.browser_output:
+            clear_output(wait=True)
+            folders = [line.strip() for line in self.folders.value.splitlines() if line.strip()]
+            start_dir = str(Path(folders[0]).parent) if folders else str(Path(self.working_dir) / "shared")
+            if not Path(start_dir).is_dir():
+                start_dir = self.working_dir
+            selector = FileSelectorPanel(
+                instruction=f"Select {self.label} image folder(s)",
+                start_dir=start_dir,
+                type="directory",
+                multiple=True,
+                next=self._folders_selected,
+            )
+            selector.show()
+            self._selector = selector
+
+    def _folders_selected(self, selected) -> None:
+        paths = selected if isinstance(selected, (list, tuple)) else [selected]
+        self.folders.value = "\n".join(str(Path(path)) for path in paths)
+        with self.browser_output:
+            clear_output(wait=True)
+
+
 class FrameEditor:
-    def __init__(self, config: FrameConfig, on_change=None):
+    def __init__(self, config: FrameConfig, working_dir: str, on_change=None):
         self.on_change = on_change
+        self.working_dir = working_dir
         self.enabled = widgets.Checkbox(value=config.enabled, description="Use frame", indent=False)
         self.name = widgets.Text(value=config.name, description="Name", layout=_layout("360px"))
         self.detector = widgets.Dropdown(
@@ -57,22 +155,65 @@ class FrameEditor:
             description="Detector",
             layout=_layout("520px"),
         )
-        self.sample_runs = widgets.Text(
-            value=", ".join(run.run_number for run in config.sample_runs),
-            description="Sample runs",
-            placeholder="19558 or 19419, 19447-19448",
-            layout=_layout("520px"),
+        self.sample_input = RunInputEditor("Sample", config.sample_runs, working_dir)
+        self.ob_input = RunInputEditor("OB", config.ob_runs, working_dir)
+        self.sample_runs = self.sample_input.runs
+        self.ob_runs = self.ob_input.runs
+        self.roi_left = widgets.BoundedIntText(
+            value=config.roi.left, min=0, max=10000, description="left", layout=_layout()
         )
-        self.ob_runs = widgets.Text(
-            value=", ".join(run.run_number for run in config.ob_runs),
-            description="OB runs",
-            placeholder="19559 or 19420, 19449",
-            layout=_layout("520px"),
+        self.roi_top = widgets.BoundedIntText(
+            value=config.roi.top, min=0, max=10000, description="top", layout=_layout()
         )
-        self.roi_left = widgets.BoundedIntText(value=config.roi.left, min=0, description="left", layout=_layout())
-        self.roi_top = widgets.BoundedIntText(value=config.roi.top, min=0, description="top", layout=_layout())
-        self.roi_width = widgets.BoundedIntText(value=config.roi.width, min=1, description="width", layout=_layout())
-        self.roi_height = widgets.BoundedIntText(value=config.roi.height, min=1, description="height", layout=_layout())
+        self.roi_width = widgets.BoundedIntText(
+            value=config.roi.width, min=1, max=10000, description="width", layout=_layout()
+        )
+        self.roi_height = widgets.BoundedIntText(
+            value=config.roi.height, min=1, max=10000, description="height", layout=_layout()
+        )
+        self.roi_preview_images = widgets.BoundedIntText(
+            value=200,
+            min=1,
+            max=5000,
+            description="Preview images",
+            layout=_layout("250px"),
+        )
+        self.roi_preview_button = widgets.Button(description="Preview/select ROI", icon="crop")
+        self.roi_preview_button.on_click(self._show_roi_selector)
+        self.roi_preview_output = widgets.Output()
+        container_roi = config.container_roi or RoiConfig(left=150, top=150, width=40, height=40)
+        self.container_enabled = widgets.Checkbox(
+            value=config.container_roi is not None or bool(config.container_roi_file),
+            description="Remove container signal",
+            indent=False,
+            layout=_layout("240px"),
+        )
+        self.container_mode = widgets.Dropdown(
+            options=["Container ROI values", "Saved container ROI file"],
+            value=("Saved container ROI file" if config.container_roi_file else "Container ROI values"),
+            description="Source",
+            layout=_layout("360px"),
+        )
+        self.container_left = widgets.BoundedIntText(
+            value=container_roi.left, min=0, max=10000, description="left", layout=_layout()
+        )
+        self.container_top = widgets.BoundedIntText(
+            value=container_roi.top, min=0, max=10000, description="top", layout=_layout()
+        )
+        self.container_width = widgets.BoundedIntText(
+            value=container_roi.width, min=1, max=10000, description="width", layout=_layout()
+        )
+        self.container_height = widgets.BoundedIntText(
+            value=container_roi.height, min=1, max=10000, description="height", layout=_layout()
+        )
+        self.container_file = widgets.Text(
+            value=config.container_roi_file or "",
+            description="ROI file",
+            layout=_layout("760px"),
+        )
+        self.container_file_browse = widgets.Button(description="Browse ROI file", icon="folder-open")
+        self.container_file_browse.on_click(self._show_container_file_browser)
+        self.container_file_browser_output = widgets.Output()
         self.distance = widgets.BoundedFloatText(
             value=config.distance_source_detector_m,
             min=0.001,
@@ -102,10 +243,122 @@ class FrameEditor:
             layout=_layout("250px"),
         )
         self.experimental_uncertainties = widgets.Checkbox(
-            value=config.use_experimental_uncertainties,
+            value=(
+                config.use_experimental_uncertainties
+                if config.detector_type != DetectorType.tpx3
+                else False
+            ),
             description="Experimental uncertainty model",
             indent=False,
             layout=_layout("280px"),
+        )
+        self.combine_sample_runs = widgets.Checkbox(
+            value=config.combine_sample_runs,
+            description="Combine sample runs",
+            indent=False,
+            layout=_layout("220px"),
+        )
+        self.correct_chips_alignment = widgets.Checkbox(
+            value=False if config.correct_chips_alignment is None else config.correct_chips_alignment,
+            description="Correct chip alignment",
+            disabled=True,
+            indent=False,
+            layout=_layout("220px"),
+        )
+        self.dc_input = RunInputEditor("Dark current", config.dc_runs, working_dir)
+        self.replace_ob_zeros = widgets.Checkbox(
+            value=bool(config.replace_ob_zeros_by_local_median),
+            description="Replace OB zeros by local median",
+            indent=False,
+            layout=_layout("290px"),
+        )
+        median_kernel = config.local_median_kernel or (3, 3, 1)
+        self.median_kernel_y = widgets.BoundedIntText(
+            value=median_kernel[0], min=1, description="kernel y", layout=_layout()
+        )
+        self.median_kernel_x = widgets.BoundedIntText(
+            value=median_kernel[1], min=1, description="kernel x", layout=_layout()
+        )
+        self.median_kernel_tof = widgets.BoundedIntText(
+            value=median_kernel[2], min=1, description="kernel TOF", layout=_layout()
+        )
+        self.median_iterations = widgets.BoundedIntText(
+            value=config.local_median_max_iterations or 2,
+            min=1,
+            description="max iterations",
+            layout=_layout("250px"),
+        )
+
+        black_filter = config.black_filter_background
+        self.black_filter_enabled = widgets.Checkbox(
+            value=black_filter.enabled,
+            description="Enable black-filter background correction",
+            indent=False,
+            layout=_layout("360px"),
+        )
+        self.black_filter_shape_file = widgets.Text(
+            value=black_filter.shape_file,
+            description="Shape CSV",
+            layout=_layout("820px"),
+        )
+        self.black_filter_anchor = widgets.BoundedFloatText(
+            value=black_filter.anchor_energy_eV,
+            min=0.0,
+            description="Anchor (eV)",
+            layout=_layout("250px"),
+        )
+
+        measured_by_key = {item.key: item for item in config.measured_backgrounds}
+        cd_background = measured_by_key.get(
+            "bragg_edge_cd",
+            MeasuredBackgroundConfig(key="bragg_edge_cd"),
+        )
+        self.cd_background_enabled = widgets.Checkbox(
+            value=cd_background.enabled,
+            description="Enable Cd-filter measured background",
+            indent=False,
+            layout=_layout("330px"),
+        )
+        self.cd_background_weight = widgets.FloatText(
+            value=cd_background.weight,
+            description="Weight",
+            layout=_layout("200px"),
+        )
+        self.cd_sample_input = RunInputEditor(
+            "Cd sample background",
+            cd_background.sample_runs,
+            working_dir,
+        )
+        self.cd_ob_input = RunInputEditor(
+            "Cd OB background",
+            cd_background.ob_runs,
+            working_dir,
+        )
+
+        closed_background = measured_by_key.get(
+            "closed_slits",
+            MeasuredBackgroundConfig(key="closed_slits"),
+        )
+        self.closed_background_enabled = widgets.Checkbox(
+            value=closed_background.enabled,
+            description="Enable closed-slits measured background",
+            indent=False,
+            layout=_layout("350px"),
+        )
+        self.closed_background_weight = widgets.FloatText(
+            value=closed_background.weight,
+            description="Weight",
+            layout=_layout("200px"),
+        )
+        self.closed_sample_input = RunInputEditor(
+            "Closed-slits sample background",
+            closed_background.sample_runs,
+            working_dir,
+        )
+        self.closed_ob_input = RunInputEditor(
+            "Closed-slits OB background",
+            closed_background.ob_runs,
+            working_dir,
         )
 
         rebin = config.rebin
@@ -118,10 +371,10 @@ class FrameEditor:
         self.delta_tof = widgets.FloatText(value=rebin.delta_tof_us or 30.0, description="delta TOF (us)")
         self.delta_lambda = widgets.FloatText(value=rebin.delta_lambda_a or 0.01, description="delta lambda (A)")
         self.delta_tof_relative = widgets.FloatText(
-            value=rebin.delta_tof_over_tof or 0.005, description="delta TOF / TOF"
+            value=rebin.delta_tof_over_tof or 0.01, description="delta TOF / TOF"
         )
         self.delta_lambda_relative = widgets.FloatText(
-            value=rebin.delta_lambda_over_lambda or 0.005, description="delta lambda / lambda"
+            value=rebin.delta_lambda_over_lambda or 0.01, description="delta lambda / lambda"
         )
         self.delta_lambda_squared = widgets.FloatText(
             value=rebin.delta_lambda_squared_a2 or 0.01, description="delta lambda^2 (A^2)"
@@ -137,7 +390,7 @@ class FrameEditor:
             description="Custom scale",
         )
         self.custom_schedule = widgets.Textarea(
-            value=_format_schedule(rebin.custom_schedule),
+            value=_format_schedule(rebin.custom_schedule) or "560, 70\n2700, 60\n5500, 50\n, 40",
             placeholder="560, 60\n2700, 60\n, 100",
             description="Schedule",
             layout=widgets.Layout(width="520px", height="120px"),
@@ -151,33 +404,148 @@ class FrameEditor:
 
         self.rebin_parameters = widgets.VBox()
         self.rebin_mode.observe(self._update_rebin_parameters, names="value")
+        self.custom_scale.observe(self._update_rebin_parameters, names="value")
         self.auto_detector_delay.observe(self._update_delay_state, names="value")
+        self.detector.observe(self._update_detector_state, names="value")
+        self.container_enabled.observe(self._update_container_state, names="value")
+        self.container_mode.observe(self._update_container_state, names="value")
+        self.replace_ob_zeros.observe(self._update_median_state, names="value")
+        self.black_filter_enabled.observe(self._update_background_state, names="value")
+        self.cd_background_enabled.observe(self._update_background_state, names="value")
+        self.closed_background_enabled.observe(self._update_background_state, names="value")
         self._update_rebin_parameters()
         self._update_delay_state()
+        self._update_detector_state()
+        self._update_median_state()
+        self._update_background_state()
 
         all_widgets = self._all_widgets()
+        _show_full_descriptions(all_widgets)
         if on_change is not None:
             for widget in all_widgets:
                 widget.observe(on_change, names="value")
 
-        roi_row = widgets.HBox([self.roi_left, self.roi_top, self.roi_width, self.roi_height])
-        axis_row = widgets.HBox([self.distance, self.detector_delay, self.auto_detector_delay, self.manual_tof])
-        flags_row = widgets.HBox([self.use_proton_charge, self.experimental_uncertainties])
-        rebin_flags = widgets.HBox([self.full_bins_only, self.snap_to_native])
+        wrapping_row = widgets.Layout(display="flex", flex_flow="row wrap", align_items="center")
+        roi_row = widgets.HBox(
+            [self.roi_left, self.roi_top, self.roi_width, self.roi_height],
+            layout=wrapping_row,
+        )
+        roi_preview_row = widgets.HBox(
+            [self.roi_preview_images, self.roi_preview_button],
+            layout=wrapping_row,
+        )
+        axis_row = widgets.HBox(
+            [self.distance, self.detector_delay, self.auto_detector_delay, self.manual_tof],
+            layout=wrapping_row,
+        )
+        flags_row = widgets.HBox(
+            [
+                self.use_proton_charge,
+                self.experimental_uncertainties,
+                self.combine_sample_runs,
+                self.correct_chips_alignment,
+            ],
+            layout=wrapping_row,
+        )
+        rebin_flags = widgets.HBox(
+            [self.full_bins_only, self.snap_to_native],
+            layout=wrapping_row,
+        )
+        median_box = widgets.VBox(
+            [
+                self.replace_ob_zeros,
+                widgets.HBox(
+                    [
+                        self.median_kernel_y,
+                        self.median_kernel_x,
+                        self.median_kernel_tof,
+                        self.median_iterations,
+                    ],
+                    layout=wrapping_row,
+                ),
+            ]
+        )
+        self.container_roi_box = widgets.HBox(
+            [
+                self.container_left,
+                self.container_top,
+                self.container_width,
+                self.container_height,
+            ],
+            layout=wrapping_row,
+        )
+        self.container_file_box = widgets.VBox(
+            [
+                widgets.HBox([self.container_file, self.container_file_browse], layout=wrapping_row),
+                self.container_file_browser_output,
+            ]
+        )
+        self._update_container_state()
+        container_box = widgets.VBox(
+            [
+                self.container_enabled,
+                self.container_mode,
+                self.container_roi_box,
+                self.container_file_box,
+            ]
+        )
+        black_filter_box = widgets.VBox(
+            [
+                self.black_filter_enabled,
+                self.black_filter_shape_file,
+                self.black_filter_anchor,
+            ]
+        )
+        self.cd_background_box = widgets.VBox(
+            [
+                widgets.HBox(
+                    [self.cd_background_enabled, self.cd_background_weight],
+                    layout=wrapping_row,
+                ),
+                self.cd_sample_input.widget,
+                self.cd_ob_input.widget,
+            ]
+        )
+        self.closed_background_box = widgets.VBox(
+            [
+                widgets.HBox(
+                    [self.closed_background_enabled, self.closed_background_weight],
+                    layout=wrapping_row,
+                ),
+                self.closed_sample_input.widget,
+                self.closed_ob_input.widget,
+            ]
+        )
+        corrections = widgets.Accordion(
+            children=[
+                widgets.VBox([flags_row, self.dc_input.widget]),
+                widgets.VBox([black_filter_box, self.cd_background_box, self.closed_background_box]),
+                median_box,
+                container_box,
+            ],
+            selected_index=None,
+        )
+        corrections.set_title(0, "Normalization and dark current")
+        corrections.set_title(1, "Background corrections")
+        corrections.set_title(2, "OB zero handling")
+        corrections.set_title(3, "Container correction")
         self.widget = widgets.VBox(
             [
                 widgets.HBox([self.enabled, self.name]),
                 self.detector,
-                self.sample_runs,
-                self.ob_runs,
+                self.sample_input.widget,
+                self.ob_input.widget,
                 widgets.HTML("<b>ROI</b>"),
                 roi_row,
+                roi_preview_row,
+                self.roi_preview_output,
                 axis_row,
-                flags_row,
                 widgets.HTML("<b>Proposed rebinning</b>"),
                 self.rebin_mode,
                 self.rebin_parameters,
                 rebin_flags,
+                widgets.HTML("<b>Corrections and normalization options</b>"),
+                corrections,
             ],
             layout=widgets.Layout(border="1px solid #bbb", padding="8px", margin="0 0 8px 0"),
         )
@@ -187,18 +555,44 @@ class FrameEditor:
             self.enabled,
             self.name,
             self.detector,
-            self.sample_runs,
-            self.ob_runs,
+            *self.sample_input.value_widgets,
+            *self.ob_input.value_widgets,
             self.roi_left,
             self.roi_top,
             self.roi_width,
             self.roi_height,
+            self.container_enabled,
+            self.container_mode,
+            self.container_left,
+            self.container_top,
+            self.container_width,
+            self.container_height,
+            self.container_file,
             self.distance,
             self.detector_delay,
             self.auto_detector_delay,
             self.manual_tof,
             self.use_proton_charge,
             self.experimental_uncertainties,
+            self.combine_sample_runs,
+            self.correct_chips_alignment,
+            *self.dc_input.value_widgets,
+            self.replace_ob_zeros,
+            self.median_kernel_y,
+            self.median_kernel_x,
+            self.median_kernel_tof,
+            self.median_iterations,
+            self.black_filter_enabled,
+            self.black_filter_shape_file,
+            self.black_filter_anchor,
+            self.cd_background_enabled,
+            self.cd_background_weight,
+            *self.cd_sample_input.value_widgets,
+            *self.cd_ob_input.value_widgets,
+            self.closed_background_enabled,
+            self.closed_background_weight,
+            *self.closed_sample_input.value_widgets,
+            *self.closed_ob_input.value_widgets,
             self.rebin_mode,
             self.delta_tof,
             self.delta_lambda,
@@ -214,6 +608,45 @@ class FrameEditor:
 
     def _update_delay_state(self, _change=None) -> None:
         self.detector_delay.disabled = self.auto_detector_delay.value
+
+    def _update_detector_state(self, change=None) -> None:
+        is_tpx3 = self.detector.value == DetectorType.tpx3
+        self.experimental_uncertainties.disabled = is_tpx3
+        if is_tpx3:
+            self.experimental_uncertainties.value = False
+        elif change is not None:
+            self.experimental_uncertainties.value = True
+
+    def _update_container_state(self, _change=None) -> None:
+        enabled = self.container_enabled.value
+        self.container_mode.disabled = not enabled
+        use_file = enabled and self.container_mode.value == "Saved container ROI file"
+        self.container_roi_box.layout.display = "none" if not enabled or use_file else None
+        self.container_file_box.layout.display = None if use_file else "none"
+
+    def _update_median_state(self, _change=None) -> None:
+        disabled = not self.replace_ob_zeros.value
+        for widget in (
+            self.median_kernel_y,
+            self.median_kernel_x,
+            self.median_kernel_tof,
+            self.median_iterations,
+        ):
+            widget.disabled = disabled
+
+    def _update_background_state(self, _change=None) -> None:
+        self.black_filter_shape_file.disabled = not self.black_filter_enabled.value
+        self.black_filter_anchor.disabled = not self.black_filter_enabled.value
+        self.cd_background_weight.disabled = not self.cd_background_enabled.value
+        self.closed_background_weight.disabled = not self.closed_background_enabled.value
+        self.cd_sample_input.widget.layout.display = None if self.cd_background_enabled.value else "none"
+        self.cd_ob_input.widget.layout.display = None if self.cd_background_enabled.value else "none"
+        self.closed_sample_input.widget.layout.display = (
+            None if self.closed_background_enabled.value else "none"
+        )
+        self.closed_ob_input.widget.layout.display = (
+            None if self.closed_background_enabled.value else "none"
+        )
 
     def _update_rebin_parameters(self, _change=None) -> None:
         controls: list[widgets.Widget]
@@ -233,10 +666,159 @@ class FrameEditor:
         else:
             controls = [widgets.HTML("Native TOF bins will be used.")]
         self.rebin_parameters.children = tuple(controls)
+        rebin_enabled = mode != RebinMode.none
+        self.full_bins_only.disabled = not rebin_enabled
+        fixed_width_mode = mode in (RebinMode.linear_tof, RebinMode.linear_lambda)
+        custom_fixed_width = (
+            mode == RebinMode.custom_schedule and self.custom_scale.value == RebinCustomScale.linear
+        )
+        self.snap_to_native.disabled = not (fixed_width_mode or custom_fixed_width)
+
+    def _show_roi_selector(self, _button) -> None:
+        self.roi_preview_button.disabled = True
+        with self.roi_preview_output:
+            clear_output(wait=True)
+            display(HTML("Resolving the first sample run and integrating the ROI preview..."))
+        try:
+            sample_specs = self.sample_input.specs()
+            if not sample_specs:
+                raise ValueError("Enter or select at least one sample run first.")
+            resolver = MultiFramePreviewEngine(
+                MultiFrameRecipe(working_dir=self.working_dir, frames=[])
+            )
+            run = resolver.resolve_run(sample_specs[0], self.detector.value)
+            integrated, selected_count, total_count = load_integrated_image_preview(
+                run.data_path,
+                max_images=self.roi_preview_images.value,
+            )
+            if integrated is None or integrated.ndim != 2:
+                raise ValueError("The integrated sample preview is not a two-dimensional image.")
+            if not np.any(np.isfinite(integrated)):
+                raise ValueError("The integrated sample preview contains no finite values.")
+
+            image_height, image_width = integrated.shape
+            left = min(max(int(self.roi_left.value), 0), image_width - 1)
+            top = min(max(int(self.roi_top.value), 0), image_height - 1)
+            right = min(max(left + int(self.roi_width.value), left + 1), image_width)
+            bottom = min(max(top + int(self.roi_height.value), top + 1), image_height)
+            finite_values = integrated[np.isfinite(integrated)]
+            intensity_max = max(1, int(np.ceil(np.max(finite_values))))
+
+            intensity = widgets.IntRangeSlider(
+                value=(0, intensity_max),
+                min=0,
+                max=intensity_max,
+                step=1,
+                description="Intensity",
+                continuous_update=False,
+                layout=widgets.Layout(width="780px"),
+            )
+            left_right = widgets.IntRangeSlider(
+                value=(left, right),
+                min=0,
+                max=image_width,
+                step=1,
+                description="left/right",
+                continuous_update=False,
+                layout=widgets.Layout(width="780px"),
+            )
+            top_bottom = widgets.IntRangeSlider(
+                value=(top, bottom),
+                min=0,
+                max=image_height,
+                step=1,
+                description="top/bottom",
+                continuous_update=False,
+                layout=widgets.Layout(width="780px"),
+            )
+            plot_output = widgets.Output()
+
+            def update_roi_plot(_change=None) -> None:
+                selected_left, selected_right = (int(value) for value in left_right.value)
+                selected_top, selected_bottom = (int(value) for value in top_bottom.value)
+                if selected_right <= selected_left or selected_bottom <= selected_top:
+                    return
+                self.roi_left.value = selected_left
+                self.roi_top.value = selected_top
+                self.roi_width.value = selected_right - selected_left
+                self.roi_height.value = selected_bottom - selected_top
+                figure = go.Figure(
+                    go.Heatmap(
+                        z=integrated,
+                        colorscale="Viridis",
+                        zmin=intensity.value[0],
+                        zmax=intensity.value[1],
+                        colorbar=dict(title="Integrated counts"),
+                    )
+                )
+                figure.add_shape(
+                    type="rect",
+                    x0=selected_left,
+                    y0=selected_top,
+                    x1=selected_right,
+                    y1=selected_bottom,
+                    line=dict(color="red", width=2),
+                    fillcolor="rgba(0,0,0,0)",
+                )
+                figure.update_layout(
+                    template="plotly_white",
+                    title=f"{self.name.value or 'frame'}: select ROI",
+                    width=820,
+                    height=760,
+                    yaxis=dict(autorange="reversed", scaleanchor="x", scaleratio=1),
+                    margin=dict(l=55, r=40, t=65, b=50),
+                )
+                with plot_output:
+                    clear_output(wait=True)
+                    figure.show()
+
+            for slider in (intensity, left_right, top_bottom):
+                slider.observe(update_roi_plot, names="value")
+
+            with self.roi_preview_output:
+                clear_output(wait=True)
+                display(
+                    HTML(
+                        f"Preview source: <code>{_escape(run.data_path)}</code><br>"
+                        f"Integrated {selected_count} evenly sampled TIFFs out of {total_count}. "
+                        "The ROI fields above update when the sliders are released."
+                    )
+                )
+                display(widgets.VBox([intensity, left_right, top_bottom, plot_output]))
+            update_roi_plot()
+        except Exception as error:
+            with self.roi_preview_output:
+                clear_output(wait=True)
+                display(HTML(f"<span style='color:#b00020'><b>ROI preview failed:</b> {_escape(error)}</span>"))
+        finally:
+            self.roi_preview_button.disabled = False
+
+    def _show_container_file_browser(self, _button) -> None:
+        with self.container_file_browser_output:
+            clear_output(wait=True)
+            current = self.container_file.value.strip()
+            start_dir = str(Path(current).parent) if current else str(Path(self.working_dir) / "shared")
+            if not Path(start_dir).is_dir():
+                start_dir = self.working_dir
+            selector = FileSelectorPanel(
+                instruction="Select a saved container ROI file",
+                start_dir=start_dir,
+                type="file",
+                multiple=False,
+                next=self._container_file_selected,
+            )
+            selector.show()
+            self._container_selector = selector
+
+    def _container_file_selected(self, selected) -> None:
+        self.container_file.value = str(Path(selected))
+        with self.container_file_browser_output:
+            clear_output(wait=True)
 
     def to_config(self) -> FrameConfig:
-        sample = tuple(RunSpec(run) for run in parse_run_numbers(self.sample_runs.value))
-        ob = tuple(RunSpec(run) for run in parse_run_numbers(self.ob_runs.value))
+        sample = self.sample_input.specs()
+        ob = self.ob_input.specs()
+        dc = self.dc_input.specs()
         mode = self.rebin_mode.value
         rebin = RebinConfig(
             mode=mode,
@@ -260,11 +842,27 @@ class FrameEditor:
             detector_type=self.detector.value,
             sample_runs=sample,
             ob_runs=ob,
+            dc_runs=dc,
             roi=RoiConfig(
                 left=self.roi_left.value,
                 top=self.roi_top.value,
                 width=self.roi_width.value,
                 height=self.roi_height.value,
+            ),
+            container_roi=(
+                RoiConfig(
+                    left=self.container_left.value,
+                    top=self.container_top.value,
+                    width=self.container_width.value,
+                    height=self.container_height.value,
+                )
+                if self.container_enabled.value and self.container_mode.value == "Container ROI values"
+                else None
+            ),
+            container_roi_file=(
+                self.container_file.value.strip()
+                if self.container_enabled.value and self.container_mode.value == "Saved container ROI file"
+                else None
             ),
             rebin=rebin,
             distance_source_detector_m=self.distance.value,
@@ -272,6 +870,36 @@ class FrameEditor:
             manual_tof_bin_size_ns=self.manual_tof.value if self.manual_tof.value > 0 else None,
             use_proton_charge=self.use_proton_charge.value,
             use_experimental_uncertainties=self.experimental_uncertainties.value,
+            combine_sample_runs=self.combine_sample_runs.value,
+            correct_chips_alignment=self.correct_chips_alignment.value,
+            replace_ob_zeros_by_local_median=self.replace_ob_zeros.value,
+            local_median_kernel=(
+                self.median_kernel_y.value,
+                self.median_kernel_x.value,
+                self.median_kernel_tof.value,
+            ),
+            local_median_max_iterations=self.median_iterations.value,
+            black_filter_background=BlackFilterBackgroundConfig(
+                enabled=self.black_filter_enabled.value,
+                shape_file=self.black_filter_shape_file.value.strip(),
+                anchor_energy_eV=self.black_filter_anchor.value,
+            ),
+            measured_backgrounds=(
+                MeasuredBackgroundConfig(
+                    key="bragg_edge_cd",
+                    enabled=self.cd_background_enabled.value,
+                    sample_runs=self.cd_sample_input.specs(),
+                    ob_runs=self.cd_ob_input.specs(),
+                    weight=self.cd_background_weight.value,
+                ),
+                MeasuredBackgroundConfig(
+                    key="closed_slits",
+                    enabled=self.closed_background_enabled.value,
+                    sample_runs=self.closed_sample_input.specs(),
+                    ob_runs=self.closed_ob_input.specs(),
+                    weight=self.closed_background_weight.value,
+                ),
+            ),
             enabled=self.enabled.value,
         )
 
@@ -324,15 +952,28 @@ class MultiFrameNormalizationTof:
         self.loaded_frame_configs: dict[str, FrameConfig] = {}
         self.frame_editors: list[FrameEditor] = []
 
+        _show_full_descriptions(
+            [
+                self.output_root,
+                self.cache_dir,
+                self.recipe_file,
+                self.overlap_min,
+                self.overlap_max,
+                self.reference,
+                self.comparison,
+            ]
+        )
+
         initial_frames = frames if frames is not None else _default_frames()
         self._set_frames(initial_frames)
         self._wire_events()
         self._update_run_button()
 
     def display(self) -> None:
+        wrapping_row = widgets.Layout(display="flex", flex_flow="row wrap", align_items="center")
         header = widgets.VBox(
             [
-                widgets.HBox([self.add_frame_button, self.remove_frame_button]),
+                widgets.HBox([self.add_frame_button, self.remove_frame_button], layout=wrapping_row),
                 self.output_root,
                 self.cache_dir,
                 self.recipe_file,
@@ -341,12 +982,15 @@ class MultiFrameNormalizationTof:
         )
         overlap_controls = widgets.VBox(
             [
-                widgets.HBox([self.reference, self.comparison, self.overlap_min, self.overlap_max]),
-                widgets.HBox([self.show_native, self.show_errors, self.force_reload]),
-                widgets.HBox([self.preview_button, self.replot_button]),
+                widgets.HBox(
+                    [self.reference, self.comparison, self.overlap_min, self.overlap_max],
+                    layout=wrapping_row,
+                ),
+                widgets.HBox([self.show_native, self.show_errors, self.force_reload], layout=wrapping_row),
+                widgets.HBox([self.preview_button, self.replot_button], layout=wrapping_row),
             ]
         )
-        full_run_controls = widgets.HBox([self.arm_full_run, self.run_button])
+        full_run_controls = widgets.HBox([self.arm_full_run, self.run_button], layout=wrapping_row)
         display(
             widgets.VBox(
                 [
@@ -390,7 +1034,10 @@ class MultiFrameNormalizationTof:
         self.show_errors.observe(self._plot_setting_changed, names="value")
 
     def _set_frames(self, frames: list[FrameConfig]) -> None:
-        self.frame_editors = [FrameEditor(frame, on_change=self._frame_changed) for frame in frames]
+        self.frame_editors = [
+            FrameEditor(frame, self.working_dir, on_change=self._frame_changed)
+            for frame in frames
+        ]
         self.frame_box.children = tuple(editor.widget for editor in self.frame_editors)
         for index, editor in enumerate(self.frame_editors):
             self.frame_box.set_title(index, editor.name.value or f"frame {index + 1}")
@@ -481,6 +1128,7 @@ class MultiFrameNormalizationTof:
             preview = self.engine.previews[frame.name]
             native = preview.native
             warning = "<br>".join(_escape(item) for item in native.warnings) or "none"
+            corrections = "<br>".join(_escape(item) for item in native.corrections_applied) or "none"
             rows.append(
                 "<tr>"
                 f"<td>{_escape(frame.name)}</td>"
@@ -488,6 +1136,7 @@ class MultiFrameNormalizationTof:
                 f"<td>{len(preview.tof_s)}</td>"
                 f"<td>{native.sample_total_proton_charge_c or 'not used'}</td>"
                 f"<td>{native.ob_total_proton_charge_c or 'not used'}</td>"
+                f"<td>{corrections}</td>"
                 f"<td>{warning}</td>"
                 "</tr>"
             )
@@ -495,7 +1144,8 @@ class MultiFrameNormalizationTof:
             HTML(
                 "<table style='border-collapse:collapse' border='1' cellpadding='5'>"
                 "<tr><th>Frame</th><th>Native bins</th><th>Preview bins</th>"
-                "<th>Sample charge (C)</th><th>OB charge (C)</th><th>Warnings</th></tr>"
+                "<th>Sample charge (C)</th><th>OB charge (C)</th>"
+                "<th>Corrections in preview</th><th>Warnings</th></tr>"
                 + "".join(rows)
                 + "</table>"
             )
@@ -714,6 +1364,16 @@ def _parse_schedule(text: str) -> list[tuple[float | None, float]]:
     if not schedule:
         raise ValueError("Custom schedule needs at least one segment.")
     return schedule
+
+
+def _run_number_from_folder(folder: str) -> str:
+    match = re.search(r"run[_-]?(\d+)", str(folder), flags=re.IGNORECASE)
+    if match is None:
+        raise ValueError(
+            f"Could not infer a run number from direct folder {folder!r}. "
+            "Enter the matching run number in the run-number field."
+        )
+    return match.group(1)
 
 
 def _empty_frame(name: str, detector_type: str) -> FrameConfig:
