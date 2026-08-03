@@ -36,7 +36,10 @@ from __code.normalization_tof.multiple_frames_ui import (
     RunInputEditor,
     _empty_frame,
 )
-from __code.normalization_tof.utilities import calculate_detector_corrected_variance
+from __code.normalization_tof.utilities import (
+    calculate_detector_corrected_variance,
+    perform_spectrum_normalization,
+)
 
 
 def _write_run(root: Path, run_number: str, frames: list[np.ndarray], charge_c: float = 1.0):
@@ -68,6 +71,7 @@ def _frame(
     ob: list[tuple[str, Path, Path]],
     roi: RoiConfig,
     rebin: RebinConfig | None = None,
+    ob_roi: RoiConfig | None = None,
 ):
     def specs(values):
         return tuple(
@@ -81,6 +85,7 @@ def _frame(
         sample_runs=specs(sample),
         ob_runs=specs(ob),
         roi=roi,
+        ob_roi=ob_roi,
         rebin=rebin or RebinConfig(),
         use_experimental_uncertainties=False,
     )
@@ -94,6 +99,7 @@ def test_run_parser_and_recipe_round_trip(tmp_path):
         sample_runs=(RunSpec("19477"),),
         ob_runs=(RunSpec("19478"),),
         roi=RoiConfig(left=52, top=62, width=411, height=401),
+        ob_roi=RoiConfig(left=53, top=63, width=410, height=400),
         black_filter_background=BlackFilterBackgroundConfig(
             enabled=False,
             shape_file="/tmp/background.csv",
@@ -110,10 +116,13 @@ def test_run_parser_and_recipe_round_trip(tmp_path):
         frames=[frame],
         output_root=str(tmp_path),
         cache_dir=str(tmp_path / "cache"),
+        same_rois_all_frames=True,
     )
     recipe_path = recipe.save(tmp_path / "recipe.json")
     loaded = MultiFrameRecipe.load(recipe_path)
     assert loaded == recipe
+    assert loaded.frames[0].effective_ob_roi() == RoiConfig(left=53, top=63, width=410, height=400)
+    assert loaded.same_rois_all_frames is True
     assert json.loads(recipe_path.read_text())["recipe_version"] == 1
 
 
@@ -126,6 +135,12 @@ def test_new_frame_defaults_match_single_frame_notebook():
     assert editor.roi_top.value == 156
     assert editor.roi_width.value == 200
     assert editor.roi_height.value == 200
+    assert editor.ob_roi_linked.value is True
+    assert editor.ob_roi_left.value == 156
+    assert editor.ob_roi_top.value == 156
+    assert editor.ob_roi_width.value == 200
+    assert editor.ob_roi_height.value == 200
+    assert editor.ob_roi_left.disabled is True
     assert editor.rebin_mode.value == RebinMode.none
     assert editor.delta_tof.value == 30.0
     assert editor.delta_lambda.value == 0.01
@@ -152,7 +167,8 @@ def test_new_frame_defaults_match_single_frame_notebook():
     assert editor.roi_preview_row.layout.display == "flex"
     assert editor.axis_row.layout.display == "flex"
     assert editor.rebin_flags_row.layout.display == "flex"
-    assert editor.roi_preview_button.description == "Preview/select ROI"
+    assert editor.roi_preview_button.description == "Preview/select sample ROI"
+    assert editor.ob_roi_preview_button.description == "Preview/select OB ROI"
     assert recipe.export_mode == {
         "sample_stack": False,
         "ob_stack": False,
@@ -170,6 +186,44 @@ def test_new_frame_defaults_match_single_frame_notebook():
     editor.detector.value = DetectorType.tpx1
     assert editor.experimental_uncertainties.value is True
     assert editor.experimental_uncertainties.disabled is False
+
+
+def test_ob_roi_can_be_unlinked_and_saved_independently():
+    frame = _empty_frame("frame", DetectorType.tpx1)
+    editor = FrameEditor(frame, "/SNS/VENUS/IPTS-36914")
+
+    editor.ob_roi_linked.value = False
+    editor.ob_roi_left.value = 188
+    editor.ob_roi_top.value = 198
+    editor.ob_roi_width.value = 135
+    editor.ob_roi_height.value = 131
+
+    config = editor.to_config()
+    assert config.roi == RoiConfig(left=156, top=156, width=200, height=200)
+    assert config.ob_roi == RoiConfig(left=188, top=198, width=135, height=131)
+    assert editor.ob_roi_left.disabled is False
+
+
+def test_same_rois_all_frames_propagates_both_sample_and_ob_values():
+    planner = MultiFrameNormalizationTof(
+        working_dir="/SNS/VENUS/IPTS-36914",
+        frames=[_empty_frame("first", DetectorType.tpx1), _empty_frame("second", DetectorType.tpx1)],
+    )
+    planner.same_rois_all_frames.value = True
+    source, target = planner.frame_editors
+
+    source.roi_left.value = 47
+    source.roi_top.value = 36
+    source.ob_roi_linked.value = False
+    source.ob_roi_left.value = 52
+    source.ob_roi_top.value = 62
+
+    assert target.roi_left.value == 47
+    assert target.roi_top.value == 36
+    assert target.ob_roi_linked.value is False
+    assert target.ob_roi_left.value == 52
+    assert target.ob_roi_top.value == 62
+    assert planner.recipe().same_rois_all_frames is True
 
 
 def test_direct_folder_override_can_infer_run_number(tmp_path):
@@ -219,6 +273,77 @@ def test_roi_profile_matches_production_transposed_orientation(tmp_path):
     np.testing.assert_allclose(profile.counts, expected)
     np.testing.assert_allclose(profile.variance, expected)
     assert profile.proton_charge_c == 2.0
+
+
+def test_frame_preview_uses_distinct_sample_and_ob_rois(tmp_path):
+    sample_frames = [
+        np.asarray([[10, 20], [30, 40]], dtype=np.uint16),
+        np.asarray([[20, 30], [40, 50]], dtype=np.uint16),
+    ]
+    ob_frames = [
+        np.asarray([[1, 2], [5, 6]], dtype=np.uint16),
+        np.asarray([[2, 3], [10, 12]], dtype=np.uint16),
+    ]
+    sample_path, sample_nexus = _write_run(tmp_path, "701", sample_frames)
+    ob_path, ob_nexus = _write_run(tmp_path, "702", ob_frames)
+    frame = _frame(
+        "frame",
+        [("701", sample_path, sample_nexus)],
+        [("702", ob_path, ob_nexus)],
+        RoiConfig(left=0, top=0, width=1, height=1),
+        ob_roi=RoiConfig(left=1, top=0, width=1, height=1),
+    )
+    recipe = MultiFrameRecipe(
+        working_dir=str(tmp_path),
+        frames=[frame],
+        cache_dir=str(tmp_path / "cache"),
+    )
+
+    profile = MultiFramePreviewEngine(recipe).load_frame(frame)
+    np.testing.assert_allclose(profile.sample_counts, [10.0, 20.0])
+    np.testing.assert_allclose(profile.ob_counts, [5.0, 10.0])
+    np.testing.assert_allclose(profile.transmission, [2.0, 2.0])
+
+
+def test_spectrum_normalization_uses_distinct_dc_rois_and_covariance():
+    sample_data = np.asarray([[[10.0, 0.0], [0.0, 0.0]]])
+    sample_variance = np.asarray([[[10.0, 0.0], [0.0, 0.0]]])
+    dc_data = np.asarray([[[1.0, 2.0], [0.0, 0.0]]])
+    dc_variance = dc_data.copy()
+
+    result = perform_spectrum_normalization(
+        sample_roi=RoiConfig(left=0, top=0, width=1, height=1),
+        ob_roi=RoiConfig(left=1, top=0, width=1, height=1),
+        sample_data=sample_data,
+        sample_variance=sample_variance,
+        ob_data_combined_for_spectrum=np.asarray([5.0]),
+        ob_data_combined_variance_for_spectrum=np.asarray([5.0]),
+        dc_data_combined=dc_data,
+        dc_data_combined_variance=dc_variance,
+    )
+
+    np.testing.assert_allclose(result["sample_dc_roi_counts"], [1.0])
+    np.testing.assert_allclose(result["ob_dc_roi_counts"], [2.0])
+    np.testing.assert_allclose(result["spectrum_normalization"], [3.0])
+    np.testing.assert_allclose(result["spectrum_normalization_uncertainty"] ** 2, [74.0 / 9.0])
+
+
+def test_spectrum_normalization_preserves_legacy_same_roi_dc_uncertainty():
+    result = perform_spectrum_normalization(
+        roi=RoiConfig(left=0, top=0, width=1, height=1),
+        sample_data=np.asarray([[[10.0]]]),
+        sample_variance=np.asarray([[[10.0]]]),
+        ob_data_combined_for_spectrum=np.asarray([5.0]),
+        ob_data_combined_variance_for_spectrum=np.asarray([5.0]),
+        dc_data_combined=np.asarray([[[1.0]]]),
+        dc_data_combined_variance=np.asarray([[[1.0]]]),
+    )
+
+    np.testing.assert_allclose(result["spectrum_normalization"], [2.25])
+    np.testing.assert_allclose(
+        result["spectrum_normalization_uncertainty"] ** 2,
+        [2.3046875],
+    )
 
 
 def test_streamed_experimental_variance_matches_production_roi_result(tmp_path):
@@ -392,7 +517,7 @@ def _preview(name, energy, transmission, uncertainty):
     )
 
 
-def test_draw_plot_creates_adjacent_overlap_panel_for_every_selected_frame(monkeypatch):
+def test_draw_plot_splits_transmission_and_each_adjacent_overlap(monkeypatch):
     ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
     ui.show_native.value = False
     names = list(ui.inspect_frames.value)
@@ -410,10 +535,13 @@ def test_draw_plot_creates_adjacent_overlap_panel_for_every_selected_frame(monke
     monkeypatch.setattr(go.Figure, "show", lambda figure: captured.append(figure))
     ui._draw_plot()
 
-    assert len(captured) == 1
-    figure = captured[0]
-    assert len(figure.data) == 2 * len(names) - 1
-    assert figure.layout.yaxis5.title.text == "Ratio"
+    assert len(captured) == len(names)
+    transmission_figure, *overlap_figures = captured
+    assert len(transmission_figure.data) == len(names)
+    assert transmission_figure.layout.yaxis.title.text == "Transmission"
+    assert len(overlap_figures) == len(names) - 1
+    assert all(len(figure.data) == 1 for figure in overlap_figures)
+    assert all(figure.layout.yaxis.title.text == "Ratio" for figure in overlap_figures)
 
 
 def test_overlap_diagnostic_reports_scale_without_applying_it():
@@ -434,7 +562,8 @@ def test_full_normalization_uses_separate_campaign_folders_and_snapshot(tmp_path
         [("105", sample_path, sample_nexus)],
         [("106", ob_path, ob_nexus)],
         RoiConfig(left=0, top=0, width=2, height=2),
-        RebinConfig(mode=RebinMode.none),
+        rebin=RebinConfig(mode=RebinMode.none),
+        ob_roi=RoiConfig(left=1, top=0, width=1, height=2),
     )
     output_root = tmp_path / "output"
     recipe = MultiFrameRecipe(
@@ -459,6 +588,9 @@ def test_full_normalization_uses_separate_campaign_folders_and_snapshot(tmp_path
     assert len(calls) == 1
     assert calls[0]["output_folder"] == str(campaign / "6.3_A")
     assert calls[0]["roi"].width == 2
+    assert calls[0]["sample_roi"].width == 2
+    assert calls[0]["ob_roi"].left == 1
+    assert calls[0]["ob_roi"].width == 1
     assert calls[0]["combine_samples"] is False
     assert calls[0]["correct_chips_alignment_flag"] is False
     assert calls[0]["replace_ob_zeros_by_local_median_flag"] is False

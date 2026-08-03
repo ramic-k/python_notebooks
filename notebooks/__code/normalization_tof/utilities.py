@@ -1005,6 +1005,21 @@ def calculate_roi_profile(data=None, roi=None):
     )
 
 
+def calculate_roi_intersection_profile(data=None, first_roi=None, second_roi=None):
+    if data is None or first_roi is None or second_roi is None:
+        return None
+    left = max(first_roi.left, second_roi.left)
+    top = max(first_roi.top, second_roi.top)
+    right = min(first_roi.left + first_roi.width, second_roi.left + second_roi.width)
+    bottom = min(first_roi.top + first_roi.height, second_roi.top + second_roi.height)
+    if right <= left or bottom <= top:
+        return np.zeros(np.asarray(data).shape[0], dtype=np.float64)
+    return calculate_roi_profile(
+        data=data,
+        roi=Roi(left=left, top=top, width=right - left, height=bottom - top),
+    )
+
+
 def _load_black_filter_background_shape(background_shape_file: str) -> dict:
     if not background_shape_file:
         raise ValueError("Black-filter background correction requires a background shape CSV file.")
@@ -1075,6 +1090,8 @@ def _evaluate_black_filter_background_shape(
 
 def calculate_black_filter_background_corrected_spectrum(
     roi=None,
+    sample_roi=None,
+    ob_roi=None,
     sample_data=None,
     sample_variance=None,
     ob_data_combined=None,
@@ -1094,7 +1111,9 @@ def calculate_black_filter_background_corrected_spectrum(
     variance. The fitted background shape and single-bin scale factors are treated
     as exact model inputs.
     """
-    if roi is None:
+    sample_roi = sample_roi or roi
+    ob_roi = ob_roi or sample_roi
+    if sample_roi is None:
         raise ValueError("Black-filter background correction requires a ROI.")
     if sample_data is None or ob_data_combined is None:
         raise ValueError("Black-filter background correction requires sample and OB data.")
@@ -1102,8 +1121,8 @@ def calculate_black_filter_background_corrected_spectrum(
         raise ValueError("Black-filter background correction requires an energy axis.")
 
     measured_energy = np.asarray(energy_array, dtype=np.float64)
-    sample_roi_counts = calculate_roi_profile(data=sample_data, roi=roi)
-    ob_roi_counts = calculate_roi_profile(data=ob_data_combined, roi=roi)
+    sample_roi_counts = calculate_roi_profile(data=sample_data, roi=sample_roi)
+    ob_roi_counts = calculate_roi_profile(data=ob_data_combined, roi=ob_roi)
     if sample_roi_counts is None or ob_roi_counts is None:
         raise ValueError("Unable to compute ROI counts for black-filter background correction.")
     if len(measured_energy) != len(sample_roi_counts):
@@ -1114,12 +1133,12 @@ def calculate_black_filter_background_corrected_spectrum(
     if sample_variance is None:
         sample_roi_variance = np.asarray(sample_roi_counts, dtype=np.float64)
     else:
-        sample_roi_variance = calculate_roi_profile(data=sample_variance, roi=roi)
+        sample_roi_variance = calculate_roi_profile(data=sample_variance, roi=sample_roi)
 
     if ob_data_combined_variance is None:
         ob_roi_variance = np.asarray(ob_roi_counts, dtype=np.float64)
     else:
-        ob_roi_variance = calculate_roi_profile(data=ob_data_combined_variance, roi=roi)
+        ob_roi_variance = calculate_roi_profile(data=ob_data_combined_variance, roi=ob_roi)
 
     background_shape = _load_black_filter_background_shape(background_shape_file)
     sample_shape, sample_shape_in_range = _evaluate_black_filter_background_shape(
@@ -1353,6 +1372,8 @@ def calculate_ratio_and_uncertainty(
 
 def calculate_bragg_edge_cd_background_profile(
     roi=None,
+    sample_roi=None,
+    ob_roi=None,
     raw_sample_data=None,
     raw_sample_variance=None,
     raw_ob_data=None,
@@ -1365,18 +1386,20 @@ def calculate_bragg_edge_cd_background_profile(
     column_label: str = "Cd-filter",
     key_prefix: str = "bragg_edge_cd",
 ) -> dict:
-    if roi is None:
+    sample_roi = sample_roi or roi
+    ob_roi = ob_roi or sample_roi
+    if sample_roi is None:
         return None
 
-    raw_sample_roi_counts = calculate_roi_profile(data=raw_sample_data, roi=roi)
-    raw_ob_roi_counts = calculate_roi_profile(data=raw_ob_data, roi=roi)
-    sample_background_roi_counts = calculate_roi_profile(data=sample_background_data, roi=roi)
-    ob_background_roi_counts = calculate_roi_profile(data=ob_background_data, roi=roi)
+    raw_sample_roi_counts = calculate_roi_profile(data=raw_sample_data, roi=sample_roi)
+    raw_ob_roi_counts = calculate_roi_profile(data=raw_ob_data, roi=ob_roi)
+    sample_background_roi_counts = calculate_roi_profile(data=sample_background_data, roi=sample_roi)
+    ob_background_roi_counts = calculate_roi_profile(data=ob_background_data, roi=ob_roi)
 
-    raw_sample_roi_variance = calculate_roi_profile(data=raw_sample_variance, roi=roi)
-    raw_ob_roi_variance = calculate_roi_profile(data=raw_ob_variance, roi=roi)
-    sample_background_roi_variance = calculate_roi_profile(data=sample_background_variance, roi=roi)
-    ob_background_roi_variance = calculate_roi_profile(data=ob_background_variance, roi=roi)
+    raw_sample_roi_variance = calculate_roi_profile(data=raw_sample_variance, roi=sample_roi)
+    raw_ob_roi_variance = calculate_roi_profile(data=raw_ob_variance, roi=ob_roi)
+    sample_background_roi_variance = calculate_roi_profile(data=sample_background_variance, roi=sample_roi)
+    ob_background_roi_variance = calculate_roi_profile(data=ob_background_variance, roi=ob_roi)
 
     corrected_sample_roi_counts = raw_sample_roi_counts - sample_background_roi_counts
     corrected_ob_roi_counts = raw_ob_roi_counts - ob_background_roi_counts
@@ -3002,6 +3025,8 @@ def perform_normalization(_sample_data=None, ob_data_combined=None, dc_data_comb
 
 def perform_spectrum_normalization(
     roi=None,
+    sample_roi=None,
+    ob_roi=None,
     sample_data=None,
     sample_variance=None,
     ob_data_combined_for_spectrum=None,
@@ -3010,21 +3035,28 @@ def perform_spectrum_normalization(
     dc_data_combined_for_spectrum=None,
     dc_data_combined_variance=None,
     dc_data_combined_variance_for_spectrum=None,
+    sample_dc_data_combined_for_spectrum=None,
+    ob_dc_data_combined_for_spectrum=None,
+    sample_dc_data_combined_variance_for_spectrum=None,
+    ob_dc_data_combined_variance_for_spectrum=None,
+    sample_ob_dc_covariance_for_spectrum=None,
     black_filter_background_profile=None,
     bragg_edge_cd_background_profile=None,
     measured_background_profiles=None,
 ):
-    if roi is None:
+    sample_roi = sample_roi or roi
+    ob_roi = ob_roi or sample_roi
+    if sample_roi is None:
         return None
 
-    sample_roi_counts = calculate_roi_profile(data=sample_data, roi=roi)
+    sample_roi_counts = calculate_roi_profile(data=sample_data, roi=sample_roi)
     if sample_variance is None:
         sample_roi_variance = np.asarray(sample_roi_counts, dtype=np.float64)
     else:
-        sample_roi_variance = calculate_roi_profile(data=sample_variance, roi=roi)
+        sample_roi_variance = calculate_roi_profile(data=sample_variance, roi=sample_roi)
 
     if ob_data_combined_for_spectrum is None:
-        roi_pixel_count = float(roi.width * roi.height)
+        roi_pixel_count = float(sample_roi.width * sample_roi.height)
         ob_roi_counts = np.full_like(sample_roi_counts, roi_pixel_count, dtype=np.float64)
         ob_roi_variance = np.zeros_like(sample_roi_counts, dtype=np.float64)
     else:
@@ -3042,23 +3074,65 @@ def perform_spectrum_normalization(
     }
 
     if dc_data_combined is not None:
-        if dc_data_combined_for_spectrum is None:
-            dc_roi_counts = calculate_roi_profile(data=dc_data_combined, roi=roi)
-        else:
-            dc_roi_counts = np.asarray(dc_data_combined_for_spectrum, dtype=np.float64)
+        sample_dc_roi_counts = sample_dc_data_combined_for_spectrum
+        if sample_dc_roi_counts is None:
+            sample_dc_roi_counts = calculate_roi_profile(data=dc_data_combined, roi=sample_roi)
+        if sample_dc_roi_counts is None:
+            sample_dc_roi_counts = dc_data_combined_for_spectrum
+        sample_dc_roi_counts = np.asarray(sample_dc_roi_counts, dtype=np.float64)
 
-        if dc_data_combined_variance_for_spectrum is None:
-            if dc_data_combined_variance is None:
-                dc_roi_variance = np.asarray(dc_roi_counts, dtype=np.float64)
-            else:
-                dc_roi_variance = calculate_roi_profile(data=dc_data_combined_variance, roi=roi)
-        else:
-            dc_roi_variance = np.asarray(dc_data_combined_variance_for_spectrum, dtype=np.float64)
+        ob_dc_roi_counts = ob_dc_data_combined_for_spectrum
+        if ob_dc_roi_counts is None:
+            ob_dc_roi_counts = calculate_roi_profile(data=dc_data_combined, roi=ob_roi)
+        if ob_dc_roi_counts is None:
+            ob_dc_roi_counts = dc_data_combined_for_spectrum
+        ob_dc_roi_counts = np.asarray(ob_dc_roi_counts, dtype=np.float64)
 
-        numerator = sample_roi_counts - dc_roi_counts
-        denominator = ob_roi_counts - dc_roi_counts
-        numerator_variance = sample_roi_variance + dc_roi_variance
-        denominator_variance = ob_roi_variance + dc_roi_variance
+        sample_dc_roi_variance = sample_dc_data_combined_variance_for_spectrum
+        if sample_dc_roi_variance is None and dc_data_combined_variance is not None:
+            sample_dc_roi_variance = calculate_roi_profile(
+                data=dc_data_combined_variance,
+                roi=sample_roi,
+            )
+        if sample_dc_roi_variance is None:
+            sample_dc_roi_variance = dc_data_combined_variance_for_spectrum
+        if sample_dc_roi_variance is None:
+            sample_dc_roi_variance = sample_dc_roi_counts
+        sample_dc_roi_variance = np.asarray(sample_dc_roi_variance, dtype=np.float64)
+
+        ob_dc_roi_variance = ob_dc_data_combined_variance_for_spectrum
+        if ob_dc_roi_variance is None and dc_data_combined_variance is not None:
+            ob_dc_roi_variance = calculate_roi_profile(
+                data=dc_data_combined_variance,
+                roi=ob_roi,
+            )
+        if ob_dc_roi_variance is None:
+            ob_dc_roi_variance = dc_data_combined_variance_for_spectrum
+        if ob_dc_roi_variance is None:
+            ob_dc_roi_variance = ob_dc_roi_counts
+        ob_dc_roi_variance = np.asarray(ob_dc_roi_variance, dtype=np.float64)
+
+        dc_covariance = sample_ob_dc_covariance_for_spectrum
+        if dc_covariance is None and dc_data_combined_variance is not None:
+            dc_covariance = calculate_roi_intersection_profile(
+                data=dc_data_combined_variance,
+                first_roi=sample_roi,
+                second_roi=ob_roi,
+            )
+        if dc_covariance is None:
+            same_roi = (
+                sample_roi.left,
+                sample_roi.top,
+                sample_roi.width,
+                sample_roi.height,
+            ) == (ob_roi.left, ob_roi.top, ob_roi.width, ob_roi.height)
+            dc_covariance = sample_dc_roi_variance if same_roi else np.zeros_like(sample_dc_roi_variance)
+        dc_covariance = np.asarray(dc_covariance, dtype=np.float64)
+
+        numerator = sample_roi_counts - sample_dc_roi_counts
+        denominator = ob_roi_counts - ob_dc_roi_counts
+        numerator_variance = sample_roi_variance + sample_dc_roi_variance
+        denominator_variance = ob_roi_variance + ob_dc_roi_variance
 
         spectrum_normalization = np.divide(
             numerator,
@@ -3070,16 +3144,19 @@ def perform_spectrum_normalization(
         spectrum_normalization_variance = np.zeros_like(sample_roi_counts, dtype=np.float64)
         valid = denominator != 0
         spectrum_normalization_variance[valid] = (
-            sample_roi_variance[valid] / (denominator[valid] ** 2)
-            + ((numerator[valid] ** 2) * ob_roi_variance[valid]) / (denominator[valid] ** 4)
-            + (((numerator[valid] - denominator[valid]) ** 2) * dc_roi_variance[valid])
-            / (denominator[valid] ** 4)
+            numerator_variance[valid] / (denominator[valid] ** 2)
+            + ((numerator[valid] ** 2) * denominator_variance[valid]) / (denominator[valid] ** 4)
+            - (2.0 * numerator[valid] * dc_covariance[valid]) / (denominator[valid] ** 3)
         )
 
         spectrum_result.update(
             {
-                "dc_roi_counts": dc_roi_counts,
-                "dc_roi_uncertainty": np.sqrt(np.clip(dc_roi_variance, 0, None)),
+                "dc_roi_counts": sample_dc_roi_counts,
+                "dc_roi_uncertainty": np.sqrt(np.clip(sample_dc_roi_variance, 0, None)),
+                "sample_dc_roi_counts": sample_dc_roi_counts,
+                "sample_dc_roi_uncertainty": np.sqrt(np.clip(sample_dc_roi_variance, 0, None)),
+                "ob_dc_roi_counts": ob_dc_roi_counts,
+                "ob_dc_roi_uncertainty": np.sqrt(np.clip(ob_dc_roi_variance, 0, None)),
                 "sample_minus_dc_roi_counts": numerator,
                 "sample_minus_dc_roi_uncertainty": np.sqrt(np.clip(numerator_variance, 0, None)),
                 "ob_minus_dc_roi_counts": denominator,
@@ -3130,6 +3207,8 @@ def export_normalized_data(ob_master_dict=None,
                 export_corrected_stack_of_normalized_data=False,
                 export_corrected_integrated_normalized_data=False,
                 roi=None,
+                sample_roi=None,
+                ob_roi=None,
                 spectra_array=None,
                 spectra_file=None,
                 output_suffix="",
@@ -3149,13 +3228,16 @@ def export_normalized_data(ob_master_dict=None,
     full_output_folder = os.path.abspath(full_output_folder)
     os.makedirs(full_output_folder, exist_ok=True)
 
-    if roi is not None:
+    sample_roi = sample_roi or roi
+    ob_roi = ob_roi or sample_roi
+    if sample_roi is not None:
         logging.info(f"\t -> exporting the spectrum normalization")
-        logging.info(f"{roi =}")
-        x0 = roi.left
-        y0 = roi.top
-        width = roi.width
-        height = roi.height
+        logging.info(f"{sample_roi =}")
+        logging.info(f"{ob_roi =}")
+        x0 = sample_roi.left
+        y0 = sample_roi.top
+        width = sample_roi.width
+        height = sample_roi.height
         full_file_name = os.path.join(full_output_folder, "spectrum_normalization_profile.txt")
         if bin_metadata is not None:
             bin_index_array = bin_metadata["active_bin_index_array"]
@@ -3198,6 +3280,10 @@ def export_normalized_data(ob_master_dict=None,
                 ("ob_roi_uncertainty", "ob ROI uncertainty"),
                 ("dc_roi_counts", "dc ROI counts"),
                 ("dc_roi_uncertainty", "dc ROI uncertainty"),
+                ("sample_dc_roi_counts", "sample DC ROI counts"),
+                ("sample_dc_roi_uncertainty", "sample DC ROI uncertainty"),
+                ("ob_dc_roi_counts", "OB DC ROI counts"),
+                ("ob_dc_roi_uncertainty", "OB DC ROI uncertainty"),
                 ("sample_minus_dc_roi_counts", "sample minus DC ROI counts"),
                 ("sample_minus_dc_roi_uncertainty", "sample minus DC ROI uncertainty"),
                 ("ob_minus_dc_roi_counts", "OB minus DC ROI counts"),
@@ -3318,6 +3404,12 @@ def export_normalized_data(ob_master_dict=None,
 
         pd_dataframe = pd.DataFrame(pd_dataframe_dict)
         pd_dataframe.attrs['roi [left, top, width, height]'] = f"{x0}, {y0}, {width}, {height}"
+        pd_dataframe.attrs['sample roi [left, top, width, height]'] = (
+            f"{sample_roi.left}, {sample_roi.top}, {sample_roi.width}, {sample_roi.height}"
+        )
+        pd_dataframe.attrs['ob roi [left, top, width, height]'] = (
+            f"{ob_roi.left}, {ob_roi.top}, {ob_roi.width}, {ob_roi.height}"
+        )
         pd_dataframe.attrs['uncertainty model'] = uncertainty_model_label or (
             "Poisson counting statistics; proton charge treated as an exact scale factor"
         )
@@ -3360,7 +3452,7 @@ def export_normalized_data(ob_master_dict=None,
             output_folder=full_output_folder,
             integrated_normalized_image=integrated_normalized_data[_sample_run_number],
             normalized_stack=normalized_data.get(_sample_run_number) if normalized_data is not None else None,
-            roi=roi,
+            roi=sample_roi,
             bin_metadata=bin_metadata,
             spectrum_normalized_data=_spectrum_normalized_data,
         )

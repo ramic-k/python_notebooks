@@ -89,6 +89,8 @@ def normalization_with_list_of_full_path(
     correct_chips_alignment_config: dict = None,
     export_mode: dict = None,
     roi = None,
+    sample_roi = None,
+    ob_roi = None,
     container_roi = None,
     container_roi_file = None,
     rebin_mode: str = RebinMode.none,
@@ -141,7 +143,9 @@ def normalization_with_list_of_full_path(
     #     correct_chips_alignment_flag (bool): if True, correct chips alignment
     #     correct_chips_alignment_config (dict): configuration for chips alignment correction
     #     export_mode (dict): dictionary with export options
-    #     roi (Roi): region of interest for full spectrum normalization
+    #     roi (Roi): legacy ROI applied to both sample and OB spectrum normalization
+    #     sample_roi (Roi): sample region of interest; defaults to roi
+    #     ob_roi (Roi): open-beam region of interest; defaults to sample_roi
     #     container_roi (Roi): region of interest for container only normalization 
     #     container_roi_file (str): file path to container ROI file (scitiff format) (will take precedence over container_roi if both are provided)
 
@@ -149,6 +153,9 @@ def normalization_with_list_of_full_path(
     #     normalized_data | np.ndarray: normalized data
     
     # """
+
+    sample_roi = sample_roi or roi
+    ob_roi = ob_roi or sample_roi
 
     initialize_logging()
 
@@ -195,7 +202,8 @@ def normalization_with_list_of_full_path(
     logging.info(f"\t{export_corrected_integrated_normalized_data = }")
     
     logging.info(f"")
-    logging.info(f"{roi =}")
+    logging.info(f"{sample_roi =}")
+    logging.info(f"{ob_roi =}")
     logging.info(f"{export_x_axis = }")
     logging.info(f"{proton_charge_flag = }")
     logging.info(f"{replace_ob_zeros_by_nan_flag = }")
@@ -545,7 +553,8 @@ def normalization_with_list_of_full_path(
             active_frame_groups = rebinned_payload["active_frame_groups"]
             rebinned_payload["measured_background_profiles"].append(
                 calculate_bragg_edge_cd_background_profile(
-                    roi=roi,
+                    sample_roi=sample_roi,
+                    ob_roi=ob_roi,
                     raw_sample_data=rebin_array_from_bin_groups(
                         current_sample_data,
                         active_frame_groups,
@@ -595,7 +604,7 @@ def normalization_with_list_of_full_path(
         rebinned_payload["ob_data_combined_for_spectrum"] = (
             None if container_only_without_ob else
             calculate_ob_data_combined_used_by_spectrum_normalization(
-                roi=roi,
+                roi=ob_roi,
                 ob_data_combined=rebinned_payload["ob_data_combined"],
                 verbose=verbose,
             )
@@ -604,28 +613,42 @@ def normalization_with_list_of_full_path(
             None if container_only_without_ob else
             calculate_roi_profile(
                 data=rebinned_payload["ob_data_combined_variance"],
-                roi=roi,
+                roi=ob_roi,
             )
         )
 
-        rebinned_payload["dc_data_combined_for_spectrum"] = calculate_roi_profile(
+        rebinned_payload["sample_dc_data_combined_for_spectrum"] = calculate_roi_profile(
             data=rebinned_payload["dc_data_combined"],
-            roi=roi,
+            roi=sample_roi,
         )
-        rebinned_payload["dc_data_combined_variance_for_spectrum"] = calculate_roi_profile(
+        rebinned_payload["ob_dc_data_combined_for_spectrum"] = calculate_roi_profile(
+            data=rebinned_payload["dc_data_combined"],
+            roi=ob_roi,
+        )
+        rebinned_payload["sample_dc_data_combined_variance_for_spectrum"] = calculate_roi_profile(
             data=rebinned_payload["dc_data_combined_variance"],
-            roi=roi,
+            roi=sample_roi,
+        )
+        rebinned_payload["ob_dc_data_combined_variance_for_spectrum"] = calculate_roi_profile(
+            data=rebinned_payload["dc_data_combined_variance"],
+            roi=ob_roi,
+        )
+        rebinned_payload["sample_ob_dc_covariance_for_spectrum"] = calculate_roi_intersection_profile(
+            data=rebinned_payload["dc_data_combined_variance"],
+            first_roi=sample_roi,
+            second_roi=ob_roi,
         )
 
         rebinned_payload["black_filter_background_profile"] = None
         if black_filter_background_config and black_filter_background_config.get("enabled", False):
-            if roi is None:
+            if sample_roi is None:
                 raise ValueError("Black-filter background correction is enabled but no ROI was provided.")
             if dc_data_combined is not None:
                 raise ValueError("Black-filter background correction is not currently supported with dark-current data.")
             rebinned_payload["black_filter_background_profile"] = (
                 calculate_black_filter_background_corrected_spectrum(
-                    roi=roi,
+                    sample_roi=sample_roi,
+                    ob_roi=ob_roi,
                     sample_data=current_sample_data,
                     sample_variance=current_sample_variance,
                     ob_data_combined=ob_data_combined,
@@ -881,8 +904,6 @@ def normalization_with_list_of_full_path(
         dc_data_for_normalization = rebinned_payload["dc_data_combined"]
         ob_data_combined_for_spectrum = rebinned_payload["ob_data_combined_for_spectrum"]
         ob_data_combined_variance_for_spectrum = rebinned_payload["ob_data_combined_variance_for_spectrum"]
-        dc_data_combined_for_spectrum = rebinned_payload["dc_data_combined_for_spectrum"]
-        dc_data_combined_variance_for_spectrum = rebinned_payload["dc_data_combined_variance_for_spectrum"]
         time_spectra = rebinned_payload["tof_array"]
         lambda_array = rebinned_payload["lambda_array"]
         energy_array = rebinned_payload["energy_array"]
@@ -929,15 +950,20 @@ def normalization_with_list_of_full_path(
         integrated_normalized_data[str_list_run_number] = _integrated_normalized_data
         normalized_data[str_list_run_number] = _normalized_data
 
-        _spectrum_normalized_data = perform_spectrum_normalization(roi=roi, 
+        _spectrum_normalized_data = perform_spectrum_normalization(
+                                                                sample_roi=sample_roi,
+                                                                ob_roi=ob_roi,
                                                                 sample_data=sample_data_combined,
                                                                 sample_variance=sample_data_combined_variance,
                                                                 ob_data_combined_for_spectrum=ob_data_combined_for_spectrum,
                                                                 ob_data_combined_variance_for_spectrum=ob_data_combined_variance_for_spectrum,
                                                                 dc_data_combined=dc_data_for_normalization,
-                                                                dc_data_combined_for_spectrum=dc_data_combined_for_spectrum,
                                                                 dc_data_combined_variance=rebinned_payload["dc_data_combined_variance"],
-                                                                dc_data_combined_variance_for_spectrum=dc_data_combined_variance_for_spectrum,
+                                                                sample_dc_data_combined_for_spectrum=rebinned_payload["sample_dc_data_combined_for_spectrum"],
+                                                                ob_dc_data_combined_for_spectrum=rebinned_payload["ob_dc_data_combined_for_spectrum"],
+                                                                sample_dc_data_combined_variance_for_spectrum=rebinned_payload["sample_dc_data_combined_variance_for_spectrum"],
+                                                                ob_dc_data_combined_variance_for_spectrum=rebinned_payload["ob_dc_data_combined_variance_for_spectrum"],
+                                                                sample_ob_dc_covariance_for_spectrum=rebinned_payload["sample_ob_dc_covariance_for_spectrum"],
                                                                 black_filter_background_profile=rebinned_payload["black_filter_background_profile"],
                                                                 bragg_edge_cd_background_profile=rebinned_payload["bragg_edge_cd_background_profile"],
                                                                 measured_background_profiles=rebinned_payload["measured_background_profiles"])
@@ -966,7 +992,7 @@ def normalization_with_list_of_full_path(
                                     str_list_run_number,
                                     combine_samples,
                                     _spectrum_normalized_data,
-                                    roi,
+                                    sample_roi,
                                     bin_metadata=rebinned_payload["bin_metadata"],
                                     )
             
@@ -984,7 +1010,9 @@ def normalization_with_list_of_full_path(
                 output_folder=output_folder, 
                 export_corrected_stack_of_normalized_data=export_corrected_stack_of_normalized_data,
                 export_corrected_integrated_normalized_data=export_corrected_integrated_normalized_data,
-                roi=roi,
+                roi=sample_roi,
+                sample_roi=sample_roi,
+                ob_roi=ob_roi,
                 spectra_array=rebinned_payload["export_spectra_array"],
                 spectra_file=sample_master_dict[list_run_number[0]][MasterDictKeys.spectra_file_name],
                 output_suffix=output_suffix,
@@ -1088,8 +1116,6 @@ def normalization_with_list_of_full_path(
             dc_data_for_normalization = rebinned_payload["dc_data_combined"]
             ob_data_combined_for_spectrum = rebinned_payload["ob_data_combined_for_spectrum"]
             ob_data_combined_variance_for_spectrum = rebinned_payload["ob_data_combined_variance_for_spectrum"]
-            dc_data_combined_for_spectrum = rebinned_payload["dc_data_combined_for_spectrum"]
-            dc_data_combined_variance_for_spectrum = rebinned_payload["dc_data_combined_variance_for_spectrum"]
             time_spectra = rebinned_payload["tof_array"]
             lambda_array = rebinned_payload["lambda_array"]
             energy_array = rebinned_payload["energy_array"]
@@ -1136,15 +1162,20 @@ def normalization_with_list_of_full_path(
             integrated_normalized_data[_sample_run_number] = _integrated_normalized_data
             normalized_data[_sample_run_number] = _normalized_data
 
-            _spectrum_normalized_data = perform_spectrum_normalization(roi=roi, 
+            _spectrum_normalized_data = perform_spectrum_normalization(
+                                                                    sample_roi=sample_roi,
+                                                                    ob_roi=ob_roi,
                                                                     sample_data=_sample_data,
                                                                     sample_variance=_sample_variance,
                                                                     ob_data_combined_for_spectrum=ob_data_combined_for_spectrum,
                                                                     ob_data_combined_variance_for_spectrum=ob_data_combined_variance_for_spectrum,
                                                                     dc_data_combined=dc_data_for_normalization,
-                                                                    dc_data_combined_for_spectrum=dc_data_combined_for_spectrum,
                                                                     dc_data_combined_variance=rebinned_payload["dc_data_combined_variance"],
-                                                                    dc_data_combined_variance_for_spectrum=dc_data_combined_variance_for_spectrum,
+                                                                    sample_dc_data_combined_for_spectrum=rebinned_payload["sample_dc_data_combined_for_spectrum"],
+                                                                    ob_dc_data_combined_for_spectrum=rebinned_payload["ob_dc_data_combined_for_spectrum"],
+                                                                    sample_dc_data_combined_variance_for_spectrum=rebinned_payload["sample_dc_data_combined_variance_for_spectrum"],
+                                                                    ob_dc_data_combined_variance_for_spectrum=rebinned_payload["ob_dc_data_combined_variance_for_spectrum"],
+                                                                    sample_ob_dc_covariance_for_spectrum=rebinned_payload["sample_ob_dc_covariance_for_spectrum"],
                                                                     black_filter_background_profile=rebinned_payload["black_filter_background_profile"],
                                                                     bragg_edge_cd_background_profile=rebinned_payload["bragg_edge_cd_background_profile"],
                                                                     measured_background_profiles=rebinned_payload["measured_background_profiles"])
@@ -1173,7 +1204,7 @@ def normalization_with_list_of_full_path(
                                         _sample_run_number,
                                         combine_samples,
                                         _spectrum_normalized_data,
-                                        roi,
+                                        sample_roi,
                                         bin_metadata=rebinned_payload["bin_metadata"],
                                         )
                 
@@ -1191,7 +1222,9 @@ def normalization_with_list_of_full_path(
                     output_folder=output_folder, 
                     export_corrected_stack_of_normalized_data=export_corrected_stack_of_normalized_data,
                     export_corrected_integrated_normalized_data=export_corrected_integrated_normalized_data,
-                    roi=roi,
+                    roi=sample_roi,
+                    sample_roi=sample_roi,
+                    ob_roi=ob_roi,
                     spectra_array=rebinned_payload["export_spectra_array"],
                     spectra_file=sample_master_dict[_sample_run_number][MasterDictKeys.spectra_file_name],
                     output_suffix=output_suffix,

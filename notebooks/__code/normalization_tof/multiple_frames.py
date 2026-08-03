@@ -224,6 +224,7 @@ class FrameConfig:
     sample_runs: tuple[RunSpec, ...]
     ob_runs: tuple[RunSpec, ...]
     roi: RoiConfig
+    ob_roi: RoiConfig | None = None
     container_roi: RoiConfig | None = None
     container_roi_file: str | None = None
     dc_runs: tuple[RunSpec, ...] = ()
@@ -249,6 +250,8 @@ class FrameConfig:
         values["ob_runs"] = tuple(RunSpec.from_value(item) for item in values.get("ob_runs", ()))
         values["dc_runs"] = tuple(RunSpec.from_value(item) for item in values.get("dc_runs", ()))
         values["roi"] = RoiConfig(**values.get("roi", {}))
+        if values.get("ob_roi") is not None:
+            values["ob_roi"] = RoiConfig(**values["ob_roi"])
         if values.get("container_roi") is not None:
             values["container_roi"] = RoiConfig(**values["container_roi"])
         values["black_filter_background"] = BlackFilterBackgroundConfig.from_dict(
@@ -298,8 +301,13 @@ class FrameConfig:
         if self.local_median_max_iterations is not None and self.local_median_max_iterations <= 0:
             raise ValueError(f"{self.name}: local median maximum iterations must be positive.")
         self.roi.validate()
+        if self.ob_roi is not None:
+            self.ob_roi.validate()
         if self.container_roi is not None:
             self.container_roi.validate()
+
+    def effective_ob_roi(self) -> RoiConfig:
+        return self.roi if self.ob_roi is None else self.ob_roi
 
 
 @dataclass
@@ -325,6 +333,7 @@ class MultiFrameRecipe:
     replace_ob_zeros_by_local_median: bool = False
     local_median_kernel: tuple[int, int, int] = (3, 3, 1)
     local_median_max_iterations: int = 2
+    same_rois_all_frames: bool = False
     recipe_version: int = RECIPE_VERSION
 
     @classmethod
@@ -579,8 +588,10 @@ class MultiFramePreviewEngine:
         frame.validate()
         sample_runs = [self.resolve_run(spec, frame.detector_type) for spec in frame.sample_runs]
         ob_runs = [self.resolve_run(spec, frame.detector_type) for spec in frame.ob_runs]
-        sample_profiles = [self._load_run(run, frame, force_reload) for run in sample_runs]
-        ob_profiles = [self._load_run(run, frame, force_reload) for run in ob_runs]
+        sample_profiles = [self._load_run(run, frame, frame.roi, force_reload) for run in sample_runs]
+        ob_profiles = [
+            self._load_run(run, frame, frame.effective_ob_roi(), force_reload) for run in ob_runs
+        ]
 
         sample_tof, sample_counts, sample_variance, sample_charge, sample_warnings = self._combine_runs(
             sample_profiles, frame.use_proton_charge, role="sample"
@@ -627,18 +638,30 @@ class MultiFramePreviewEngine:
 
         if frame.dc_runs:
             dc_runs = [self.resolve_run(spec, frame.detector_type) for spec in frame.dc_runs]
-            dc_profiles = [self._load_run(run, frame, force_reload) for run in dc_runs]
-            dc_tof, dc_counts, dc_variance, _, dc_warnings = self._combine_runs(
-                dc_profiles,
+            sample_dc_profiles = [
+                self._load_run(run, frame, frame.roi, force_reload) for run in dc_runs
+            ]
+            ob_dc_profiles = [
+                self._load_run(run, frame, frame.effective_ob_roi(), force_reload)
+                for run in dc_runs
+            ]
+            dc_tof, sample_dc_counts, sample_dc_variance, _, dc_warnings = self._combine_runs(
+                sample_dc_profiles,
                 use_proton_charge=False,
-                role="dark current",
+                role="sample dark current",
+            )
+            ob_dc_tof, ob_dc_counts, ob_dc_variance, _, ob_dc_warnings = self._combine_runs(
+                ob_dc_profiles,
+                use_proton_charge=False,
+                role="OB dark current",
             )
             _require_matching_axis(sample_tof, dc_tof, f"{frame.name} dark current")
-            sample_counts -= dc_counts
-            ob_counts -= dc_counts
-            sample_variance += dc_variance
-            ob_variance += dc_variance
-            sample_warnings.extend(dc_warnings)
+            _require_matching_axis(sample_tof, ob_dc_tof, f"{frame.name} OB dark current")
+            sample_counts -= sample_dc_counts
+            ob_counts -= ob_dc_counts
+            sample_variance += sample_dc_variance
+            ob_variance += ob_dc_variance
+            sample_warnings.extend(dc_warnings + ob_dc_warnings)
             corrections_applied.append("dark current")
 
         for background in frame.measured_backgrounds:
@@ -651,10 +674,12 @@ class MultiFramePreviewEngine:
                 self.resolve_run(spec, frame.detector_type) for spec in background.ob_runs
             ]
             sample_background_profiles = [
-                self._load_run(run, frame, force_reload) for run in sample_background_runs
+                self._load_run(run, frame, frame.roi, force_reload)
+                for run in sample_background_runs
             ]
             ob_background_profiles = [
-                self._load_run(run, frame, force_reload) for run in ob_background_runs
+                self._load_run(run, frame, frame.effective_ob_roi(), force_reload)
+                for run in ob_background_runs
             ]
             (
                 sample_background_tof,
@@ -885,6 +910,8 @@ class MultiFramePreviewEngine:
                 correct_chips_alignment_config=correct_config,
                 export_mode=dict(self.recipe.export_mode),
                 roi=frame.roi.to_roi(),
+                sample_roi=frame.roi.to_roi(),
+                ob_roi=frame.effective_ob_roi().to_roi(),
                 container_roi=(None if frame.container_roi is None else frame.container_roi.to_roi()),
                 container_roi_file=frame.container_roi_file,
                 experimental_uncertainties_flag=frame.use_experimental_uncertainties,
@@ -905,10 +932,16 @@ class MultiFramePreviewEngine:
             )
         return (np.arange(lengths[0], dtype=np.float64) + 0.5) * frame.manual_tof_bin_size_ns * 1e-9
 
-    def _load_run(self, run: ResolvedRun, frame: FrameConfig, force_reload: bool) -> NativeRunProfile:
+    def _load_run(
+        self,
+        run: ResolvedRun,
+        frame: FrameConfig,
+        roi: RoiConfig,
+        force_reload: bool,
+    ) -> NativeRunProfile:
         cache_key = self.cache.key(
             run,
-            frame.roi,
+            roi,
             frame.use_experimental_uncertainties,
             frame.manual_tof_bin_size_ns,
         )
@@ -918,7 +951,7 @@ class MultiFramePreviewEngine:
                 return cached
         profile = load_native_roi_profile(
             run=run,
-            roi=frame.roi,
+            roi=roi,
             use_experimental_uncertainties=frame.use_experimental_uncertainties,
             manual_tof_bin_size_ns=frame.manual_tof_bin_size_ns,
         )

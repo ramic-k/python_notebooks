@@ -11,7 +11,6 @@ import ipywidgets as widgets
 import numpy as np
 import plotly.graph_objects as go
 from IPython.display import HTML, clear_output, display
-from plotly.subplots import make_subplots
 
 from __code.ipywe.fileselector import FileSelectorPanel
 from __code.normalization_tof import (
@@ -175,6 +174,25 @@ class FrameEditor:
         self.roi_height = widgets.BoundedIntText(
             value=config.roi.height, min=1, max=10000, description="height", layout=_layout()
         )
+        ob_roi = config.effective_ob_roi()
+        self.ob_roi_linked = widgets.Checkbox(
+            value=config.ob_roi is None,
+            description="Use sample ROI for OB",
+            indent=False,
+            layout=_layout("240px"),
+        )
+        self.ob_roi_left = widgets.BoundedIntText(
+            value=ob_roi.left, min=0, max=10000, description="left", layout=_layout()
+        )
+        self.ob_roi_top = widgets.BoundedIntText(
+            value=ob_roi.top, min=0, max=10000, description="top", layout=_layout()
+        )
+        self.ob_roi_width = widgets.BoundedIntText(
+            value=ob_roi.width, min=1, max=10000, description="width", layout=_layout()
+        )
+        self.ob_roi_height = widgets.BoundedIntText(
+            value=ob_roi.height, min=1, max=10000, description="height", layout=_layout()
+        )
         self.roi_preview_images = widgets.BoundedIntText(
             value=200,
             min=1,
@@ -182,8 +200,10 @@ class FrameEditor:
             description="Preview images",
             layout=_layout("250px"),
         )
-        self.roi_preview_button = widgets.Button(description="Preview/select ROI", icon="crop")
-        self.roi_preview_button.on_click(self._show_roi_selector)
+        self.roi_preview_button = widgets.Button(description="Preview/select sample ROI", icon="crop")
+        self.roi_preview_button.on_click(self._show_sample_roi_selector)
+        self.ob_roi_preview_button = widgets.Button(description="Preview/select OB ROI", icon="crop")
+        self.ob_roi_preview_button.on_click(self._show_ob_roi_selector)
         self.roi_preview_output = widgets.Output()
         container_roi = config.container_roi or RoiConfig(left=150, top=150, width=40, height=40)
         self.container_enabled = widgets.Checkbox(
@@ -417,11 +437,20 @@ class FrameEditor:
         self.black_filter_enabled.observe(self._update_background_state, names="value")
         self.cd_background_enabled.observe(self._update_background_state, names="value")
         self.closed_background_enabled.observe(self._update_background_state, names="value")
+        self.ob_roi_linked.observe(self._update_ob_roi_state, names="value")
+        for sample_roi_widget in (
+            self.roi_left,
+            self.roi_top,
+            self.roi_width,
+            self.roi_height,
+        ):
+            sample_roi_widget.observe(self._sync_ob_roi_from_sample, names="value")
         self._update_rebin_parameters()
         self._update_delay_state()
         self._update_detector_state()
         self._update_median_state()
         self._update_background_state()
+        self._update_ob_roi_state()
 
         all_widgets = self._all_widgets()
         _show_full_descriptions(all_widgets)
@@ -435,6 +464,14 @@ class FrameEditor:
         )
         self.roi_preview_row = widgets.HBox(
             [self.roi_preview_images, self.roi_preview_button],
+            layout=_wrapping_row_layout(),
+        )
+        self.ob_roi_row = widgets.HBox(
+            [self.ob_roi_left, self.ob_roi_top, self.ob_roi_width, self.ob_roi_height],
+            layout=_wrapping_row_layout(),
+        )
+        self.ob_roi_preview_row = widgets.HBox(
+            [self.ob_roi_preview_button],
             layout=_wrapping_row_layout(),
         )
         self.axis_row = widgets.HBox(
@@ -541,9 +578,13 @@ class FrameEditor:
                 self.detector,
                 self.sample_input.widget,
                 self.ob_input.widget,
-                widgets.HTML("<b>ROI</b>"),
+                widgets.HTML("<b>Sample ROI</b>"),
                 self.roi_row,
                 self.roi_preview_row,
+                widgets.HTML("<b>Open-beam ROI</b>"),
+                self.ob_roi_linked,
+                self.ob_roi_row,
+                self.ob_roi_preview_row,
                 self.roi_preview_output,
                 self.axis_row,
                 widgets.HTML("<b>Proposed rebinning</b>"),
@@ -554,6 +595,20 @@ class FrameEditor:
                 corrections,
             ],
             layout=widgets.Layout(border="1px solid #bbb", padding="8px", margin="0 0 8px 0"),
+        )
+
+    @property
+    def roi_value_widgets(self) -> tuple[widgets.Widget, ...]:
+        return (
+            self.roi_left,
+            self.roi_top,
+            self.roi_width,
+            self.roi_height,
+            self.ob_roi_linked,
+            self.ob_roi_left,
+            self.ob_roi_top,
+            self.ob_roi_width,
+            self.ob_roi_height,
         )
 
     def _all_widgets(self) -> list[widgets.Widget]:
@@ -567,6 +622,11 @@ class FrameEditor:
             self.roi_top,
             self.roi_width,
             self.roi_height,
+            self.ob_roi_linked,
+            self.ob_roi_left,
+            self.ob_roi_top,
+            self.ob_roi_width,
+            self.ob_roi_height,
             self.container_enabled,
             self.container_mode,
             self.container_left,
@@ -654,6 +714,26 @@ class FrameEditor:
             None if self.closed_background_enabled.value else "none"
         )
 
+    def _sync_ob_roi_from_sample(self, _change=None) -> None:
+        if not self.ob_roi_linked.value:
+            return
+        self.ob_roi_left.value = self.roi_left.value
+        self.ob_roi_top.value = self.roi_top.value
+        self.ob_roi_width.value = self.roi_width.value
+        self.ob_roi_height.value = self.roi_height.value
+
+    def _update_ob_roi_state(self, _change=None) -> None:
+        linked = self.ob_roi_linked.value
+        if linked:
+            self._sync_ob_roi_from_sample()
+        for widget in (
+            self.ob_roi_left,
+            self.ob_roi_top,
+            self.ob_roi_width,
+            self.ob_roi_height,
+        ):
+            widget.disabled = linked
+
     def _update_rebin_parameters(self, _change=None) -> None:
         controls: list[widgets.Widget]
         mode = self.rebin_mode.value
@@ -680,33 +760,54 @@ class FrameEditor:
         )
         self.snap_to_native.disabled = not (fixed_width_mode or custom_fixed_width)
 
-    def _show_roi_selector(self, _button) -> None:
-        self.roi_preview_button.disabled = True
+    def _show_sample_roi_selector(self, _button) -> None:
+        self._show_roi_selector("sample")
+
+    def _show_ob_roi_selector(self, _button) -> None:
+        self._show_roi_selector("ob")
+
+    def _show_roi_selector(self, source: str) -> None:
+        is_sample = source == "sample"
+        preview_button = self.roi_preview_button if is_sample else self.ob_roi_preview_button
+        run_input = self.sample_input if is_sample else self.ob_input
+        source_label = "sample" if is_sample else "OB"
+        if is_sample or self.ob_roi_linked.value:
+            roi_widgets = (self.roi_left, self.roi_top, self.roi_width, self.roi_height)
+        else:
+            roi_widgets = (
+                self.ob_roi_left,
+                self.ob_roi_top,
+                self.ob_roi_width,
+                self.ob_roi_height,
+            )
+
+        preview_button.disabled = True
         with self.roi_preview_output:
             clear_output(wait=True)
-            display(HTML("Resolving the first sample run and integrating the ROI preview..."))
+            display(HTML(f"Resolving the first {source_label} run and integrating the ROI preview..."))
         try:
-            sample_specs = self.sample_input.specs()
-            if not sample_specs:
-                raise ValueError("Enter or select at least one sample run first.")
+            run_specs = run_input.specs()
+            if not run_specs:
+                raise ValueError(f"Enter or select at least one {source_label} run first.")
             resolver = MultiFramePreviewEngine(
                 MultiFrameRecipe(working_dir=self.working_dir, frames=[])
             )
-            run = resolver.resolve_run(sample_specs[0], self.detector.value)
+            run = resolver.resolve_run(run_specs[0], self.detector.value)
             integrated, selected_count, total_count = load_integrated_image_preview(
                 run.data_path,
                 max_images=self.roi_preview_images.value,
             )
             if integrated is None or integrated.ndim != 2:
-                raise ValueError("The integrated sample preview is not a two-dimensional image.")
+                raise ValueError(f"The integrated {source_label} preview is not a two-dimensional image.")
             if not np.any(np.isfinite(integrated)):
-                raise ValueError("The integrated sample preview contains no finite values.")
+                raise ValueError(f"The integrated {source_label} preview contains no finite values.")
 
             image_height, image_width = integrated.shape
-            left = min(max(int(self.roi_left.value), 0), image_width - 1)
-            top = min(max(int(self.roi_top.value), 0), image_height - 1)
-            right = min(max(left + int(self.roi_width.value), left + 1), image_width)
-            bottom = min(max(top + int(self.roi_height.value), top + 1), image_height)
+            roi_left, roi_top, roi_width, roi_height = roi_widgets
+            left = min(max(int(roi_left.value), 0), image_width - 1)
+            top = min(max(int(roi_top.value), 0), image_height - 1)
+            right = min(max(left + int(roi_width.value), left + 1), image_width)
+            bottom = min(max(top + int(roi_height.value), top + 1), image_height)
             finite_values = integrated[np.isfinite(integrated)]
             intensity_max = max(1, int(np.ceil(np.max(finite_values))))
 
@@ -744,10 +845,10 @@ class FrameEditor:
                 selected_top, selected_bottom = (int(value) for value in top_bottom.value)
                 if selected_right <= selected_left or selected_bottom <= selected_top:
                     return
-                self.roi_left.value = selected_left
-                self.roi_top.value = selected_top
-                self.roi_width.value = selected_right - selected_left
-                self.roi_height.value = selected_bottom - selected_top
+                roi_left.value = selected_left
+                roi_top.value = selected_top
+                roi_width.value = selected_right - selected_left
+                roi_height.value = selected_bottom - selected_top
                 figure = go.Figure(
                     go.Heatmap(
                         z=integrated,
@@ -768,7 +869,7 @@ class FrameEditor:
                 )
                 figure.update_layout(
                     template="plotly_white",
-                    title=f"{self.name.value or 'frame'}: select ROI",
+                    title=f"{self.name.value or 'frame'}: select {source_label} ROI",
                     width=820,
                     height=760,
                     yaxis=dict(autorange="reversed", scaleanchor="x", scaleratio=1),
@@ -787,7 +888,12 @@ class FrameEditor:
                     HTML(
                         f"Preview source: <code>{_escape(run.data_path)}</code><br>"
                         f"Integrated {selected_count} evenly sampled TIFFs out of {total_count}. "
-                        "The ROI fields above update when the sliders are released."
+                        f"The {source_label} ROI fields above update when the sliders are released."
+                        + (
+                            " The OB ROI is linked, so this also updates the sample ROI."
+                            if not is_sample and self.ob_roi_linked.value
+                            else ""
+                        )
                     )
                 )
                 display(widgets.VBox([intensity, left_right, top_bottom, plot_output]))
@@ -797,7 +903,7 @@ class FrameEditor:
                 clear_output(wait=True)
                 display(HTML(f"<span style='color:#b00020'><b>ROI preview failed:</b> {_escape(error)}</span>"))
         finally:
-            self.roi_preview_button.disabled = False
+            preview_button.disabled = False
 
     def _show_container_file_browser(self, _button) -> None:
         with self.container_file_browser_output:
@@ -854,6 +960,16 @@ class FrameEditor:
                 top=self.roi_top.value,
                 width=self.roi_width.value,
                 height=self.roi_height.value,
+            ),
+            ob_roi=(
+                None
+                if self.ob_roi_linked.value
+                else RoiConfig(
+                    left=self.ob_roi_left.value,
+                    top=self.ob_roi_top.value,
+                    width=self.ob_roi_width.value,
+                    height=self.ob_roi_height.value,
+                )
             ),
             container_roi=(
                 RoiConfig(
@@ -950,6 +1066,12 @@ class MultiFrameNormalizationTof:
         )
         self.add_frame_button = widgets.Button(description="Add frame", icon="plus")
         self.remove_frame_button = widgets.Button(description="Remove last", icon="minus")
+        self.same_rois_all_frames = widgets.Checkbox(
+            value=False,
+            description="Use same ROIs for all frames",
+            indent=False,
+            layout=_layout("280px"),
+        )
         self.preview_button = widgets.Button(description="Load ROI profiles and preview", icon="line-chart")
         self.replot_button = widgets.Button(description="Rebin cached profiles", icon="refresh")
         self.save_button = widgets.Button(description="Save recipe", icon="save")
@@ -962,6 +1084,7 @@ class MultiFrameNormalizationTof:
         self.engine: MultiFramePreviewEngine | None = None
         self.loaded_frame_configs: dict[str, FrameConfig] = {}
         self.frame_editors: list[FrameEditor] = []
+        self._syncing_frame_rois = False
 
         _show_full_descriptions(
             [
@@ -1016,7 +1139,8 @@ class MultiFrameNormalizationTof:
             widgets.VBox(
                 [
                     header,
-                    widgets.HTML("<h3>Independent frame settings</h3>"),
+                    widgets.HTML("<h3>Frame settings</h3>"),
+                    self.same_rois_all_frames,
                     self.frame_box,
                     widgets.HTML("<h3>Overlap inspection</h3>"),
                     overlap_controls,
@@ -1038,6 +1162,7 @@ class MultiFrameNormalizationTof:
             frames=frames,
             output_root=self.output_root.value.strip() or None,
             cache_dir=self.cache_dir.value.strip() or None,
+            same_rois_all_frames=self.same_rois_all_frames.value,
         )
 
     def _wire_events(self) -> None:
@@ -1054,6 +1179,7 @@ class MultiFrameNormalizationTof:
         self.overlap_max.observe(self._plot_setting_changed, names="value")
         self.show_native.observe(self._plot_setting_changed, names="value")
         self.show_errors.observe(self._plot_setting_changed, names="value")
+        self.same_rois_all_frames.observe(self._same_rois_all_frames_changed, names="value")
 
     def _set_frames(self, frames: list[FrameConfig]) -> None:
         self.frame_editors = [
@@ -1065,6 +1191,8 @@ class MultiFrameNormalizationTof:
             self.frame_box.set_title(index, editor.name.value or f"frame {index + 1}")
         self.frame_box.selected_index = 0 if self.frame_editors else None
         self._refresh_overlap_options()
+        if self.same_rois_all_frames.value and self.frame_editors:
+            self._sync_frame_rois(self.frame_editors[0])
 
     def _refresh_overlap_options(self) -> None:
         names = [editor.name.value for editor in self.frame_editors if editor.enabled.value and editor.name.value]
@@ -1073,10 +1201,50 @@ class MultiFrameNormalizationTof:
         self.inspect_frames.value = old_selection or tuple(names)
         self._update_manual_overlap_state()
 
-    def _frame_changed(self, _change=None) -> None:
+    def _frame_changed(self, change=None) -> None:
+        if self.same_rois_all_frames.value and not self._syncing_frame_rois and change is not None:
+            source = next(
+                (
+                    editor
+                    for editor in self.frame_editors
+                    if change.get("owner") in editor.roi_value_widgets
+                ),
+                None,
+            )
+            if source is not None:
+                self._sync_frame_rois(source)
         for index, editor in enumerate(self.frame_editors):
             self.frame_box.set_title(index, editor.name.value or f"frame {index + 1}")
         self._refresh_overlap_options()
+
+    def _same_rois_all_frames_changed(self, change=None) -> None:
+        if not self.same_rois_all_frames.value or not self.frame_editors:
+            return
+        selected_index = self.frame_box.selected_index
+        source_index = 0 if selected_index is None else selected_index
+        self._sync_frame_rois(self.frame_editors[source_index])
+
+    def _sync_frame_rois(self, source: FrameEditor) -> None:
+        if self._syncing_frame_rois:
+            return
+        self._syncing_frame_rois = True
+        try:
+            for target in self.frame_editors:
+                if target is source:
+                    continue
+                target.roi_left.value = source.roi_left.value
+                target.roi_top.value = source.roi_top.value
+                target.roi_width.value = source.roi_width.value
+                target.roi_height.value = source.roi_height.value
+                target.ob_roi_linked.value = source.ob_roi_linked.value
+                if not source.ob_roi_linked.value:
+                    target.ob_roi_left.value = source.ob_roi_left.value
+                    target.ob_roi_top.value = source.ob_roi_top.value
+                    target.ob_roi_width.value = source.ob_roi_width.value
+                    target.ob_roi_height.value = source.ob_roi_height.value
+                target._update_ob_roi_state()
+        finally:
+            self._syncing_frame_rois = False
 
     def _add_frame(self, _button) -> None:
         index = len(self.frame_editors) + 1
@@ -1171,19 +1339,8 @@ class MultiFrameNormalizationTof:
             return
         selected_names = self._selected_frame_names()
         overlap_pairs = list(zip(selected_names[:-1], selected_names[1:]))
-        row_count = 1 + len(overlap_pairs)
-        row_heights = [0.5] + ([0.5 / len(overlap_pairs)] * len(overlap_pairs) if overlap_pairs else [])
-        figure = make_subplots(
-            rows=row_count,
-            cols=1,
-            shared_xaxes=False,
-            vertical_spacing=min(0.06, 0.18 / row_count),
-            row_heights=row_heights,
-            subplot_titles=(
-                ["Selected frame transmission previews"]
-                + [f"{comparison} / {reference} overlap" for reference, comparison in overlap_pairs]
-            ),
-        )
+        transmission_figure = go.Figure()
+        overlap_figures: list[go.Figure] = []
         palette = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf"]
         color_by_name = {
             name: palette[index % len(palette)]
@@ -1194,7 +1351,7 @@ class MultiFrameNormalizationTof:
             color = color_by_name[name]
             if self.show_native.value:
                 native_order = np.argsort(preview.native.energy_eV)
-                figure.add_trace(
+                transmission_figure.add_trace(
                     go.Scattergl(
                         x=preview.native.energy_eV[native_order],
                         y=preview.native.transmission[native_order],
@@ -1203,15 +1360,13 @@ class MultiFrameNormalizationTof:
                         opacity=0.25,
                         name=f"{name} native",
                         legendgroup=name,
-                    ),
-                    row=1,
-                    col=1,
+                    )
                 )
             order = np.argsort(preview.energy_eV)
             error = None
             if self.show_errors.value:
                 error = dict(type="data", array=preview.uncertainty[order], visible=True, thickness=0.8, width=0)
-            figure.add_trace(
+            transmission_figure.add_trace(
                 go.Scatter(
                     x=preview.energy_eV[order],
                     y=preview.transmission[order],
@@ -1226,20 +1381,19 @@ class MultiFrameNormalizationTof:
                         "Energy=%{x:.6g} eV<br>Transmission=%{y:.6g}"
                         "<br>native frames/bin=%{customdata}<extra>%{fullData.name}</extra>"
                     ),
-                ),
-                row=1,
-                col=1,
+                )
             )
 
         manual_window = self._energy_window() if len(selected_names) == 2 else None
-        for pair_index, (reference_name, comparison_name) in enumerate(overlap_pairs, start=2):
+        for reference_name, comparison_name in overlap_pairs:
             reference = self.engine.previews.get(reference_name)
             comparison = self.engine.previews.get(comparison_name)
+            ratio_figure = go.Figure()
             if reference is not None and comparison is not None:
                 try:
                     energy, ratio, uncertainty = overlap_ratio_arrays(reference, comparison, manual_window)
                     diagnostics = calculate_overlap_diagnostics(reference, comparison, manual_window)
-                    figure.add_trace(
+                    ratio_figure.add_trace(
                         go.Scatter(
                             x=energy,
                             y=ratio,
@@ -1252,70 +1406,63 @@ class MultiFrameNormalizationTof:
                             ),
                             name=f"{comparison_name} / {reference_name}",
                             showlegend=False,
-                        ),
-                        row=pair_index,
-                        col=1,
+                        )
                     )
-                    figure.add_hline(y=1.0, line_color="#666", line_width=1, row=pair_index, col=1)
-                    figure.add_vrect(
+                    ratio_figure.add_hline(y=1.0, line_color="#666", line_width=1)
+                    transmission_figure.add_vrect(
                         x0=diagnostics.energy_min_eV,
                         x1=diagnostics.energy_max_eV,
                         fillcolor="#999",
                         opacity=0.08,
                         line_width=0,
-                        row=1,
-                        col=1,
                     )
-                    figure.add_vrect(
-                        x0=diagnostics.energy_min_eV,
-                        x1=diagnostics.energy_max_eV,
-                        fillcolor="#999",
-                        opacity=0.08,
-                        line_width=0,
-                        row=pair_index,
-                        col=1,
-                    )
-                    axis_suffix = str(pair_index)
-                    figure.add_annotation(
-                        x=0.01,
-                        y=0.98,
-                        xref=f"x{axis_suffix} domain",
-                        yref=f"y{axis_suffix} domain",
-                        xanchor="left",
-                        yanchor="top",
-                        showarrow=False,
-                        text=(
+                    ratio_figure.update_layout(
+                        title=(
+                            f"{comparison_name} / {reference_name} overlap"
+                            "<br><sup>"
                             f"ratio={diagnostics.comparison_over_reference:.5g}; "
                             f"scale={diagnostics.scale_comparison_to_reference:.5g} +/- "
-                            f"{diagnostics.scale_uncertainty:.2g}; reduced chi2={diagnostics.reduced_chi_square:.3g}"
+                            f"{diagnostics.scale_uncertainty:.2g}; "
+                            f"reduced chi2={diagnostics.reduced_chi_square:.3g}</sup>"
                         ),
+                        template="plotly_white",
+                        height=380,
+                        margin=dict(l=70, r=30, t=85, b=60),
+                        hovermode="closest",
                     )
+                    ratio_figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)")
+                    ratio_figure.update_yaxes(title_text="Ratio")
                 except Exception as error:
-                    axis_suffix = str(pair_index)
-                    figure.add_annotation(
+                    ratio_figure.add_annotation(
                         x=0.5,
                         y=0.5,
-                        xref=f"x{axis_suffix} domain",
-                        yref=f"y{axis_suffix} domain",
+                        xref="paper",
+                        yref="paper",
                         text=f"Overlap unavailable: {_escape(error)}",
                         showarrow=False,
                     )
+                    ratio_figure.update_layout(
+                        title=f"{comparison_name} / {reference_name} overlap",
+                        template="plotly_white",
+                        height=300,
+                    )
+            overlap_figures.append(ratio_figure)
 
-        figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)", row=1, col=1)
-        figure.update_yaxes(title_text="Transmission", row=1, col=1)
-        for row in range(2, row_count + 1):
-            figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)", row=row, col=1)
-            figure.update_yaxes(title_text="Ratio", row=row, col=1)
-        figure.update_layout(
+        transmission_figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)")
+        transmission_figure.update_yaxes(title_text="Transmission")
+        transmission_figure.update_layout(
+            title="Selected frame transmission previews",
             template="plotly_white",
-            height=max(700, 470 + 210 * len(overlap_pairs)),
+            height=650,
             hovermode="closest",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
             margin=dict(l=70, r=30, t=100, b=60),
         )
         with self.plot_output:
             clear_output(wait=True)
-            figure.show()
+            transmission_figure.show()
+            for ratio_figure in overlap_figures:
+                ratio_figure.show()
 
     def _energy_window(self) -> tuple[float, float] | None:
         if self.overlap_min.value > 0 and self.overlap_max.value > 0:
@@ -1362,6 +1509,7 @@ class MultiFrameNormalizationTof:
                 self.cache_dir.value = recipe.cache_dir or str(
                     Path(recipe.working_dir) / "shared" / ".normalization_tof_multiple_frames_cache"
                 )
+                self.same_rois_all_frames.value = recipe.same_rois_all_frames
                 self._set_frames(recipe.frames)
                 self.engine = None
                 self.loaded_frame_configs = {}
