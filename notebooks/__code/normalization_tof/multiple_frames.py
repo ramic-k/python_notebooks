@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -44,8 +45,11 @@ from __code.normalization_tof.utilities import (
     _load_black_filter_background_shape,
     build_rebin_bin_groups,
     build_rebin_bin_metadata,
+    calculate_bragg_edge_cd_background_profile,
     calculate_ratio_and_uncertainty,
     calculate_time_lambda_energy_arrays,
+    create_rebin_output_suffix,
+    export_normalized_data,
     get_detector_offset_from_nexus,
     retrieve_list_of_tif,
 )
@@ -316,6 +320,7 @@ class FrameConfig:
     manual_tof_bin_size_ns: float | None = None
     use_proton_charge: bool = True
     use_experimental_uncertainties: bool = True
+    spectrum_only: bool = True
     combine_sample_runs: bool = False
     correct_chips_alignment: bool | None = None
     replace_ob_zeros_by_local_median: bool | None = None
@@ -481,6 +486,7 @@ class NativeFrameProfile:
     ob_total_proton_charge_c: float | None
     warnings: list[str] = field(default_factory=list)
     corrections_applied: list[str] = field(default_factory=list)
+    measured_background_diagnostic: dict[str, Any] | None = None
 
 
 @dataclass
@@ -497,6 +503,7 @@ class RebinnedFramePreview:
     uncertainty: np.ndarray
     source_frame_count: np.ndarray
     native: NativeFrameProfile
+    bin_metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -764,9 +771,22 @@ class MultiFramePreviewEngine:
             sample_warnings.extend(dc_warnings + ob_dc_warnings)
             corrections_applied.append("dark current")
 
-        for background in frame.measured_backgrounds:
-            if not background.enabled:
-                continue
+        enabled_backgrounds = [
+            background for background in frame.measured_backgrounds if background.enabled
+        ]
+        measured_background_diagnostic = None
+        if enabled_backgrounds:
+            raw_sample_counts = sample_counts.copy()
+            raw_sample_variance = sample_variance.copy()
+            raw_ob_counts = ob_counts.copy()
+            raw_ob_variance = ob_variance.copy()
+            total_sample_background_counts = np.zeros_like(sample_counts)
+            total_sample_background_variance = np.zeros_like(sample_variance)
+            total_ob_background_counts = np.zeros_like(ob_counts)
+            total_ob_background_variance = np.zeros_like(ob_variance)
+            background_labels = []
+
+        for background in enabled_backgrounds:
             sample_background_runs = [
                 self.resolve_run(spec, frame.detector_type) for spec in background.sample_runs
             ]
@@ -806,6 +826,10 @@ class MultiFramePreviewEngine:
             _require_matching_axis(sample_tof, sample_background_tof, f"{frame.name} sample background")
             _require_matching_axis(sample_tof, ob_background_tof, f"{frame.name} OB background")
             weight = float(background.weight)
+            total_sample_background_counts += weight * sample_background_counts
+            total_ob_background_counts += weight * ob_background_counts
+            total_sample_background_variance += weight**2 * sample_background_variance
+            total_ob_background_variance += weight**2 * ob_background_variance
             sample_counts -= weight * sample_background_counts
             ob_counts -= weight * ob_background_counts
             sample_variance += weight**2 * sample_background_variance
@@ -813,6 +837,24 @@ class MultiFramePreviewEngine:
             sample_warnings.extend(sample_background_warnings + ob_background_warnings)
             _, label, _ = background.normalized_labels()
             corrections_applied.append(f"{label} measured background (weight {weight:g})")
+            sign = "-" if weight < 0 else ("+" if background_labels else "")
+            background_labels.append(f"{sign}{abs(weight):g}*{label}")
+
+        if enabled_backgrounds:
+            combined_label = " ".join(background_labels)
+            measured_background_diagnostic = {
+                "mode": f"Measured background correction for Bragg edge mode ({combined_label})",
+                "column_label": "measured background combined",
+                "key_prefix": "measured_background_combined",
+                "raw_sample_counts": raw_sample_counts,
+                "raw_sample_variance": raw_sample_variance,
+                "raw_ob_counts": raw_ob_counts,
+                "raw_ob_variance": raw_ob_variance,
+                "sample_background_counts": total_sample_background_counts,
+                "sample_background_variance": total_sample_background_variance,
+                "ob_background_counts": total_ob_background_counts,
+                "ob_background_variance": total_ob_background_variance,
+            }
 
         if frame.black_filter_background.enabled:
             sample_counts, ob_counts, black_filter_metadata = _apply_black_filter_background_to_profiles(
@@ -853,6 +895,7 @@ class MultiFramePreviewEngine:
             ob_total_proton_charge_c=ob_charge,
             warnings=sample_warnings + ob_warnings,
             corrections_applied=corrections_applied,
+            measured_background_diagnostic=measured_background_diagnostic,
         )
         self.native_profiles[frame.name] = profile
         return profile
@@ -892,6 +935,7 @@ class MultiFramePreviewEngine:
             uncertainty=uncertainty,
             source_frame_count=metadata["source_frame_count_array"],
             native=native,
+            bin_metadata=metadata,
         )
         self.previews[frame.name] = preview
         return preview
@@ -914,6 +958,147 @@ class MultiFramePreviewEngine:
         reference = self.previews[reference_name]
         comparison = self.previews[comparison_name]
         return calculate_overlap_diagnostics(reference, comparison, energy_window_eV)
+
+    def _spectrum_only_fallback_reasons(
+        self,
+        frame: FrameConfig,
+        *,
+        correct_chips_alignment: bool,
+        replace_ob_zeros: bool,
+    ) -> list[str]:
+        reasons = []
+        if correct_chips_alignment:
+            reasons.append("chip-alignment correction")
+        if replace_ob_zeros:
+            reasons.append("OB local-median zero replacement")
+        if frame.dc_runs:
+            reasons.append("dark-current correction")
+        if frame.black_filter_background.enabled:
+            reasons.append("black-filter background correction")
+        if frame.container_roi is not None or frame.container_roi_file:
+            reasons.append("container correction")
+        return reasons
+
+    @staticmethod
+    def _stage3_measured_background_profile(
+        native: NativeFrameProfile,
+        active_groups: list[np.ndarray],
+    ) -> dict | None:
+        diagnostic = native.measured_background_diagnostic
+        if diagnostic is None:
+            return None
+
+        def grouped_image(key: str) -> np.ndarray:
+            values = _sum_groups(diagnostic[key], active_groups)
+            return np.asarray(values, dtype=np.float64)[:, None, None]
+
+        unit_roi = Roi(left=0, top=0, width=1, height=1)
+        return calculate_bragg_edge_cd_background_profile(
+            sample_roi=unit_roi,
+            ob_roi=unit_roi,
+            raw_sample_data=grouped_image("raw_sample_counts"),
+            raw_sample_variance=grouped_image("raw_sample_variance"),
+            raw_ob_data=grouped_image("raw_ob_counts"),
+            raw_ob_variance=grouped_image("raw_ob_variance"),
+            sample_background_data=grouped_image("sample_background_counts"),
+            sample_background_variance=grouped_image("sample_background_variance"),
+            ob_background_data=grouped_image("ob_background_counts"),
+            ob_background_variance=grouped_image("ob_background_variance"),
+            mode=diagnostic["mode"],
+            column_label=diagnostic["column_label"],
+            key_prefix=diagnostic["key_prefix"],
+        )
+
+    def _run_spectrum_only_normalization(
+        self,
+        frame: FrameConfig,
+        frame_output: Path,
+    ) -> None:
+        if frame.combine_sample_runs or len(frame.sample_runs) == 1:
+            sample_groups = [frame.sample_runs]
+        else:
+            sample_groups = [(sample_run,) for sample_run in frame.sample_runs]
+
+        ob_runs = [self.resolve_run(spec, frame.detector_type) for spec in frame.ob_runs]
+        ob_dict = _normalization_input_dict(ob_runs)
+        for sample_group in sample_groups:
+            spectrum_frame = replace(
+                frame,
+                sample_runs=tuple(sample_group),
+                combine_sample_runs=len(sample_group) > 1,
+            )
+            native = self.load_frame(spectrum_frame, force_reload=False)
+            rebinned = self.rebin_frame(spectrum_frame, native=native)
+            active_groups = rebinned.bin_metadata["list_file_index_array"]
+            spectrum_result = {
+                "sample_roi_counts": rebinned.sample_counts,
+                "sample_roi_uncertainty": np.sqrt(np.clip(rebinned.sample_variance, 0, None)),
+                "ob_roi_counts": rebinned.ob_counts,
+                "ob_roi_uncertainty": np.sqrt(np.clip(rebinned.ob_variance, 0, None)),
+                "spectrum_normalization": rebinned.transmission,
+                "spectrum_normalization_uncertainty": rebinned.uncertainty,
+            }
+            measured_background_profile = self._stage3_measured_background_profile(
+                native,
+                active_groups,
+            )
+            if measured_background_profile is not None:
+                spectrum_result.update(measured_background_profile)
+
+            sample_runs = [
+                self.resolve_run(spec, frame.detector_type) for spec in sample_group
+            ]
+            sample_dict = _normalization_input_dict(sample_runs)
+            sample_label = "_".join(sample_dict)
+            output_suffix = create_rebin_output_suffix(**frame.rebin.engine_kwargs())
+            uncertainty_model_label = (
+                "TPX1 detector-model uncertainty (iBeatles-style) where shutter counts are "
+                "available; otherwise Poisson counting statistics. Proton charge propagated "
+                "as an exact scale factor."
+                if frame.use_experimental_uncertainties
+                else "Poisson counting statistics; proton charge treated as an exact scale factor"
+            )
+            if native.measured_background_diagnostic is not None:
+                uncertainty_model_label += (
+                    "; measured background correction propagates independent sample/OB "
+                    "background variances with squared weights"
+                )
+
+            native_inputs = None
+            if frame.rebin.mode != RebinMode.none:
+                native_inputs = {
+                    "bin_index": np.arange(len(native.tof_s), dtype=int),
+                    "tof_s": native.tof_s,
+                    "lambda_a": native.lambda_a,
+                    "energy_eV": native.energy_eV,
+                    "sample_counts": native.sample_counts,
+                    "sample_uncertainty": np.sqrt(
+                        np.clip(native.sample_variance, 0, None)
+                    ),
+                    "ob_counts": native.ob_counts,
+                    "ob_uncertainty": np.sqrt(np.clip(native.ob_variance, 0, None)),
+                }
+
+            export_normalized_data(
+                ob_master_dict=ob_dict,
+                sample_master_dict=sample_dict,
+                _sample_run_number=sample_label,
+                normalized_data={},
+                integrated_normalized_data={},
+                _spectrum_normalized_data=spectrum_result,
+                tof_array=rebinned.tof_s,
+                lambda_array=rebinned.lambda_a,
+                energy_array=rebinned.energy_eV,
+                output_folder=str(frame_output),
+                export_corrected_stack_of_normalized_data=False,
+                export_corrected_integrated_normalized_data=False,
+                sample_roi=frame.roi.to_roi(),
+                ob_roi=frame.effective_ob_roi().to_roi(),
+                output_suffix=output_suffix,
+                bin_metadata=rebinned.bin_metadata,
+                uncertainty_model_label=uncertainty_model_label,
+                native_spectrum_inputs=native_inputs,
+            )
 
     def run_full_normalization(self, campaign_label: str | None = None, preview: bool = True) -> Path:
         output_root = Path(self.recipe.output_root or (self.working_dir / "shared")).expanduser()
@@ -988,6 +1173,26 @@ class MultiFramePreviewEngine:
                     "background_shape_file": frame.black_filter_background.shape_file,
                     "anchor_energy_eV": frame.black_filter_background.anchor_energy_eV,
                 }
+
+            if frame.spectrum_only:
+                fallback_reasons = self._spectrum_only_fallback_reasons(
+                    frame,
+                    correct_chips_alignment=correct_chips_alignment,
+                    replace_ob_zeros=replace_ob_zeros,
+                )
+                if not fallback_reasons:
+                    logging.info(
+                        "Stage 3 spectrum-only production enabled for %s.",
+                        frame.name,
+                    )
+                    self._run_spectrum_only_normalization(frame, frame_output)
+                    continue
+                logging.info(
+                    "Stage 3 spectrum-only production unavailable for %s; using the "
+                    "full-image engine because of: %s.",
+                    frame.name,
+                    ", ".join(fallback_reasons),
+                )
 
             normalization_with_list_of_full_path(
                 sample_dict=sample_dict,

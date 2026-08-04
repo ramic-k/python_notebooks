@@ -3587,7 +3587,8 @@ def export_normalized_data(ob_master_dict=None,
                 spectra_file=None,
                 output_suffix="",
                 bin_metadata: dict = None,
-                uncertainty_model_label: str = None):
+                uncertainty_model_label: str = None,
+                native_spectrum_inputs: dict = None):
 
     logging.info("Exporting normalized data ...")
 
@@ -3787,6 +3788,74 @@ def export_normalized_data(ob_master_dict=None,
         pd_dataframe.attrs['uncertainty model'] = uncertainty_model_label or (
             "Poisson counting statistics; proton charge treated as an exact scale factor"
         )
+        if native_spectrum_inputs is not None:
+            native_columns = {
+                "native bin index": np.asarray(
+                    native_spectrum_inputs["bin_index"],
+                    dtype=int,
+                ),
+                "native_tof (micros)": np.asarray(
+                    native_spectrum_inputs["tof_s"],
+                    dtype=np.float64,
+                ) * 1e6,
+                "native_lambda (Angstroms)": np.asarray(
+                    native_spectrum_inputs["lambda_a"],
+                    dtype=np.float64,
+                ),
+                "native_energy (eV)": np.asarray(
+                    native_spectrum_inputs["energy_eV"],
+                    dtype=np.float64,
+                ),
+                "native sample ROI counts": np.asarray(
+                    native_spectrum_inputs["sample_counts"],
+                    dtype=np.float64,
+                ),
+                "native sample ROI uncertainty": np.asarray(
+                    native_spectrum_inputs["sample_uncertainty"],
+                    dtype=np.float64,
+                ),
+                "native OB ROI counts": np.asarray(
+                    native_spectrum_inputs["ob_counts"],
+                    dtype=np.float64,
+                ),
+                "native OB ROI uncertainty": np.asarray(
+                    native_spectrum_inputs["ob_uncertainty"],
+                    dtype=np.float64,
+                ),
+            }
+            native_lengths = {len(values) for values in native_columns.values()}
+            if len(native_lengths) != 1:
+                raise ValueError(
+                    "Native spectrum input columns must all have the same length."
+                )
+            native_file_name = os.path.join(
+                full_output_folder,
+                "native_spectrum_normalization_inputs.txt",
+            )
+            native_dataframe = pd.DataFrame(native_columns)
+            native_dataframe.attrs["sample roi [left, top, width, height]"] = (
+                f"{sample_roi.left}, {sample_roi.top}, {sample_roi.width}, {sample_roi.height}"
+            )
+            native_dataframe.attrs["ob roi [left, top, width, height]"] = (
+                f"{ob_roi.left}, {ob_roi.top}, {ob_roi.width}, {ob_roi.height}"
+            )
+            native_dataframe.attrs["uncertainty model"] = pd_dataframe.attrs[
+                "uncertainty model"
+            ]
+            native_dataframe.attrs["values"] = (
+                "Native-grid ROI inputs after enabled count-domain corrections and before rebinning."
+            )
+            with open(native_file_name, "w") as stream:
+                for key, value in native_dataframe.attrs.items():
+                    stream.write(f"# {key}: {value}\n")
+                native_dataframe.to_csv(stream, index=False)
+            pd_dataframe.attrs["native ROI input profile"] = os.path.basename(
+                native_file_name
+            )
+            logging.info(
+                "\t -> Exporting native sample/OB ROI inputs to %s",
+                native_file_name,
+            )
         if bin_metadata is not None:
             pd_dataframe.attrs["rebin snap to native grid"] = bin_metadata.get(
                 "rebin_snap_to_native_grid",

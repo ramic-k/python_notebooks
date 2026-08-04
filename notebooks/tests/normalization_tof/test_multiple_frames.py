@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import h5py
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 from PIL import Image
 
@@ -469,6 +470,7 @@ def test_run_parser_and_recipe_round_trip(tmp_path):
     loaded = MultiFrameRecipe.load(recipe_path)
     assert loaded == recipe
     assert loaded.frames[0].effective_ob_roi() == RoiConfig(left=53, top=63, width=410, height=400)
+    assert loaded.frames[0].spectrum_only is True
     assert loaded.same_rois_all_frames is True
     assert json.loads(recipe_path.read_text())["recipe_version"] == 1
 
@@ -499,6 +501,7 @@ def test_new_frame_defaults_match_single_frame_notebook():
     assert editor.snap_to_native.value is True
     assert editor.use_proton_charge.value is True
     assert editor.experimental_uncertainties.value is True
+    assert editor.spectrum_only.value is True
     assert editor.combine_sample_runs.value is False
     assert editor.correct_chips_alignment.value is False
     assert editor.correct_chips_alignment.disabled is True
@@ -1137,14 +1140,14 @@ def test_full_normalization_uses_separate_campaign_folders_and_snapshot(tmp_path
     frame_data = [np.ones((2, 2), dtype=np.uint16)]
     sample_path, sample_nexus = _write_run(tmp_path, "105", frame_data)
     ob_path, ob_nexus = _write_run(tmp_path, "106", frame_data)
-    frame = _frame(
+    frame = replace(_frame(
         "6.3 A",
         [("105", sample_path, sample_nexus)],
         [("106", ob_path, ob_nexus)],
         RoiConfig(left=0, top=0, width=2, height=2),
         rebin=RebinConfig(mode=RebinMode.none),
         ob_roi=RoiConfig(left=1, top=0, width=1, height=2),
-    )
+    ), spectrum_only=False)
     output_root = tmp_path / "output"
     recipe = MultiFrameRecipe(
         working_dir=str(tmp_path),
@@ -1250,6 +1253,7 @@ def test_full_normalization_forwards_measured_background_runs(tmp_path, monkeypa
                 weight=0.75,
             ),
         ),
+        spectrum_only=False,
     )
     calls = []
     monkeypatch.setattr(
@@ -1268,3 +1272,235 @@ def test_full_normalization_forwards_measured_background_runs(tmp_path, monkeypa
     assert configs[0]["weight"] == 0.75
     assert list(configs[0]["sample_background_dict"]) == [paths["503"][0].name]
     assert list(configs[0]["ob_background_dict"]) == [paths["504"][0].name]
+
+
+def test_stage3_spectrum_only_exports_rebinned_and_native_roi_profiles(tmp_path, monkeypatch):
+    sample_values = np.asarray([10, 20, 30, 40], dtype=np.float64)
+    ob_values = np.asarray([20, 40, 60, 80], dtype=np.float64)
+    sample_path, sample_nexus = _write_run(
+        tmp_path,
+        "701",
+        [np.asarray([[value]], dtype=np.uint16) for value in sample_values],
+    )
+    ob_path, ob_nexus = _write_run(
+        tmp_path,
+        "702",
+        [np.asarray([[value]], dtype=np.uint16) for value in ob_values],
+    )
+    frame = _frame(
+        "0.3 A",
+        [("701", sample_path, sample_nexus)],
+        [("702", ob_path, ob_nexus)],
+        RoiConfig(left=0, top=0, width=1, height=1),
+        rebin=RebinConfig(
+            mode=RebinMode.linear_tof,
+            delta_tof_us=2.0,
+            full_bins_only=False,
+        ),
+    )
+    recipe = MultiFrameRecipe(
+        working_dir=str(tmp_path),
+        frames=[frame],
+        output_root=str(tmp_path / "output"),
+        cache_dir=str(tmp_path / "cache"),
+    )
+
+    def fail_full_image_engine(**_kwargs):
+        raise AssertionError("The full-image production engine was called")
+
+    monkeypatch.setattr(
+        "__code.normalization_tof.multiple_frames.normalization_with_list_of_full_path",
+        fail_full_image_engine,
+    )
+    campaign = MultiFramePreviewEngine(recipe).run_full_normalization(
+        "stage3",
+        preview=False,
+    )
+    profile_path = next(campaign.rglob("spectrum_normalization_profile.txt"))
+    native_path = profile_path.with_name("native_spectrum_normalization_inputs.txt")
+    profile = pd.read_csv(profile_path, comment="#")
+    native = pd.read_csv(native_path, comment="#")
+
+    np.testing.assert_allclose(profile["sample ROI counts"], [30.0, 70.0])
+    np.testing.assert_allclose(profile["ob ROI counts"], [60.0, 140.0])
+    np.testing.assert_allclose(profile["spectrum normalization"], [0.5, 0.5])
+    np.testing.assert_allclose(native["native sample ROI counts"], sample_values)
+    np.testing.assert_allclose(native["native OB ROI counts"], ob_values)
+    np.testing.assert_allclose(
+        native["native sample ROI uncertainty"],
+        np.sqrt(sample_values),
+    )
+    np.testing.assert_allclose(
+        native["native OB ROI uncertainty"],
+        np.sqrt(ob_values),
+    )
+    assert "# native ROI input profile: native_spectrum_normalization_inputs.txt" in (
+        profile_path.read_text(encoding="utf-8")
+    )
+    assert not any(campaign.rglob("stack"))
+
+
+def test_stage3_measured_background_matches_count_domain_rebin(tmp_path):
+    frame_values = {
+        "711": (10, 18, 12, 16),
+        "712": (20, 30, 24, 32),
+        "713": (2, 4, 2, 4),
+        "714": (4, 6, 4, 8),
+    }
+    runs = {}
+    for run_number, values in frame_values.items():
+        runs[run_number] = _write_run(
+            tmp_path,
+            run_number,
+            [np.asarray([[value]], dtype=np.uint16) for value in values],
+        )
+
+    def spec(run_number):
+        data_path, nexus_path = runs[run_number]
+        return RunSpec(run_number, str(data_path), str(nexus_path))
+
+    frame = FrameConfig(
+        name="resonance",
+        detector_type=DetectorType.tpx1,
+        sample_runs=(spec("711"),),
+        ob_runs=(spec("712"),),
+        roi=RoiConfig(left=0, top=0, width=1, height=1),
+        measured_backgrounds=(
+            MeasuredBackgroundConfig(
+                key="closed_slits",
+                enabled=True,
+                sample_runs=(spec("713"),),
+                ob_runs=(spec("714"),),
+                weight=0.5,
+            ),
+        ),
+        rebin=RebinConfig(
+            mode=RebinMode.linear_tof,
+            delta_tof_us=2.0,
+            full_bins_only=False,
+        ),
+        use_proton_charge=False,
+        use_experimental_uncertainties=False,
+    )
+    recipe = MultiFrameRecipe(
+        working_dir=str(tmp_path),
+        frames=[frame],
+        output_root=str(tmp_path / "background_output"),
+    )
+    campaign = MultiFramePreviewEngine(recipe).run_full_normalization(
+        "stage3 background",
+        preview=False,
+    )
+    profile_path = next(campaign.rglob("spectrum_normalization_profile.txt"))
+    profile = pd.read_csv(profile_path, comment="#")
+    native = pd.read_csv(
+        profile_path.with_name("native_spectrum_normalization_inputs.txt"),
+        comment="#",
+    )
+
+    corrected_sample = np.asarray(frame_values["711"], dtype=float) - 0.5 * np.asarray(
+        frame_values["713"], dtype=float
+    )
+    corrected_ob = np.asarray(frame_values["712"], dtype=float) - 0.5 * np.asarray(
+        frame_values["714"], dtype=float
+    )
+    expected_sample = np.asarray([corrected_sample[:2].sum(), corrected_sample[2:].sum()])
+    expected_ob = np.asarray([corrected_ob[:2].sum(), corrected_ob[2:].sum()])
+    np.testing.assert_allclose(profile["sample ROI counts"], expected_sample)
+    np.testing.assert_allclose(profile["ob ROI counts"], expected_ob)
+    np.testing.assert_allclose(
+        profile["spectrum normalization"],
+        expected_sample / expected_ob,
+    )
+    np.testing.assert_allclose(native["native sample ROI counts"], corrected_sample)
+    np.testing.assert_allclose(native["native OB ROI counts"], corrected_ob)
+    assert "measured background combined corrected spectrum normalization" in profile.columns
+
+
+def test_stage3_profile_matches_full_image_production_profile(tmp_path, monkeypatch):
+    sample_path, sample_nexus = _write_run(
+        tmp_path,
+        "721",
+        [
+            np.asarray([[2, 4], [6, 8]], dtype=np.uint16),
+            np.asarray([[3, 5], [7, 9]], dtype=np.uint16),
+            np.asarray([[4, 6], [8, 10]], dtype=np.uint16),
+            np.asarray([[5, 7], [9, 11]], dtype=np.uint16),
+        ],
+    )
+    ob_path, ob_nexus = _write_run(
+        tmp_path,
+        "722",
+        [
+            np.asarray([[4, 8], [12, 16]], dtype=np.uint16),
+            np.asarray([[6, 10], [14, 18]], dtype=np.uint16),
+            np.asarray([[8, 12], [16, 20]], dtype=np.uint16),
+            np.asarray([[10, 14], [18, 22]], dtype=np.uint16),
+        ],
+    )
+    frame = _frame(
+        "2.5 A",
+        [("721", sample_path, sample_nexus)],
+        [("722", ob_path, ob_nexus)],
+        RoiConfig(left=0, top=0, width=2, height=2),
+        rebin=RebinConfig(
+            mode=RebinMode.linear_tof,
+            delta_tof_us=2.0,
+            full_bins_only=False,
+        ),
+    )
+    monkeypatch.setattr(production_normalization, "initialize_logging", lambda: None)
+
+    stage3_recipe = MultiFrameRecipe(
+        working_dir=str(tmp_path),
+        frames=[frame],
+        output_root=str(tmp_path / "stage3_output"),
+    )
+    full_image_recipe = MultiFrameRecipe(
+        working_dir=str(tmp_path),
+        frames=[replace(frame, spectrum_only=False)],
+        output_root=str(tmp_path / "full_image_output"),
+    )
+    stage3_campaign = MultiFramePreviewEngine(stage3_recipe).run_full_normalization(
+        "stage3 parity",
+        preview=False,
+    )
+    full_image_campaign = MultiFramePreviewEngine(full_image_recipe).run_full_normalization(
+        "full image parity",
+        preview=False,
+    )
+    stage3_profile = pd.read_csv(
+        next(stage3_campaign.rglob("spectrum_normalization_profile.txt")),
+        comment="#",
+    )
+    full_image_profile = pd.read_csv(
+        next(full_image_campaign.rglob("spectrum_normalization_profile.txt")),
+        comment="#",
+    )
+
+    for column in (
+        "sample ROI counts",
+        "sample ROI uncertainty",
+        "ob ROI counts",
+        "ob ROI uncertainty",
+        "spectrum normalization",
+        "spectrum normalization uncertainty",
+    ):
+        np.testing.assert_allclose(
+            stage3_profile[column],
+            full_image_profile[column],
+            rtol=1e-12,
+            atol=1e-12,
+            equal_nan=True,
+        )
+
+
+def test_spectrum_only_controls_apply_to_every_frame():
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+    assert all(editor.spectrum_only.value for editor in ui.frame_editors)
+
+    ui._set_all_spectrum_only(False)
+    assert all(not editor.spectrum_only.value for editor in ui.frame_editors)
+
+    ui._set_all_spectrum_only(True)
+    assert all(editor.spectrum_only.value for editor in ui.frame_editors)

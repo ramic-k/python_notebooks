@@ -326,6 +326,12 @@ class FrameEditor:
             indent=False,
             layout=_layout("280px"),
         )
+        self.spectrum_only = widgets.Checkbox(
+            value=config.spectrum_only,
+            description="Spectrum-only production",
+            indent=False,
+            layout=_layout("240px"),
+        )
         self.combine_sample_runs = widgets.Checkbox(
             value=config.combine_sample_runs,
             description="Combine sample runs",
@@ -577,6 +583,7 @@ class FrameEditor:
             [
                 self.use_proton_charge,
                 self.experimental_uncertainties,
+                self.spectrum_only,
                 self.combine_sample_runs,
                 self.correct_chips_alignment,
             ],
@@ -738,6 +745,7 @@ class FrameEditor:
             self.manual_tof,
             self.use_proton_charge,
             self.experimental_uncertainties,
+            self.spectrum_only,
             self.combine_sample_runs,
             self.correct_chips_alignment,
             *self.dc_input.value_widgets,
@@ -1413,6 +1421,7 @@ class FrameEditor:
             manual_tof_bin_size_ns=self.manual_tof.value if self.manual_tof.value > 0 else None,
             use_proton_charge=self.use_proton_charge.value,
             use_experimental_uncertainties=self.experimental_uncertainties.value,
+            spectrum_only=self.spectrum_only.value,
             combine_sample_runs=self.combine_sample_runs.value,
             correct_chips_alignment=self.correct_chips_alignment.value,
             replace_ob_zeros_by_local_median=self.replace_ob_zeros.value,
@@ -1505,6 +1514,15 @@ class MultiFrameNormalizationTof:
             indent=False,
             layout=_layout("280px"),
         )
+        self.enable_spectrum_only_all_button = widgets.Button(
+            description="Spectrum only for all",
+            icon="file-text-o",
+            button_style="info",
+        )
+        self.disable_spectrum_only_all_button = widgets.Button(
+            description="Full images for all",
+            icon="picture-o",
+        )
         self.preview_button = widgets.Button(description="Load ROI profiles and preview", icon="line-chart")
         self.replot_button = widgets.Button(description="Rebin cached profiles", icon="refresh")
         self.save_button = widgets.Button(description="Save recipe", icon="save")
@@ -1581,7 +1599,14 @@ class MultiFrameNormalizationTof:
                 [
                     header,
                     widgets.HTML("<h3>Frame settings</h3>"),
-                    self.same_rois_all_frames,
+                    widgets.HBox(
+                        [
+                            self.same_rois_all_frames,
+                            self.enable_spectrum_only_all_button,
+                            self.disable_spectrum_only_all_button,
+                        ],
+                        layout=_wrapping_row_layout(),
+                    ),
                     self.frame_box,
                     widgets.HTML("<h3>Overlap inspection</h3>"),
                     overlap_controls,
@@ -1623,6 +1648,16 @@ class MultiFrameNormalizationTof:
         self.show_native.observe(self._plot_setting_changed, names="value")
         self.show_errors.observe(self._plot_setting_changed, names="value")
         self.same_rois_all_frames.observe(self._same_rois_all_frames_changed, names="value")
+        self.enable_spectrum_only_all_button.on_click(
+            lambda _button: self._set_all_spectrum_only(True)
+        )
+        self.disable_spectrum_only_all_button.on_click(
+            lambda _button: self._set_all_spectrum_only(False)
+        )
+
+    def _set_all_spectrum_only(self, enabled: bool) -> None:
+        for editor in self.frame_editors:
+            editor.spectrum_only.value = bool(enabled)
 
     def _set_frames(self, frames: list[FrameConfig]) -> None:
         self.frame_editors = [
