@@ -1053,6 +1053,53 @@ class FrameEditor:
             transmission_figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)")
             transmission_figure.update_yaxes(title_text="Transmission")
 
+            flux_figure = go.Figure()
+            flux_ylabel = (
+                "ROI signal (counts / C)"
+                if frame.use_proton_charge
+                else "ROI signal (counts / run)"
+            )
+            for label, counts, variance, color in (
+                (
+                    "sample native ROI flux",
+                    native.sample_counts,
+                    native.sample_variance,
+                    "#1f77b4",
+                ),
+                (
+                    "OB native ROI flux",
+                    native.ob_counts,
+                    native.ob_variance,
+                    "#e45756",
+                ),
+            ):
+                uncertainty = np.sqrt(np.maximum(np.asarray(variance), 0.0))
+                flux_figure.add_trace(
+                    go.Scattergl(
+                        x=native.energy_eV[native_order],
+                        y=np.asarray(counts)[native_order],
+                        mode="lines",
+                        line=dict(color=color, width=1.2),
+                        name=label,
+                        customdata=uncertainty[native_order],
+                        hovertemplate=(
+                            "Energy: %{x:.6g} eV<br>"
+                            "ROI signal: %{y:.6g}<br>"
+                            "Uncertainty: %{customdata:.3g}<extra>%{fullData.name}</extra>"
+                        ),
+                    )
+                )
+            flux_figure.update_layout(
+                title=f"{frame.name}: native sample and OB ROI flux before division",
+                template="plotly_white",
+                height=440,
+                margin=dict(l=70, r=30, t=75, b=60),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            )
+            flux_figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)")
+            flux_figure.update_yaxes(title_text=flux_ylabel)
+
             construction_figure = go.Figure()
             construction_figure.add_trace(
                 go.Bar(
@@ -1089,6 +1136,7 @@ class FrameEditor:
             with self.rebin_preview_output:
                 clear_output(wait=True)
                 transmission_figure.show()
+                flux_figure.show()
                 construction_figure.show()
         except Exception as error:
             self.rebin_bin_summary.value = (

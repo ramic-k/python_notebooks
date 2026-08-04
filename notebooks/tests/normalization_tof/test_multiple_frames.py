@@ -296,7 +296,7 @@ def test_frame_editor_bin_preview_converts_legacy_tof_schedule(tmp_path, monkeyp
 
     editor._preview_bins()
 
-    assert len(captured) == 2, editor.rebin_bin_summary.value
+    assert len(captured) == 3, editor.rebin_bin_summary.value
     assert editor.custom_basis.value == RebinCustomBasis.energy_tof
     converted = editor.to_config().rebin.custom_schedule
     assert [edge for edge, _ in converted[:-1]] == sorted(edge for edge, _ in converted[:-1])
@@ -421,7 +421,7 @@ def test_frame_preview_uses_distinct_sample_and_ob_rois(tmp_path):
     np.testing.assert_allclose(profile.transmission, [2.0, 2.0])
 
 
-def test_frame_editor_bin_preview_reports_counts_and_shows_two_plots(tmp_path, monkeypatch):
+def test_frame_editor_bin_preview_reports_counts_and_shows_flux_plot(tmp_path, monkeypatch):
     sample_frames = [np.full((2, 2), 20 + index, dtype=np.uint16) for index in range(6)]
     ob_frames = [np.full((2, 2), 40 + index, dtype=np.uint16) for index in range(6)]
     sample_path, sample_nexus = _write_run(tmp_path, "711", sample_frames)
@@ -445,10 +445,17 @@ def test_frame_editor_bin_preview_reports_counts_and_shows_two_plots(tmp_path, m
 
     editor._preview_bins()
 
-    assert len(captured) == 2, editor.rebin_bin_summary.value
+    assert len(captured) == 3, editor.rebin_bin_summary.value
     assert "active output bins: 3" in editor.rebin_bin_summary.value
     assert captured[0].layout.xaxis.type == "log"
-    assert captured[1].layout.yaxis2.title.text == "Actual TOF span (us)"
+    assert [trace.name for trace in captured[1].data] == [
+        "sample native ROI flux",
+        "OB native ROI flux",
+    ]
+    assert captured[1].layout.yaxis.title.text == "ROI signal (counts / run)"
+    expected_sample_flux = frame.roi.width * frame.roi.height * np.arange(25, 19, -1)
+    np.testing.assert_allclose(captured[1].data[0].y, expected_sample_flux)
+    assert captured[2].layout.yaxis2.title.text == "Actual TOF span (us)"
     assert editor.preview_bins_button.disabled is False
 
 
