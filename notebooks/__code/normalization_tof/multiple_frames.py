@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -51,6 +52,8 @@ from __code.normalization_tof.utilities import (
 
 
 RECIPE_VERSION = 1
+_ROI_PREVIEW_IO_WORKERS = 8
+_ROI_PREVIEW_PREFETCH_FACTOR = 2
 
 
 def _clean_run_number(value: str | int) -> str:
@@ -519,6 +522,25 @@ def _path_signature(path: Path | None) -> dict[str, Any] | None:
     return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
+def _ordered_parallel_map(function, values: Iterable[Any], max_workers: int):
+    """Yield ordered thread results while keeping only a small bounded queue."""
+    iterator = iter(values)
+    worker_count = max(1, int(max_workers))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        pending = deque()
+        for _ in range(worker_count * _ROI_PREVIEW_PREFETCH_FACTOR):
+            try:
+                pending.append(executor.submit(function, next(iterator)))
+            except StopIteration:
+                break
+        while pending:
+            yield pending.popleft().result()
+            try:
+                pending.append(executor.submit(function, next(iterator)))
+            except StopIteration:
+                pass
+
+
 class RoiProfileCache:
     """Small persistent NPZ cache keyed by source files, ROI, and variance mode."""
 
@@ -533,16 +555,17 @@ class RoiProfileCache:
         use_experimental_uncertainties: bool,
         manual_tof_bin_size_ns: float | None,
     ) -> str:
-        tiffs = retrieve_list_of_tif(str(run.data_path))
+        tiffs = [Path(path) for path in retrieve_list_of_tif(str(run.data_path))]
         spectra_files = sorted(run.data_path.glob("*_Spectra.txt"))
         shutter_files = sorted(run.data_path.glob("*_ShutterCount.txt"))
+        worker_count = min(len(tiffs), os.cpu_count() or 1, _ROI_PREVIEW_IO_WORKERS)
         payload = {
             "cache_schema": 1,
             "run_number": run.run_number,
             "roi": asdict(roi),
             "experimental_uncertainties": use_experimental_uncertainties,
             "manual_tof_bin_size_ns": manual_tof_bin_size_ns,
-            "tiffs": [_path_signature(Path(path)) for path in tiffs],
+            "tiffs": list(_ordered_parallel_map(_path_signature, tiffs, worker_count)),
             "spectra": [_path_signature(path) for path in spectra_files],
             "shutter": [_path_signature(path) for path in shutter_files],
             "nexus": _path_signature(run.nexus_path),
@@ -1266,14 +1289,16 @@ def load_native_roi_profile(
     cumulative_raw: np.ndarray | None = None
     y0, y1 = roi.top, roi.top + roi.height
     x0, x1 = roi.left, roi.left + roi.width
-    for index, tiff in enumerate(tiffs):
-        roi_image, image_shape = _read_tiff_roi(tiff, x0=x0, x1=x1, y0=y0, y1=y1)
-        if y1 > image_shape[0] or x1 > image_shape[1]:
-            raise ValueError(
-                f"Run {run.run_number}: ROI {roi} is outside image shape {image_shape}."
-            )
-        counts[index] = np.sum(roi_image, dtype=np.float64)
-        if use_experimental_uncertainties and shutter_count is not None:
+    worker_count = min(len(tiffs), os.cpu_count() or 1, _ROI_PREVIEW_IO_WORKERS)
+
+    def _load_roi(tiff: Path) -> tuple[np.ndarray, tuple[int, int]]:
+        return _read_tiff_roi(tiff, x0=x0, x1=x1, y0=y0, y1=y1)
+
+    if use_experimental_uncertainties and shutter_count is not None:
+        loaded_rois = _ordered_parallel_map(_load_roi, tiffs, worker_count)
+        for index, (roi_image, image_shape) in enumerate(loaded_rois):
+            _validate_roi_image_shape(run, roi, image_shape, x1=x1, y1=y1)
+            counts[index] = np.sum(roi_image, dtype=np.float64)
             if cumulative_raw is None:
                 cumulative_raw = np.zeros_like(roi_image, dtype=np.float64)
             numerator = roi_image * (shutter_count - cumulative_raw)
@@ -1285,8 +1310,16 @@ def load_native_roi_profile(
             with np.errstate(divide="ignore", invalid="ignore"):
                 pixel_variance = np.where(1.0 - occupancy > 0, roi_image / (1.0 - occupancy), 0.0)
             variance[index] = np.sum(np.maximum(pixel_variance, 0.0), dtype=np.float64)
-        else:
-            variance[index] = max(counts[index], 0.0)
+    else:
+        def _load_count(tiff: Path) -> tuple[float, tuple[int, int]]:
+            roi_image, image_shape = _load_roi(tiff)
+            return float(np.sum(roi_image, dtype=np.float64)), image_shape
+
+        loaded_counts = _ordered_parallel_map(_load_count, tiffs, worker_count)
+        for index, (count, image_shape) in enumerate(loaded_counts):
+            _validate_roi_image_shape(run, roi, image_shape, x1=x1, y1=y1)
+            counts[index] = count
+            variance[index] = max(count, 0.0)
 
     return NativeRunProfile(
         run_number=run.run_number,
@@ -1323,6 +1356,18 @@ def _read_tiff_roi(
     except (OSError, TypeError, ValueError):
         image = np.asarray(imread(path), dtype=np.float64).swapaxes(0, 1)
         return image[y0:y1, x0:x1], tuple(int(value) for value in image.shape)
+
+
+def _validate_roi_image_shape(
+    run: ResolvedRun,
+    roi: RoiConfig,
+    image_shape: tuple[int, int],
+    *,
+    x1: int,
+    y1: int,
+) -> None:
+    if y1 > image_shape[0] or x1 > image_shape[1]:
+        raise ValueError(f"Run {run.run_number}: ROI {roi} is outside image shape {image_shape}.")
 
 
 def calculate_overlap_diagnostics(
