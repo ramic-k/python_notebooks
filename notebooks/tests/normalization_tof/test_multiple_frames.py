@@ -1504,3 +1504,22 @@ def test_spectrum_only_controls_apply_to_every_frame():
 
     ui._set_all_spectrum_only(True)
     assert all(editor.spectrum_only.value for editor in ui.frame_editors)
+
+
+def test_each_frame_delete_button_removes_that_frame_but_keeps_one():
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+    initial_names = [editor.name.value for editor in ui.frame_editors]
+    target = ui.frame_editors[2]
+    target_name = target.name.value
+
+    target.delete_button.click()
+
+    remaining_names = [editor.name.value for editor in ui.frame_editors]
+    assert len(remaining_names) == len(initial_names) - 1
+    assert target_name not in remaining_names
+
+    while len(ui.frame_editors) > 1:
+        ui.frame_editors[0].delete_button.click()
+
+    assert len(ui.frame_editors) == 1
+    assert ui.frame_editors[0].delete_button.disabled is True

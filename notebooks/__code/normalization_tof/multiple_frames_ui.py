@@ -197,11 +197,26 @@ class RunInputEditor:
 
 
 class FrameEditor:
-    def __init__(self, config: FrameConfig, working_dir: str, on_change=None):
+    def __init__(
+        self,
+        config: FrameConfig,
+        working_dir: str,
+        on_change=None,
+        on_delete=None,
+    ):
         self.on_change = on_change
         self.working_dir = working_dir
         self.enabled = widgets.Checkbox(value=config.enabled, description="Use frame", indent=False)
         self.name = widgets.Text(value=config.name, description="Name", layout=_layout("360px"))
+        self.delete_button = widgets.Button(
+            description="Delete frame",
+            icon="trash",
+            button_style="danger",
+            layout=_layout("150px"),
+            tooltip="Delete this frame",
+        )
+        if on_delete is not None:
+            self.delete_button.on_click(lambda _button: on_delete(self))
         self.detector = widgets.Dropdown(
             options=[DetectorType.tpx1_legacy, DetectorType.tpx1, DetectorType.tpx3],
             value=config.detector_type,
@@ -676,7 +691,10 @@ class FrameEditor:
         corrections.set_title(3, "Container correction")
         self.widget = widgets.VBox(
             [
-                widgets.HBox([self.enabled, self.name]),
+                widgets.HBox(
+                    [self.enabled, self.name, self.delete_button],
+                    layout=_wrapping_row_layout(),
+                ),
                 self.detector,
                 self.sample_input.widget,
                 self.ob_input.widget,
@@ -1661,9 +1679,17 @@ class MultiFrameNormalizationTof:
 
     def _set_frames(self, frames: list[FrameConfig]) -> None:
         self.frame_editors = [
-            FrameEditor(frame, self.working_dir, on_change=self._frame_changed)
+            FrameEditor(
+                frame,
+                self.working_dir,
+                on_change=self._frame_changed,
+                on_delete=self._delete_frame,
+            )
             for frame in frames
         ]
+        only_one_frame = len(self.frame_editors) <= 1
+        for editor in self.frame_editors:
+            editor.delete_button.disabled = only_one_frame
         self.frame_box.children = tuple(editor.widget for editor in self.frame_editors)
         for index, editor in enumerate(self.frame_editors):
             self.frame_box.set_title(index, editor.name.value or f"frame {index + 1}")
@@ -1858,6 +1884,16 @@ class MultiFrameNormalizationTof:
         if len(self.frame_editors) <= 1:
             return
         self._set_frames([editor.to_config() for editor in self.frame_editors[:-1]])
+
+    def _delete_frame(self, target: FrameEditor) -> None:
+        if len(self.frame_editors) <= 1 or target not in self.frame_editors:
+            return
+        frames = [
+            editor.to_config()
+            for editor in self.frame_editors
+            if editor is not target
+        ]
+        self._set_frames(frames)
 
     def _preview(self, _button) -> None:
         with self.status_output:
