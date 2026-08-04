@@ -475,6 +475,38 @@ def test_run_parser_and_recipe_round_trip(tmp_path):
     assert json.loads(recipe_path.read_text())["recipe_version"] == 1
 
 
+def test_direct_data_folder_infers_nexus_from_its_own_ipts(tmp_path):
+    source_ipts = tmp_path / "SNS" / "VENUS" / "IPTS-36914"
+    data_path = (
+        source_ipts
+        / "shared"
+        / "autoreduce"
+        / "images"
+        / "tpx1"
+        / "raw"
+        / "radiography"
+        / "Run_19560"
+    )
+    data_path.mkdir(parents=True)
+    nexus_path = source_ipts / "nexus" / "VENUS_19560.nxs.h5"
+    nexus_path.parent.mkdir()
+    with h5py.File(nexus_path, "w") as nexus:
+        entry = nexus.create_group("entry")
+        entry.create_dataset("proton_charge", data=[1.0e12])
+
+    recipe = MultiFrameRecipe(
+        working_dir=str(tmp_path / "SNS" / "VENUS" / "IPTS-35167"),
+        frames=[],
+    )
+    resolved = MultiFramePreviewEngine(recipe).resolve_run(
+        RunSpec("19560", data_path=str(data_path)),
+        DetectorType.tpx1,
+    )
+
+    assert resolved.data_path == data_path
+    assert resolved.nexus_path == nexus_path
+
+
 def test_new_frame_defaults_match_single_frame_notebook():
     frame = _empty_frame("frame", DetectorType.tpx1)
     recipe = MultiFrameRecipe(working_dir="/SNS/VENUS/IPTS-36914", frames=[frame])

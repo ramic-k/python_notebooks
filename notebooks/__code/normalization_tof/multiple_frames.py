@@ -87,6 +87,18 @@ def parse_run_numbers(value: str | Iterable[str | int]) -> list[str]:
     return runs
 
 
+def _infer_nexus_path_from_data_path(
+    data_path: Path,
+    instrument: str,
+    run_number: str,
+) -> Path | None:
+    for parent in (data_path, *data_path.parents):
+        if re.fullmatch(r"IPTS-\d+", parent.name, flags=re.IGNORECASE):
+            nexus_path = parent / "nexus" / f"{instrument.upper()}_{run_number}.nxs.h5"
+            return nexus_path if nexus_path.exists() else None
+    return None
+
+
 @dataclass(frozen=True)
 class RoiConfig:
     left: int = 0
@@ -661,6 +673,12 @@ class MultiFramePreviewEngine:
 
         if spec.data_path:
             data_path = Path(spec.data_path).expanduser()
+            if nexus_path is None:
+                nexus_path = _infer_nexus_path_from_data_path(
+                    data_path,
+                    self.recipe.instrument,
+                    run_number,
+                )
         elif detector_type == DetectorType.tpx1_legacy:
             base = (
                 Path(autoreduce_dir[self.recipe.instrument][detector_type][0])
