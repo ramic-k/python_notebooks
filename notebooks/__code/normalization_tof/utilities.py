@@ -2,10 +2,10 @@ import argparse
 import glob
 import hashlib
 import logging
-import multiprocessing as mp
 import os
 import re
 import shutil
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from sqlite3 import Time
@@ -30,6 +30,8 @@ from __code._utilities.json import load_json, save_json
 
 MARKERSIZE = 6
 MAX_NORMALIZATION_OUTPUT_BASENAME_LENGTH = 220
+FULL_STACK_IO_WORKERS = 4
+TIFF_IO_PREFETCH_FACTOR = 2
 
 
 def _compact_run_label(run_label) -> str:
@@ -136,6 +138,25 @@ def _worker(fl):
     #return (imread(fl).astype(np.float32))
 
 
+def _bounded_ordered_thread_map(function, values, max_workers: int):
+    """Yield ordered thread results without submitting the full TIFF list at once."""
+    iterator = iter(values)
+    worker_count = max(1, int(max_workers))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        pending = deque()
+        for _ in range(worker_count * TIFF_IO_PREFETCH_FACTOR):
+            try:
+                pending.append(executor.submit(function, next(iterator)))
+            except StopIteration:
+                break
+        while pending:
+            yield pending.popleft().result()
+            try:
+                pending.append(executor.submit(function, next(iterator)))
+            except StopIteration:
+                pass
+
+
 def _load_integrated_tof_data(list_tif: list = None) -> np.ndarray:
     if not list_tif:
         return np.array([], dtype=np.float32)
@@ -143,25 +164,41 @@ def _load_integrated_tof_data(list_tif: list = None) -> np.ndarray:
     max_workers = min(len(list_tif), os.cpu_count() or 1, 8)
     integrated_data = None
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for frame in executor.map(_worker, list_tif):
-            if integrated_data is None:
-                integrated_data = frame
-            else:
-                integrated_data += frame
+    for frame in _bounded_ordered_thread_map(_worker, list_tif, max_workers=max_workers):
+        if integrated_data is None:
+            integrated_data = frame
+        else:
+            integrated_data += frame
 
     return integrated_data
 
 
+def _load_tof_stack(list_tif: list = None) -> np.ndarray:
+    if not list_tif:
+        return np.array([], dtype=np.float32)
+
+    first_frame = _worker(list_tif[0])
+    data = np.empty((len(list_tif), *first_frame.shape), dtype=np.float32)
+    data[0] = first_frame
+
+    remaining_files = list_tif[1:]
+    if remaining_files:
+        max_workers = min(len(remaining_files), FULL_STACK_IO_WORKERS)
+        for index, frame in enumerate(
+            _bounded_ordered_thread_map(_worker, remaining_files, max_workers=max_workers),
+            start=1,
+        ):
+            data[index] = frame
+
+    return data
+
+
 def load_data_using_multithreading(list_tif: list = None, combine_tof: bool = False) -> np.ndarray:
-    """load data using multithreading"""
+    """Load a TIFF stack, or integrate it over TOF, with bounded I/O threads."""
     if combine_tof:
         return _load_integrated_tof_data(list_tif=list_tif)
 
-    with mp.Pool(processes=40) as pool:
-        data = pool.map(_worker, list_tif)
-
-    return np.array(data, dtype=np.float32)
+    return _load_tof_stack(list_tif=list_tif)
 
 
 def _get_timepix_geometry_correction():

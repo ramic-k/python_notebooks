@@ -47,6 +47,7 @@ from __code.normalization_tof.multiple_frames_ui import (
 from __code.normalization_tof.utilities import (
     build_rebin_bin_groups,
     calculate_detector_corrected_variance,
+    load_data_using_multithreading,
     perform_spectrum_normalization,
 )
 
@@ -72,6 +73,24 @@ def _write_run(root: Path, run_number: str, frames: list[np.ndarray], charge_c: 
         delay = daslogs.create_group("BL10:Det:TH:DSPT1:TIDelay")
         delay.create_dataset("value", data=[0.0])
     return data_path, nexus_path
+
+
+def test_tiff_stack_loader_preserves_frame_order_orientation_and_dtype(tmp_path):
+    frames = [
+        np.array([[1, 2, 3], [4, 5, 6]], dtype=np.uint16),
+        np.array([[10, 20, 30], [40, 50, 60]], dtype=np.uint16),
+        np.array([[100, 200, 300], [400, 500, 600]], dtype=np.uint16),
+    ]
+    data_path, _ = _write_run(tmp_path, "99", frames)
+    files = sorted(str(path) for path in data_path.glob("*.tif"))
+
+    stack = load_data_using_multithreading(files)
+    integrated = load_data_using_multithreading(files, combine_tof=True)
+    expected = np.stack(frames, axis=0).astype(np.float32).swapaxes(1, 2)
+
+    assert stack.dtype == np.float32
+    np.testing.assert_array_equal(stack, expected)
+    np.testing.assert_array_equal(integrated, expected.sum(axis=0, dtype=np.float32))
 
 
 def _frame(
