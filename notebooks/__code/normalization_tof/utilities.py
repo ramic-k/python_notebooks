@@ -277,17 +277,41 @@ def load_rebinned_normalized_data_from_tiffs(
     active_frame_groups,
     combine_samples: bool,
     use_proton_charge: bool,
+    measured_background_runtime_configs=None,
 ) -> np.ndarray:
-    """Stream and average native pixel transmissions into the active output bins."""
+    """Stream and average corrected native pixel transmissions into output bins."""
     sample_infos = [sample_master_dict[run_number] for run_number in sample_run_numbers]
     ob_infos = list(ob_master_dict.values())
     if not sample_infos or not ob_infos:
         raise ValueError("Streaming native-ratio normalization requires sample and OB runs.")
 
-    file_lists = [info[MasterDictKeys.list_tif] for info in sample_infos + ob_infos]
+    background_terms = []
+    for config in measured_background_runtime_configs or []:
+        sample_background_infos = list(config["sample_master_dict"].values())
+        ob_background_infos = list(config["ob_master_dict"].values())
+        if not sample_background_infos or not ob_background_infos:
+            raise ValueError(
+                "Streaming measured-background correction requires sample and OB background runs."
+            )
+        background_terms.append(
+            {
+                "weight": float(config.get("weight", 1.0)),
+                "sample_infos": sample_background_infos,
+                "ob_infos": ob_background_infos,
+            }
+        )
+
+    all_infos = sample_infos + ob_infos
+    for term in background_terms:
+        all_infos.extend(term["sample_infos"])
+        all_infos.extend(term["ob_infos"])
+    file_lists = [info[MasterDictKeys.list_tif] for info in all_infos]
     frame_counts = {len(files) for files in file_lists}
     if len(frame_counts) != 1:
-        raise ValueError("Streaming native-ratio normalization requires equal TIFF counts in every run.")
+        raise ValueError(
+            "Streaming native-ratio normalization requires equal TIFF counts in every run, "
+            "including measured-background runs."
+        )
     frame_count = frame_counts.pop()
     frame_to_group = _frame_group_index_array(active_frame_groups, frame_count)
 
@@ -296,15 +320,38 @@ def load_rebinned_normalized_data_from_tiffs(
             [info[MasterDictKeys.proton_charge] for info in sample_infos],
             dtype=np.float64,
         )
-        ob_charges = np.asarray(
-            [info[MasterDictKeys.proton_charge] for info in ob_infos],
-            dtype=np.float64,
-        )
         sample_charge_total = float(np.sum(sample_charges))
-        ob_charge_total = float(np.sum(ob_charges))
+        ob_charge_total = float(
+            np.sum([info[MasterDictKeys.proton_charge] for info in ob_infos])
+        )
+        for term in background_terms:
+            term["sample_charge_total"] = float(
+                np.sum(
+                    [
+                        info[MasterDictKeys.proton_charge]
+                        for info in term["sample_infos"]
+                    ]
+                )
+            )
+            term["ob_charge_total"] = float(
+                np.sum(
+                    [
+                        info[MasterDictKeys.proton_charge]
+                        for info in term["ob_infos"]
+                    ]
+                )
+            )
     else:
-        sample_charges = ob_charges = None
+        sample_charges = None
         sample_charge_total = ob_charge_total = 1.0
+
+    def combine_run_frame(infos, frame_index: int, charge_total: float) -> np.ndarray:
+        frames = [_worker(info[MasterDictKeys.list_tif][frame_index]) for info in infos]
+        combined = frames[0].copy()
+        for frame in frames[1:]:
+            combined += frame
+        divisor = charge_total if use_proton_charge else len(frames)
+        return combined / divisor
 
     def load_native_ratio(frame_index: int) -> np.ndarray:
         sample_frames = [_worker(info[MasterDictKeys.list_tif][frame_index]) for info in sample_infos]
@@ -319,16 +366,21 @@ def load_rebinned_normalized_data_from_tiffs(
             if use_proton_charge:
                 sample_data = sample_data / sample_charges[0]
 
-        ob_frames = [_worker(info[MasterDictKeys.list_tif][frame_index]) for info in ob_infos]
-        if use_proton_charge:
-            ob_data = ob_frames[0] * (ob_charges[0] / ob_charge_total)
-            for frame, charge in zip(ob_frames[1:], ob_charges[1:]):
-                ob_data += frame * (charge / ob_charge_total)
-        else:
-            ob_data = ob_frames[0].copy()
-            for frame in ob_frames[1:]:
-                ob_data += frame
-            ob_data /= len(ob_frames)
+        ob_data = combine_run_frame(ob_infos, frame_index, ob_charge_total)
+
+        for term in background_terms:
+            sample_background = combine_run_frame(
+                term["sample_infos"],
+                frame_index,
+                term.get("sample_charge_total", 1.0),
+            )
+            ob_background = combine_run_frame(
+                term["ob_infos"],
+                frame_index,
+                term.get("ob_charge_total", 1.0),
+            )
+            sample_data = sample_data - term["weight"] * sample_background
+            ob_data = ob_data - term["weight"] * ob_background
 
         normalized = np.divide(
             sample_data,

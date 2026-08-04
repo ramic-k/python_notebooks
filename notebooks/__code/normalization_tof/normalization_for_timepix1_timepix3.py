@@ -384,8 +384,6 @@ def normalization_with_list_of_full_path(
         streaming_rebin_fallback_reasons.append("OB zero replacement is enabled")
     if dc_master_dict:
         streaming_rebin_fallback_reasons.append("dark-current correction is enabled")
-    if measured_background_correction_enabled:
-        streaming_rebin_fallback_reasons.append("measured-background correction is enabled")
     if black_filter_background_config and black_filter_background_config.get("enabled", False):
         streaming_rebin_fallback_reasons.append("black-filter background correction is enabled")
     if container_normalization_requested:
@@ -402,10 +400,25 @@ def normalization_with_list_of_full_path(
             streaming_rebin_fallback_reasons.append("the native spectra/time axis is unavailable")
         else:
             native_time_spectra = np.asarray(native_time_spectra, dtype=np.float64)
-            for master_dict_name, current_master_dict in (
+            streaming_master_dicts = [
                 ("sample", sample_master_dict),
                 ("OB", ob_master_dict),
-            ):
+            ]
+            for background_config in measured_background_runtime_configs:
+                column_label = background_config["column_label"]
+                streaming_master_dicts.extend(
+                    [
+                        (
+                            f"measured sample background ({column_label})",
+                            background_config["sample_master_dict"],
+                        ),
+                        (
+                            f"measured OB background ({column_label})",
+                            background_config["ob_master_dict"],
+                        ),
+                    ]
+                )
+            for master_dict_name, current_master_dict in streaming_master_dicts:
                 for run_number, run_info in current_master_dict.items():
                     run_time_spectra = run_info[MasterDictKeys.list_spectra]
                     if run_time_spectra is None:
@@ -503,7 +516,7 @@ def normalization_with_list_of_full_path(
         )
         uncertainty_model_label += (
             "; measured Bragg-edge background correction propagates independent "
-            "sample/OB background variances on the native frame grid before rebinning "
+            "sample/OB background variances with linear count subtraction before normalization "
             f"with squared weights ({background_weight_summary})"
         )
 
@@ -563,9 +576,14 @@ def normalization_with_list_of_full_path(
                 "ob_background_variance": total_ob_background_variance,
             }
 
+            correction_grid = (
+                "native frame grid before rebinning"
+                if streaming_rebin_payload is None
+                else "streamed output-bin grid before normalization"
+            )
             logging.info(
-                "Subtracting measured Bragg-edge background on the native frame grid before rebinning: "
-                f"{combined_label}"
+                "Subtracting measured Bragg-edge background on the "
+                f"{correction_grid}: {combined_label}"
             )
             sample_data_for_rebin = current_sample_data - total_sample_background_data
             sample_variance_for_rebin = current_sample_variance + total_sample_background_variance
@@ -663,50 +681,38 @@ def normalization_with_list_of_full_path(
         rebinned_payload["bragg_edge_cd_background_profile"] = None
         rebinned_payload["measured_background_profiles"] = []
         if measured_background_diagnostic is not None:
-            active_frame_groups = rebinned_payload["active_frame_groups"]
+            if streaming_rebin_payload is None:
+                active_frame_groups = rebinned_payload["active_frame_groups"]
+
+                def diagnostic_data(data):
+                    return rebin_array_from_bin_groups(
+                        data,
+                        active_frame_groups,
+                        reducer="sum",
+                    )
+            else:
+                def diagnostic_data(data):
+                    return data
+
             rebinned_payload["measured_background_profiles"].append(
                 calculate_bragg_edge_cd_background_profile(
                     sample_roi=sample_roi,
                     ob_roi=ob_roi,
-                    raw_sample_data=rebin_array_from_bin_groups(
-                        current_sample_data,
-                        active_frame_groups,
-                        reducer="sum",
+                    raw_sample_data=diagnostic_data(current_sample_data),
+                    raw_sample_variance=diagnostic_data(current_sample_variance),
+                    raw_ob_data=diagnostic_data(ob_data_combined),
+                    raw_ob_variance=diagnostic_data(ob_data_combined_variance),
+                    sample_background_data=diagnostic_data(
+                        measured_background_diagnostic["sample_background_data"]
                     ),
-                    raw_sample_variance=rebin_array_from_bin_groups(
-                        current_sample_variance,
-                        active_frame_groups,
-                        reducer="sum",
+                    sample_background_variance=diagnostic_data(
+                        measured_background_diagnostic["sample_background_variance"]
                     ),
-                    raw_ob_data=rebin_array_from_bin_groups(
-                        ob_data_combined,
-                        active_frame_groups,
-                        reducer="sum",
+                    ob_background_data=diagnostic_data(
+                        measured_background_diagnostic["ob_background_data"]
                     ),
-                    raw_ob_variance=rebin_array_from_bin_groups(
-                        ob_data_combined_variance,
-                        active_frame_groups,
-                        reducer="sum",
-                    ),
-                    sample_background_data=rebin_array_from_bin_groups(
-                        measured_background_diagnostic["sample_background_data"],
-                        active_frame_groups,
-                        reducer="sum",
-                    ),
-                    sample_background_variance=rebin_array_from_bin_groups(
-                        measured_background_diagnostic["sample_background_variance"],
-                        active_frame_groups,
-                        reducer="sum",
-                    ),
-                    ob_background_data=rebin_array_from_bin_groups(
-                        measured_background_diagnostic["ob_background_data"],
-                        active_frame_groups,
-                        reducer="sum",
-                    ),
-                    ob_background_variance=rebin_array_from_bin_groups(
-                        measured_background_diagnostic["ob_background_variance"],
-                        active_frame_groups,
-                        reducer="sum",
+                    ob_background_variance=diagnostic_data(
+                        measured_background_diagnostic["ob_background_variance"]
                     ),
                     mode=measured_background_diagnostic["mode"],
                     column_label="measured background combined",
@@ -1029,6 +1035,7 @@ def normalization_with_list_of_full_path(
                 active_frame_groups=streaming_active_frame_groups,
                 combine_samples=True,
                 use_proton_charge=normalized_by_proton_charge,
+                measured_background_runtime_configs=measured_background_runtime_configs,
             )
         rebinned_payload = prepare_rebinned_payload(
             current_sample_data=sample_data_combined,
@@ -1254,6 +1261,7 @@ def normalization_with_list_of_full_path(
                     active_frame_groups=streaming_active_frame_groups,
                     combine_samples=False,
                     use_proton_charge=normalized_by_proton_charge,
+                    measured_background_runtime_configs=measured_background_runtime_configs,
                 )
             rebinned_payload = prepare_rebinned_payload(
                 current_sample_data=_sample_data,

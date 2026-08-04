@@ -133,7 +133,7 @@ def test_streaming_rebin_matches_full_stack_counts_and_experimental_variance(tmp
     )
 
 
-def test_streaming_native_ratio_matches_legacy_repeated_run_scaling(tmp_path):
+def test_streaming_native_ratio_matches_production_repeated_run_scaling(tmp_path):
     shape = (2, 2)
     sample_1 = [np.full(shape, value, dtype=np.uint16) for value in (2, 6, 3, 9)]
     sample_2 = [np.full(shape, value, dtype=np.uint16) for value in (1, 3, 2, 6)]
@@ -169,9 +169,9 @@ def test_streaming_native_ratio_matches_legacy_repeated_run_scaling(tmp_path):
     )
     sample_native = (np.asarray([2, 6, 3, 9]) + np.asarray([1, 3, 2, 6])) / 3.0
     ob_native = (
-        np.asarray([2, 4, 3, 6]) * 0.25
-        + np.asarray([4, 8, 6, 12]) * 0.75
-    )
+        np.asarray([2, 4, 3, 6])
+        + np.asarray([4, 8, 6, 12])
+    ) / 4.0
     native_ratio = sample_native / ob_native
     expected = np.asarray(
         [
@@ -183,6 +183,66 @@ def test_streaming_native_ratio_matches_legacy_repeated_run_scaling(tmp_path):
     expected = np.broadcast_to(expected, streamed.shape)
 
     np.testing.assert_allclose(streamed, expected, rtol=1e-7)
+
+
+def test_streaming_native_ratio_applies_weighted_measured_backgrounds(tmp_path):
+    shape = (2, 2)
+    frame_values = {
+        "85": (10, 18, 12, 16),
+        "86": (20, 30, 24, 32),
+        "87": (2, 4, 2, 4),
+        "88": (4, 6, 4, 8),
+    }
+    paths = {}
+    for run_number, values in frame_values.items():
+        frames = [np.full(shape, value, dtype=np.uint16) for value in values]
+        data_path, _ = _write_run(tmp_path, run_number, frames)
+        paths[run_number] = sorted(str(path) for path in data_path.glob("*.tif"))
+
+    def info(run_number):
+        return {
+            MasterDictKeys.list_tif: paths[run_number],
+            MasterDictKeys.proton_charge: 1.0,
+        }
+
+    groups = [np.asarray([0, 1]), np.asarray([2, 3])]
+    streamed = load_rebinned_normalized_data_from_tiffs(
+        sample_master_dict={"85": info("85")},
+        ob_master_dict={"86": info("86")},
+        sample_run_numbers=["85"],
+        active_frame_groups=groups,
+        combine_samples=True,
+        use_proton_charge=True,
+        measured_background_runtime_configs=[
+            {
+                "weight": 0.5,
+                "sample_master_dict": {"87": info("87")},
+                "ob_master_dict": {"88": info("88")},
+            }
+        ],
+    )
+
+    sample = np.asarray(frame_values["85"], dtype=np.float64)
+    ob = np.asarray(frame_values["86"], dtype=np.float64)
+    sample_background = np.asarray(frame_values["87"], dtype=np.float64)
+    ob_background = np.asarray(frame_values["88"], dtype=np.float64)
+    corrected_native_ratio = (
+        (sample - 0.5 * sample_background)
+        / (ob - 0.5 * ob_background)
+    )
+    expected = np.asarray(
+        [
+            corrected_native_ratio[:2].mean(),
+            corrected_native_ratio[2:].mean(),
+        ],
+        dtype=np.float32,
+    )[:, None, None]
+
+    np.testing.assert_allclose(
+        streamed,
+        np.broadcast_to(expected, streamed.shape),
+        rtol=1e-7,
+    )
 
 
 def test_production_normalization_uses_streaming_rebin_path(tmp_path, monkeypatch):
@@ -250,6 +310,105 @@ def test_production_normalization_uses_streaming_rebin_path(tmp_path, monkeypatc
         dtype=np.float32,
     )[:, None, None]
     np.testing.assert_allclose(normalized, np.broadcast_to(expected, normalized.shape))
+    assert len(result.tof_array) == 2
+
+
+def test_production_streaming_rebin_supports_measured_background(tmp_path, monkeypatch):
+    shape = (2, 2)
+    frame_values = {
+        "75": (10, 18, 12, 16),
+        "76": (20, 30, 24, 32),
+        "77": (2, 4, 2, 4),
+        "78": (4, 6, 4, 8),
+    }
+    runs = {}
+    for run_number, values in frame_values.items():
+        frames = [np.full(shape, value, dtype=np.uint16) for value in values]
+        runs[run_number] = _write_run(tmp_path, run_number, frames)
+
+    def run_dict(run_number):
+        data_path, nexus_path = runs[run_number]
+        return {
+            data_path.name: {
+                "full_path": str(data_path),
+                "nexus": str(nexus_path),
+            }
+        }
+
+    output = tmp_path / "background_output"
+    output.mkdir()
+    roi = RoiConfig(left=0, top=0, width=2, height=2).to_roi()
+    monkeypatch.setattr(production_normalization, "initialize_logging", lambda: None)
+
+    def fail_full_stack_loader(*_args, **_kwargs):
+        raise AssertionError("Stage 1 full-stack loader was called")
+
+    monkeypatch.setattr(
+        normalization_utilities,
+        "load_data_using_multithreading",
+        fail_full_stack_loader,
+    )
+    result = production_normalization.normalization_with_list_of_full_path(
+        sample_dict=run_dict("75"),
+        ob_dict=run_dict("76"),
+        dc_dict={},
+        spectra_array=(np.arange(4, dtype=np.float64) + 0.5) * 1e-6,
+        output_folder=str(output),
+        verbose=False,
+        proton_charge_flag=True,
+        output_tif=False,
+        preview=False,
+        correct_chips_alignment_flag=False,
+        export_mode={
+            "sample_stack": False,
+            "ob_stack": False,
+            "normalized_stack": False,
+            "sample_integrated": False,
+            "ob_integrated": False,
+            "normalized_integrated": False,
+            "x_axis": False,
+        },
+        roi=roi,
+        sample_roi=roi,
+        ob_roi=roi,
+        rebin_mode=RebinMode.linear_tof,
+        rebin_delta_tof_us=2.0,
+        experimental_uncertainties_flag=True,
+        measured_background_correction_configs=[
+            {
+                "enabled": True,
+                "weight": 0.5,
+                "mode": "test measured background",
+                "column_label": "test background",
+                "key_prefix": "test_background",
+                "sample_background_dict": run_dict("77"),
+                "ob_background_dict": run_dict("78"),
+            }
+        ],
+    )
+
+    sample = np.asarray(frame_values["75"], dtype=np.float64)
+    ob = np.asarray(frame_values["76"], dtype=np.float64)
+    sample_background = np.asarray(frame_values["77"], dtype=np.float64)
+    ob_background = np.asarray(frame_values["78"], dtype=np.float64)
+    corrected_native_ratio = (
+        (sample - 0.5 * sample_background)
+        / (ob - 0.5 * ob_background)
+    )
+    expected = np.asarray(
+        [
+            corrected_native_ratio[:2].mean(),
+            corrected_native_ratio[2:].mean(),
+        ],
+        dtype=np.float32,
+    )[:, None, None]
+    normalized = next(iter(result.data.values()))
+
+    np.testing.assert_allclose(
+        normalized,
+        np.broadcast_to(expected, normalized.shape),
+        rtol=1e-7,
+    )
     assert len(result.tof_array) == 2
 
 
