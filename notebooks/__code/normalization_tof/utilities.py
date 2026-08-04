@@ -123,6 +123,7 @@ class MasterDictKeys:
     list_spectra = "list_spectra"
     spectra_file_name = "spectra_file_name"
     detector_delay_us = "detector_delay_us"
+    variance = "variance"
 
 
 class StatusMetadata:
@@ -191,6 +192,167 @@ def _load_tof_stack(list_tif: list = None) -> np.ndarray:
             data[index] = frame
 
     return data
+
+
+def _frame_group_index_array(active_frame_groups, frame_count: int) -> np.ndarray:
+    if not active_frame_groups:
+        raise ValueError("Streaming rebinning requires at least one active output bin.")
+
+    frame_to_group = np.full(frame_count, -1, dtype=int)
+    for group_index, frame_group in enumerate(active_frame_groups):
+        indices = np.asarray(frame_group, dtype=int)
+        if np.any(indices < 0) or np.any(indices >= frame_count):
+            raise ValueError("A streaming rebin group contains an out-of-range TIFF index.")
+        if np.any(frame_to_group[indices] != -1):
+            raise ValueError("A native TIFF index appears in more than one streaming rebin group.")
+        frame_to_group[indices] = group_index
+    return frame_to_group
+
+
+def load_rebinned_tof_data(
+    list_tif: list,
+    active_frame_groups,
+    shutter_counts=None,
+    use_experimental_uncertainties: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stream TIFFs directly into output-bin count and variance stacks."""
+    if not list_tif:
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float64)
+
+    frame_to_group = _frame_group_index_array(active_frame_groups, len(list_tif))
+    group_count = len(active_frame_groups)
+    max_workers = min(len(list_tif), FULL_STACK_IO_WORKERS)
+    primary_shutter_count = (
+        _extract_primary_shutter_count(shutter_counts)
+        if use_experimental_uncertainties
+        else None
+    )
+    rebinned_data = None
+    rebinned_variance = None
+    cumulative_raw = None
+
+    for frame_index, frame in enumerate(
+        _bounded_ordered_thread_map(_worker, list_tif, max_workers=max_workers)
+    ):
+        if rebinned_data is None:
+            rebinned_data = np.zeros((group_count, *frame.shape), dtype=np.float32)
+            rebinned_variance = np.zeros((group_count, *frame.shape), dtype=np.float64)
+            if primary_shutter_count is not None:
+                cumulative_raw = np.zeros(frame.shape, dtype=np.float64)
+
+        frame_float64 = np.asarray(frame, dtype=np.float64)
+        if primary_shutter_count is not None:
+            numerator = frame_float64 * (primary_shutter_count - cumulative_raw)
+            denominator = primary_shutter_count + frame_float64
+            with np.errstate(divide="ignore", invalid="ignore"):
+                raw_frame = np.where(
+                    (denominator > 0) & (numerator >= 0),
+                    numerator / denominator,
+                    0.0,
+                )
+            cumulative_raw += raw_frame
+            occupancy = cumulative_raw / primary_shutter_count
+            with np.errstate(divide="ignore", invalid="ignore"):
+                frame_variance = np.where(
+                    1.0 - occupancy > 0,
+                    frame_float64 / (1.0 - occupancy),
+                    0.0,
+                )
+            frame_variance = np.maximum(frame_variance, 0.0)
+        else:
+            frame_variance = frame_float64
+
+        group_index = frame_to_group[frame_index]
+        if group_index >= 0:
+            rebinned_data[group_index] += frame
+            rebinned_variance[group_index] += frame_variance
+
+    return rebinned_data, rebinned_variance
+
+
+def load_rebinned_normalized_data_from_tiffs(
+    sample_master_dict: dict,
+    ob_master_dict: dict,
+    sample_run_numbers: list,
+    active_frame_groups,
+    combine_samples: bool,
+    use_proton_charge: bool,
+) -> np.ndarray:
+    """Stream and average native pixel transmissions into the active output bins."""
+    sample_infos = [sample_master_dict[run_number] for run_number in sample_run_numbers]
+    ob_infos = list(ob_master_dict.values())
+    if not sample_infos or not ob_infos:
+        raise ValueError("Streaming native-ratio normalization requires sample and OB runs.")
+
+    file_lists = [info[MasterDictKeys.list_tif] for info in sample_infos + ob_infos]
+    frame_counts = {len(files) for files in file_lists}
+    if len(frame_counts) != 1:
+        raise ValueError("Streaming native-ratio normalization requires equal TIFF counts in every run.")
+    frame_count = frame_counts.pop()
+    frame_to_group = _frame_group_index_array(active_frame_groups, frame_count)
+
+    if use_proton_charge:
+        sample_charges = np.asarray(
+            [info[MasterDictKeys.proton_charge] for info in sample_infos],
+            dtype=np.float64,
+        )
+        ob_charges = np.asarray(
+            [info[MasterDictKeys.proton_charge] for info in ob_infos],
+            dtype=np.float64,
+        )
+        sample_charge_total = float(np.sum(sample_charges))
+        ob_charge_total = float(np.sum(ob_charges))
+    else:
+        sample_charges = ob_charges = None
+        sample_charge_total = ob_charge_total = 1.0
+
+    def load_native_ratio(frame_index: int) -> np.ndarray:
+        sample_frames = [_worker(info[MasterDictKeys.list_tif][frame_index]) for info in sample_infos]
+        if combine_samples:
+            sample_data = sample_frames[0].copy()
+            for frame in sample_frames[1:]:
+                sample_data += frame
+            divisor = sample_charge_total if use_proton_charge else len(sample_frames)
+            sample_data = sample_data / divisor
+        else:
+            sample_data = sample_frames[0]
+            if use_proton_charge:
+                sample_data = sample_data / sample_charges[0]
+
+        ob_frames = [_worker(info[MasterDictKeys.list_tif][frame_index]) for info in ob_infos]
+        if use_proton_charge:
+            ob_data = ob_frames[0] * (ob_charges[0] / ob_charge_total)
+            for frame, charge in zip(ob_frames[1:], ob_charges[1:]):
+                ob_data += frame * (charge / ob_charge_total)
+        else:
+            ob_data = ob_frames[0].copy()
+            for frame in ob_frames[1:]:
+                ob_data += frame
+            ob_data /= len(ob_frames)
+
+        normalized = np.divide(
+            sample_data,
+            ob_data,
+            out=np.zeros_like(sample_data),
+            where=ob_data != 0,
+        )
+        normalized[ob_data == 0] = 0
+        return normalized
+
+    rebinned_sum = None
+    max_workers = min(frame_count, FULL_STACK_IO_WORKERS)
+    for frame_index, normalized in enumerate(
+        _bounded_ordered_thread_map(load_native_ratio, range(frame_count), max_workers=max_workers)
+    ):
+        if rebinned_sum is None:
+            rebinned_sum = np.zeros((len(active_frame_groups), *normalized.shape), dtype=np.float32)
+        group_index = frame_to_group[frame_index]
+        if group_index >= 0:
+            rebinned_sum[group_index] += normalized
+
+    for group_index, frame_group in enumerate(active_frame_groups):
+        rebinned_sum[group_index] /= len(frame_group)
+    return rebinned_sum
 
 
 def load_data_using_multithreading(list_tif: list = None, combine_tof: bool = False) -> np.ndarray:
@@ -1110,16 +1272,33 @@ def maybe_rebin_data_and_axes(
     }
 
 
-def load_images(master_dict=None, data_type=DataType.sample, verbose=False):
+def load_images(
+    master_dict=None,
+    data_type=DataType.sample,
+    verbose=False,
+    active_frame_groups=None,
+    use_experimental_uncertainties: bool = False,
+):
 
     logging.info(f"Loading {data_type} data ...")
     for _run_number in master_dict.keys():
         logging.info(f"\tloading {data_type}# {_run_number} ... ")
         if verbose:
             display(HTML(f"Loading {data_type}# {_run_number} ..."))
-        master_dict[_run_number][MasterDictKeys.data] = load_data_using_multithreading(
-            master_dict[_run_number][MasterDictKeys.list_tif], combine_tof=False
-        )
+        if active_frame_groups is None:
+            master_dict[_run_number][MasterDictKeys.data] = load_data_using_multithreading(
+                master_dict[_run_number][MasterDictKeys.list_tif], combine_tof=False
+            )
+            master_dict[_run_number][MasterDictKeys.variance] = None
+        else:
+            data, variance = load_rebinned_tof_data(
+                list_tif=master_dict[_run_number][MasterDictKeys.list_tif],
+                active_frame_groups=active_frame_groups,
+                shutter_counts=master_dict[_run_number].get(MasterDictKeys.shutter_counts),
+                use_experimental_uncertainties=use_experimental_uncertainties,
+            )
+            master_dict[_run_number][MasterDictKeys.data] = data
+            master_dict[_run_number][MasterDictKeys.variance] = variance
         logging.info(f"\t{data_type}# {_run_number} loaded!")
         logging.info(f"\t{master_dict[_run_number][MasterDictKeys.data].shape = }")
         if verbose:
@@ -1463,11 +1642,13 @@ def calculate_combined_data_variance(
     full_variance = []
     for _run_number in run_numbers:
         data = np.asarray(master_dict[_run_number][MasterDictKeys.data], dtype=np.float64)
-        variance = calculate_data_variance(
-            data=data,
-            shutter_counts=master_dict[_run_number].get(MasterDictKeys.shutter_counts),
-            use_experimental_uncertainties=use_experimental_uncertainties,
-        )
+        variance = master_dict[_run_number].get(MasterDictKeys.variance)
+        if variance is None:
+            variance = calculate_data_variance(
+                data=data,
+                shutter_counts=master_dict[_run_number].get(MasterDictKeys.shutter_counts),
+                use_experimental_uncertainties=use_experimental_uncertainties,
+            )
         full_variance.append(variance * scale_factor**2)
 
     return np.sum(np.asarray(full_variance), axis=0)
@@ -2427,6 +2608,7 @@ def init_master_dict(data_dictionary: dict) -> dict:
             MasterDictKeys.spectra_file_name: None,
             MasterDictKeys.detector_delay_us: None,
             MasterDictKeys.data: None,
+            MasterDictKeys.variance: None,
         }
 
     return master_dict

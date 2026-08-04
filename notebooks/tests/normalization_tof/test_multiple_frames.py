@@ -17,6 +17,8 @@ from __code.normalization_tof import (
     RebinCustomScale,
     RebinMode,
 )
+from __code.normalization_tof import normalization_for_timepix1_timepix3 as production_normalization
+from __code.normalization_tof import utilities as normalization_utilities
 from __code.normalization_tof.multiple_frames import (
     BlackFilterBackgroundConfig,
     FrameConfig,
@@ -45,10 +47,14 @@ from __code.normalization_tof.multiple_frames_ui import (
     _roi_preview_intensity_limits,
 )
 from __code.normalization_tof.utilities import (
+    MasterDictKeys,
     build_rebin_bin_groups,
     calculate_detector_corrected_variance,
     load_data_using_multithreading,
+    load_rebinned_normalized_data_from_tiffs,
+    load_rebinned_tof_data,
     perform_spectrum_normalization,
+    rebin_array_from_bin_groups,
 )
 
 
@@ -91,6 +97,160 @@ def test_tiff_stack_loader_preserves_frame_order_orientation_and_dtype(tmp_path)
     assert stack.dtype == np.float32
     np.testing.assert_array_equal(stack, expected)
     np.testing.assert_array_equal(integrated, expected.sum(axis=0, dtype=np.float32))
+
+
+def test_streaming_rebin_matches_full_stack_counts_and_experimental_variance(tmp_path):
+    frames = [
+        np.array([[4, 2], [3, 1]], dtype=np.uint16),
+        np.array([[2, 1], [1, 2]], dtype=np.uint16),
+        np.array([[3, 1], [2, 4]], dtype=np.uint16),
+        np.array([[1, 3], [2, 2]], dtype=np.uint16),
+    ]
+    data_path, _ = _write_run(tmp_path, "98", frames)
+    files = sorted(str(path) for path in data_path.glob("*.tif"))
+    groups = [np.asarray([0, 1]), np.asarray([2, 3])]
+
+    streamed_data, streamed_variance = load_rebinned_tof_data(
+        files,
+        active_frame_groups=groups,
+        shutter_counts=[1_000_000.0],
+        use_experimental_uncertainties=True,
+    )
+    full_stack = load_data_using_multithreading(files)
+    full_variance = calculate_detector_corrected_variance(
+        full_stack,
+        shutter_counts=[1_000_000.0],
+    )
+
+    np.testing.assert_allclose(
+        streamed_data,
+        rebin_array_from_bin_groups(full_stack, groups, reducer="sum"),
+    )
+    np.testing.assert_allclose(
+        streamed_variance,
+        rebin_array_from_bin_groups(full_variance, groups, reducer="sum"),
+        rtol=1e-13,
+    )
+
+
+def test_streaming_native_ratio_matches_legacy_repeated_run_scaling(tmp_path):
+    shape = (2, 2)
+    sample_1 = [np.full(shape, value, dtype=np.uint16) for value in (2, 6, 3, 9)]
+    sample_2 = [np.full(shape, value, dtype=np.uint16) for value in (1, 3, 2, 6)]
+    ob_1 = [np.full(shape, value, dtype=np.uint16) for value in (2, 4, 3, 6)]
+    ob_2 = [np.full(shape, value, dtype=np.uint16) for value in (4, 8, 6, 12)]
+    paths = {}
+    for run_number, frames, charge in (
+        ("91", sample_1, 2.0),
+        ("92", sample_2, 1.0),
+        ("93", ob_1, 1.0),
+        ("94", ob_2, 3.0),
+    ):
+        data_path, _ = _write_run(tmp_path, run_number, frames, charge_c=charge)
+        paths[run_number] = sorted(str(path) for path in data_path.glob("*.tif"))
+
+    def info(run_number, charge):
+        return {
+            MasterDictKeys.list_tif: paths[run_number],
+            MasterDictKeys.proton_charge: charge,
+        }
+
+    sample_master = {"91": info("91", 2.0), "92": info("92", 1.0)}
+    ob_master = {"93": info("93", 1.0), "94": info("94", 3.0)}
+    groups = [np.asarray([0, 1]), np.asarray([2, 3])]
+
+    streamed = load_rebinned_normalized_data_from_tiffs(
+        sample_master_dict=sample_master,
+        ob_master_dict=ob_master,
+        sample_run_numbers=["91", "92"],
+        active_frame_groups=groups,
+        combine_samples=True,
+        use_proton_charge=True,
+    )
+    sample_native = (np.asarray([2, 6, 3, 9]) + np.asarray([1, 3, 2, 6])) / 3.0
+    ob_native = (
+        np.asarray([2, 4, 3, 6]) * 0.25
+        + np.asarray([4, 8, 6, 12]) * 0.75
+    )
+    native_ratio = sample_native / ob_native
+    expected = np.asarray(
+        [
+            np.mean(native_ratio[:2]),
+            np.mean(native_ratio[2:]),
+        ],
+        dtype=np.float32,
+    )[:, None, None]
+    expected = np.broadcast_to(expected, streamed.shape)
+
+    np.testing.assert_allclose(streamed, expected, rtol=1e-7)
+
+
+def test_production_normalization_uses_streaming_rebin_path(tmp_path, monkeypatch):
+    shape = (2, 2)
+    sample_frames = [np.full(shape, value, dtype=np.uint16) for value in (1, 9, 2, 6)]
+    ob_frames = [np.full(shape, value, dtype=np.uint16) for value in (1, 3, 2, 2)]
+    sample_path, sample_nexus = _write_run(tmp_path, "81", sample_frames)
+    ob_path, ob_nexus = _write_run(tmp_path, "82", ob_frames)
+    output = tmp_path / "output"
+    output.mkdir()
+    roi = RoiConfig(left=0, top=0, width=2, height=2).to_roi()
+
+    monkeypatch.setattr(production_normalization, "initialize_logging", lambda: None)
+
+    def fail_full_stack_loader(*_args, **_kwargs):
+        raise AssertionError("Stage 1 full-stack loader was called")
+
+    monkeypatch.setattr(
+        normalization_utilities,
+        "load_data_using_multithreading",
+        fail_full_stack_loader,
+    )
+    result = production_normalization.normalization_with_list_of_full_path(
+        sample_dict={
+            sample_path.name: {
+                "full_path": str(sample_path),
+                "nexus": str(sample_nexus),
+            }
+        },
+        ob_dict={
+            ob_path.name: {
+                "full_path": str(ob_path),
+                "nexus": str(ob_nexus),
+            }
+        },
+        dc_dict={},
+        spectra_array=(np.arange(4, dtype=np.float64) + 0.5) * 1e-6,
+        output_folder=str(output),
+        verbose=False,
+        proton_charge_flag=False,
+        output_tif=False,
+        preview=False,
+        correct_chips_alignment_flag=False,
+        export_mode={
+            "sample_stack": False,
+            "ob_stack": False,
+            "normalized_stack": False,
+            "sample_integrated": False,
+            "ob_integrated": False,
+            "normalized_integrated": False,
+            "x_axis": False,
+        },
+        roi=roi,
+        sample_roi=roi,
+        ob_roi=roi,
+        rebin_mode=RebinMode.linear_tof,
+        rebin_delta_tof_us=2.0,
+        experimental_uncertainties_flag=True,
+    )
+
+    normalized = next(iter(result.data.values()))
+    expected_native_ratio = np.asarray([1.0, 3.0, 1.0, 3.0], dtype=np.float32)
+    expected = np.asarray(
+        [expected_native_ratio[:2].mean(), expected_native_ratio[2:].mean()],
+        dtype=np.float32,
+    )[:, None, None]
+    np.testing.assert_allclose(normalized, np.broadcast_to(expected, normalized.shape))
+    assert len(result.tof_array) == 2
 
 
 def _frame(

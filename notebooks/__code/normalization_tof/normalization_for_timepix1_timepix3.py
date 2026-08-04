@@ -374,6 +374,103 @@ def normalization_with_list_of_full_path(
             }
         )
 
+    streaming_rebin_payload = None
+    streaming_rebin_fallback_reasons = []
+    if rebin_mode == RebinMode.none:
+        streaming_rebin_fallback_reasons.append("rebinning is disabled")
+    if correct_chips_alignment_flag:
+        streaming_rebin_fallback_reasons.append("chip-alignment correction is enabled")
+    if replace_ob_zeros_by_nan_flag or replace_ob_zeros_by_local_median_flag:
+        streaming_rebin_fallback_reasons.append("OB zero replacement is enabled")
+    if dc_master_dict:
+        streaming_rebin_fallback_reasons.append("dark-current correction is enabled")
+    if measured_background_correction_enabled:
+        streaming_rebin_fallback_reasons.append("measured-background correction is enabled")
+    if black_filter_background_config and black_filter_background_config.get("enabled", False):
+        streaming_rebin_fallback_reasons.append("black-filter background correction is enabled")
+    if container_normalization_requested:
+        streaming_rebin_fallback_reasons.append("container normalization is enabled")
+
+    if not streaming_rebin_fallback_reasons:
+        first_sample_run = next(iter(sample_master_dict.values()))
+        native_time_spectra = first_sample_run[MasterDictKeys.list_spectra]
+        native_detector_delay_us = detector_delay_us
+        if native_detector_delay_us is None:
+            native_detector_delay_us = first_sample_run[MasterDictKeys.detector_delay_us]
+
+        if native_time_spectra is None:
+            streaming_rebin_fallback_reasons.append("the native spectra/time axis is unavailable")
+        else:
+            native_time_spectra = np.asarray(native_time_spectra, dtype=np.float64)
+            for master_dict_name, current_master_dict in (
+                ("sample", sample_master_dict),
+                ("OB", ob_master_dict),
+            ):
+                for run_number, run_info in current_master_dict.items():
+                    run_time_spectra = run_info[MasterDictKeys.list_spectra]
+                    if run_time_spectra is None:
+                        streaming_rebin_fallback_reasons.append(
+                            f"{master_dict_name} run {run_number} has no spectra/time axis"
+                        )
+                        continue
+                    run_time_spectra = np.asarray(run_time_spectra, dtype=np.float64)
+                    if (
+                        run_time_spectra.shape != native_time_spectra.shape
+                        or not np.allclose(run_time_spectra, native_time_spectra, rtol=0.0, atol=1e-12)
+                    ):
+                        streaming_rebin_fallback_reasons.append(
+                            f"{master_dict_name} run {run_number} uses a different spectra/time axis"
+                        )
+                    if len(run_info[MasterDictKeys.list_tif]) != len(native_time_spectra):
+                        streaming_rebin_fallback_reasons.append(
+                            f"{master_dict_name} run {run_number} TIFF count does not match its spectra axis"
+                        )
+
+            if not streaming_rebin_fallback_reasons:
+                streaming_rebin_payload = maybe_rebin_data_and_axes(
+                    time_spectra=native_time_spectra,
+                    distance_source_detector_m=distance_source_detector_m,
+                    detector_delay_us=native_detector_delay_us,
+                    rebin_mode=rebin_mode,
+                    rebin_delta_tof_us=rebin_delta_tof_us,
+                    rebin_delta_lambda_a=rebin_delta_lambda_a,
+                    rebin_delta_tof_over_tof=rebin_delta_tof_over_tof,
+                    rebin_delta_lambda_over_lambda=rebin_delta_lambda_over_lambda,
+                    rebin_delta_lambda_squared_a2=rebin_delta_lambda_squared_a2,
+                    rebin_custom_basis=rebin_custom_basis,
+                    rebin_custom_scale=rebin_custom_scale,
+                    rebin_custom_schedule=rebin_custom_schedule,
+                    rebin_full_bins_only=rebin_full_bins_only,
+                    rebin_snap_to_native_grid=rebin_snap_to_native_grid,
+                )
+                if not streaming_rebin_payload["active_frame_groups"]:
+                    streaming_rebin_fallback_reasons.append(
+                        "the requested rebin recipe produced no active output bins"
+                    )
+                    streaming_rebin_payload = None
+                else:
+                    logging.info(
+                        "Stage 2 streaming rebin enabled: %d native TIFFs -> %d output bins.",
+                        len(native_time_spectra),
+                        len(streaming_rebin_payload["active_frame_groups"]),
+                    )
+
+    if streaming_rebin_payload is None:
+        logging.info(
+            "Stage 2 streaming rebin disabled; using the full-stack loader: %s",
+            "; ".join(streaming_rebin_fallback_reasons),
+        )
+
+    streaming_active_frame_groups = (
+        None
+        if streaming_rebin_payload is None
+        else streaming_rebin_payload["active_frame_groups"]
+    )
+    streaming_load_kwargs = {
+        "active_frame_groups": streaming_active_frame_groups,
+        "use_experimental_uncertainties": experimental_uncertainties_flag,
+    }
+
     ob_data_combined_variance = None
     dc_data_combined_variance = None
     detector_model_uncertainty_available = any(
@@ -416,6 +513,7 @@ def normalization_with_list_of_full_path(
         current_time_spectra,
         current_detector_delay_us,
         current_container_value_array=None,
+        native_pixel_ratio_override=None,
     ):
         sample_data_for_rebin = current_sample_data
         sample_variance_for_rebin = current_sample_variance
@@ -474,7 +572,9 @@ def normalization_with_list_of_full_path(
             ob_data_for_rebin = ob_data_combined - total_ob_background_data
             ob_variance_for_rebin = ob_data_combined_variance + total_ob_background_variance
 
-        if rebin_mode != RebinMode.none:
+        if native_pixel_ratio_override is not None:
+            native_pixel_ratio_data = native_pixel_ratio_override
+        elif rebin_mode != RebinMode.none:
             if container_only_without_ob and current_container_value_array is not None:
                 native_pixel_ratio_data = normalize_by_container_value_array(
                     sample_data=sample_data_for_rebin,
@@ -487,28 +587,39 @@ def normalization_with_list_of_full_path(
                     dc_data_combined,
                 )["normalized_data"]
 
-        rebinned_payload = maybe_rebin_data_and_axes(
-            sample_data=sample_data_for_rebin,
-            sample_variance=sample_variance_for_rebin,
-            ob_data_combined=ob_data_for_rebin,
-            ob_data_combined_variance=ob_variance_for_rebin,
-            dc_data_combined=dc_data_combined,
-            dc_data_combined_variance=dc_data_combined_variance,
-            time_spectra=current_time_spectra,
-            distance_source_detector_m=distance_source_detector_m,
-            detector_delay_us=current_detector_delay_us,
-            rebin_mode=rebin_mode,
-            rebin_delta_tof_us=rebin_delta_tof_us,
-            rebin_delta_lambda_a=rebin_delta_lambda_a,
-            rebin_delta_tof_over_tof=rebin_delta_tof_over_tof,
-            rebin_delta_lambda_over_lambda=rebin_delta_lambda_over_lambda,
-            rebin_delta_lambda_squared_a2=rebin_delta_lambda_squared_a2,
-            rebin_custom_basis=rebin_custom_basis,
-            rebin_custom_scale=rebin_custom_scale,
-            rebin_custom_schedule=rebin_custom_schedule,
-            rebin_full_bins_only=rebin_full_bins_only,
-            rebin_snap_to_native_grid=rebin_snap_to_native_grid,
-        )
+        if streaming_rebin_payload is None:
+            rebinned_payload = maybe_rebin_data_and_axes(
+                sample_data=sample_data_for_rebin,
+                sample_variance=sample_variance_for_rebin,
+                ob_data_combined=ob_data_for_rebin,
+                ob_data_combined_variance=ob_variance_for_rebin,
+                dc_data_combined=dc_data_combined,
+                dc_data_combined_variance=dc_data_combined_variance,
+                time_spectra=current_time_spectra,
+                distance_source_detector_m=distance_source_detector_m,
+                detector_delay_us=current_detector_delay_us,
+                rebin_mode=rebin_mode,
+                rebin_delta_tof_us=rebin_delta_tof_us,
+                rebin_delta_lambda_a=rebin_delta_lambda_a,
+                rebin_delta_tof_over_tof=rebin_delta_tof_over_tof,
+                rebin_delta_lambda_over_lambda=rebin_delta_lambda_over_lambda,
+                rebin_delta_lambda_squared_a2=rebin_delta_lambda_squared_a2,
+                rebin_custom_basis=rebin_custom_basis,
+                rebin_custom_scale=rebin_custom_scale,
+                rebin_custom_schedule=rebin_custom_schedule,
+                rebin_full_bins_only=rebin_full_bins_only,
+                rebin_snap_to_native_grid=rebin_snap_to_native_grid,
+            )
+        else:
+            rebinned_payload = {
+                **streaming_rebin_payload,
+                "sample_data": sample_data_for_rebin,
+                "sample_variance": sample_variance_for_rebin,
+                "ob_data_combined": ob_data_for_rebin,
+                "ob_data_combined_variance": ob_variance_for_rebin,
+                "dc_data_combined": dc_data_combined,
+                "dc_data_combined_variance": dc_data_combined_variance,
+            }
 
         if container_only_without_ob and current_container_value_array is not None:
             active_frame_groups = rebinned_payload["active_frame_groups"]
@@ -538,7 +649,9 @@ def normalization_with_list_of_full_path(
                 )
             rebinned_payload["container_roi_reference_value_array"] = rebinned_container_value_array
 
-        if native_pixel_ratio_data is not None:
+        if native_pixel_ratio_override is not None:
+            rebinned_payload["normalized_data_from_native_pixel_ratios"] = native_pixel_ratio_override
+        elif native_pixel_ratio_data is not None:
             rebinned_payload["normalized_data_from_native_pixel_ratios"] = rebin_array_from_bin_groups(
                 native_pixel_ratio_data,
                 rebinned_payload["active_frame_groups"],
@@ -675,7 +788,12 @@ def normalization_with_list_of_full_path(
 
     # load ob images ===============================
     if ob_master_dict:
-        load_images(master_dict=ob_master_dict, data_type=DataType.ob, verbose=verbose)
+        load_images(
+            master_dict=ob_master_dict,
+            data_type=DataType.ob,
+            verbose=verbose,
+            **streaming_load_kwargs,
+        )
     else:
         logging.info("Skipping OB image loading because no OB runs were provided.")
    
@@ -733,7 +851,12 @@ def normalization_with_list_of_full_path(
         ob_data_combined_variance = None
 
     # load dc images ================================
-    load_images(master_dict=dc_master_dict, data_type=DataType.dc, verbose=verbose)
+    load_images(
+        master_dict=dc_master_dict,
+        data_type=DataType.dc,
+        verbose=verbose,
+        **streaming_load_kwargs,
+    )
 
     # combine all dc images
     dc_data_combined = combine_dc_images(dc_master_dict)
@@ -760,11 +883,13 @@ def normalization_with_list_of_full_path(
             master_dict=background_config["sample_master_dict"],
             data_type=DataType.sample,
             verbose=verbose,
+            **streaming_load_kwargs,
         )
         load_images(
             master_dict=background_config["ob_master_dict"],
             data_type=DataType.ob,
             verbose=verbose,
+            **streaming_load_kwargs,
         )
 
         if correct_chips_alignment_flag:
@@ -809,7 +934,12 @@ def normalization_with_list_of_full_path(
         )
 
     # load sample images ===============================
-    load_images(master_dict=sample_master_dict, data_type=DataType.sample, verbose=verbose)
+    load_images(
+        master_dict=sample_master_dict,
+        data_type=DataType.sample,
+        verbose=verbose,
+        **streaming_load_kwargs,
+    )
     if correct_chips_alignment_flag:
         correct_all_samples_chips_alignment(sample_master_dict, 
                                             correct_chips_alignment_config, 
@@ -890,12 +1020,23 @@ def normalization_with_list_of_full_path(
             )
 
         time_spectra = sample_master_dict[list_run_number[0]][MasterDictKeys.list_spectra]
+        native_pixel_ratio_override = None
+        if streaming_rebin_payload is not None:
+            native_pixel_ratio_override = load_rebinned_normalized_data_from_tiffs(
+                sample_master_dict=sample_master_dict,
+                ob_master_dict=ob_master_dict,
+                sample_run_numbers=list_run_number,
+                active_frame_groups=streaming_active_frame_groups,
+                combine_samples=True,
+                use_proton_charge=normalized_by_proton_charge,
+            )
         rebinned_payload = prepare_rebinned_payload(
             current_sample_data=sample_data_combined,
             current_sample_variance=sample_data_combined_variance,
             current_time_spectra=time_spectra,
             current_detector_delay_us=current_detector_delay_us,
             current_container_value_array=current_container_value_array,
+            native_pixel_ratio_override=native_pixel_ratio_override,
         )
 
         sample_data_combined = rebinned_payload["sample_data"]
@@ -1078,11 +1219,13 @@ def normalization_with_list_of_full_path(
             sample_proton_charge = None
             if normalized_by_proton_charge:
                 sample_proton_charge = sample_master_dict[_sample_run_number][MasterDictKeys.proton_charge]
-            _sample_variance = calculate_data_variance(
-                data=sample_variance_input,
-                shutter_counts=sample_master_dict[_sample_run_number].get(MasterDictKeys.shutter_counts),
-                use_experimental_uncertainties=experimental_uncertainties_flag,
-            )
+            _sample_variance = sample_master_dict[_sample_run_number].get(MasterDictKeys.variance)
+            if _sample_variance is None:
+                _sample_variance = calculate_data_variance(
+                    data=sample_variance_input,
+                    shutter_counts=sample_master_dict[_sample_run_number].get(MasterDictKeys.shutter_counts),
+                    use_experimental_uncertainties=experimental_uncertainties_flag,
+                )
             if sample_proton_charge is not None:
                 _sample_variance = _sample_variance / (sample_proton_charge**2)
 
@@ -1102,12 +1245,23 @@ def normalization_with_list_of_full_path(
                 )
 
             time_spectra = sample_master_dict[_sample_run_number][MasterDictKeys.list_spectra]
+            native_pixel_ratio_override = None
+            if streaming_rebin_payload is not None:
+                native_pixel_ratio_override = load_rebinned_normalized_data_from_tiffs(
+                    sample_master_dict=sample_master_dict,
+                    ob_master_dict=ob_master_dict,
+                    sample_run_numbers=[_sample_run_number],
+                    active_frame_groups=streaming_active_frame_groups,
+                    combine_samples=False,
+                    use_proton_charge=normalized_by_proton_charge,
+                )
             rebinned_payload = prepare_rebinned_payload(
                 current_sample_data=_sample_data,
                 current_sample_variance=_sample_variance,
                 current_time_spectra=time_spectra,
                 current_detector_delay_us=current_detector_delay_us,
                 current_container_value_array=current_container_value_array,
+                native_pixel_ratio_override=native_pixel_ratio_override,
             )
 
             _sample_data = rebinned_payload["sample_data"]
