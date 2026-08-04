@@ -42,6 +42,7 @@ from __code.normalization_tof.multiple_frames_ui import (
     MultiFrameNormalizationTof,
     RunInputEditor,
     _empty_frame,
+    _roi_preview_intensity_limits,
 )
 from __code.normalization_tof.utilities import (
     build_rebin_bin_groups,
@@ -382,6 +383,16 @@ def test_integrated_roi_preview_uses_production_orientation_and_subsampling(tmp_
     assert total_count == 3
 
 
+def test_roi_preview_intensity_limits_ignore_isolated_hot_pixel():
+    image = np.full((100, 100), 200.0)
+    image[0, 0] = 2_329_179.0
+
+    low, high, data_max = _roi_preview_intensity_limits(image)
+
+    assert (low, high) == (200, 201)
+    assert data_max == 2_329_179
+
+
 def test_roi_profile_matches_production_transposed_orientation(tmp_path):
     frames = [np.arange(20, dtype=np.uint16).reshape(4, 5) + offset for offset in (0, 20)]
     data_path, nexus_path = _write_run(tmp_path, "100", frames, charge_c=2.0)
@@ -396,6 +407,23 @@ def test_roi_profile_matches_production_transposed_orientation(tmp_path):
     np.testing.assert_allclose(profile.counts, expected)
     np.testing.assert_allclose(profile.variance, expected)
     assert profile.proton_charge_c == 2.0
+
+
+def test_roi_profile_falls_back_for_compressed_tiff(tmp_path):
+    frames = [np.arange(20, dtype=np.uint16).reshape(4, 5)]
+    data_path, nexus_path = _write_run(tmp_path, "105", frames)
+    Image.fromarray(frames[0]).save(data_path / "image0000.tif", compression="tiff_lzw")
+    roi = RoiConfig(left=1, top=2, width=2, height=2)
+
+    profile = load_native_roi_profile(
+        ResolvedRun("105", data_path, nexus_path),
+        roi=roi,
+        use_experimental_uncertainties=False,
+        manual_tof_bin_size_ns=None,
+    )
+
+    expected = np.sum(frames[0].astype(float).T[2:4, 1:3])
+    np.testing.assert_allclose(profile.counts, [expected])
 
 
 def test_frame_preview_uses_distinct_sample_and_ob_rois(tmp_path):

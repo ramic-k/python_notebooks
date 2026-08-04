@@ -21,6 +21,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from skimage.io import imread
+from tifffile import memmap as tiff_memmap
 
 from __code._utilities.nexus import extract_file_path_from_nexus
 from __code.normalization_tof import (
@@ -1266,13 +1267,11 @@ def load_native_roi_profile(
     y0, y1 = roi.top, roi.top + roi.height
     x0, x1 = roi.left, roi.left + roi.width
     for index, tiff in enumerate(tiffs):
-        # Match the production loader's detector orientation.
-        image = np.asarray(imread(tiff), dtype=np.float64).swapaxes(0, 1)
-        if y1 > image.shape[0] or x1 > image.shape[1]:
+        roi_image, image_shape = _read_tiff_roi(tiff, x0=x0, x1=x1, y0=y0, y1=y1)
+        if y1 > image_shape[0] or x1 > image_shape[1]:
             raise ValueError(
-                f"Run {run.run_number}: ROI {roi} is outside image shape {image.shape}."
+                f"Run {run.run_number}: ROI {roi} is outside image shape {image_shape}."
             )
-        roi_image = image[y0:y1, x0:x1]
         counts[index] = np.sum(roi_image, dtype=np.float64)
         if use_experimental_uncertainties and shutter_count is not None:
             if cumulative_raw is None:
@@ -1300,6 +1299,30 @@ def load_native_roi_profile(
         nexus_path=None if run.nexus_path is None else str(run.nexus_path),
         warnings=warnings,
     )
+
+
+def _read_tiff_roi(
+    path: Path,
+    *,
+    x0: int,
+    x1: int,
+    y0: int,
+    y1: int,
+) -> tuple[np.ndarray, tuple[int, int]]:
+    """Read only the requested ROI when the TIFF can be memory mapped."""
+    try:
+        mapped = tiff_memmap(path, mode="r")
+        if mapped.ndim != 2:
+            raise ValueError("Only 2D TIFFs use the memory-mapped ROI path.")
+        image_shape = (int(mapped.shape[1]), int(mapped.shape[0]))
+        # Production swaps the detector axes before applying the ROI. Selecting
+        # the transposed coordinates directly avoids reading the full image.
+        roi_image = np.array(mapped[x0:x1, y0:y1].T, dtype=np.float64, copy=True)
+        del mapped
+        return roi_image, image_shape
+    except (OSError, TypeError, ValueError):
+        image = np.asarray(imread(path), dtype=np.float64).swapaxes(0, 1)
+        return image[y0:y1, x0:x1], tuple(int(value) for value in image.shape)
 
 
 def calculate_overlap_diagnostics(

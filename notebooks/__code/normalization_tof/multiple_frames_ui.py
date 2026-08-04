@@ -99,6 +99,18 @@ def _show_full_descriptions(controls: list[widgets.Widget]) -> None:
             style.description_width = "initial"
 
 
+def _roi_preview_intensity_limits(values: np.ndarray) -> tuple[int, int, int]:
+    """Return a robust default range and the absolute maximum for an ROI preview."""
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        raise ValueError("ROI preview contains no finite intensity values.")
+    data_max = max(1, int(np.ceil(np.max(finite))))
+    robust_low = max(0, int(np.floor(np.percentile(finite, 1.0))))
+    robust_high = min(data_max, max(robust_low + 1, int(np.ceil(np.percentile(finite, 99.9)))))
+    return robust_low, robust_high, data_max
+
+
 class RunInputEditor:
     """Run-number input with an optional direct image-folder override."""
 
@@ -1197,17 +1209,24 @@ class FrameEditor:
             top = min(max(int(roi_top.value), 0), image_height - 1)
             right = min(max(left + int(roi_width.value), left + 1), image_width)
             bottom = min(max(top + int(roi_height.value), top + 1), image_height)
-            finite_values = integrated[np.isfinite(integrated)]
-            intensity_max = max(1, int(np.ceil(np.max(finite_values))))
+            intensity_low, intensity_high, intensity_data_max = _roi_preview_intensity_limits(
+                integrated
+            )
 
             intensity = widgets.IntRangeSlider(
-                value=(0, intensity_max),
+                value=(intensity_low, intensity_high),
                 min=0,
-                max=intensity_max,
+                max=intensity_high,
                 step=1,
                 description="Intensity",
                 continuous_update=False,
                 layout=widgets.Layout(width="780px"),
+            )
+            include_extreme_pixels = widgets.Checkbox(
+                value=False,
+                description="Include extreme pixels",
+                indent=False,
+                disabled=intensity_data_max <= intensity_high,
             )
             left_right = widgets.IntRangeSlider(
                 value=(left, right),
@@ -1268,8 +1287,17 @@ class FrameEditor:
                     clear_output(wait=True)
                     figure.show()
 
+            def update_intensity_extent(change) -> None:
+                if change["new"]:
+                    intensity.max = intensity_data_max
+                    intensity.value = (0, intensity_data_max)
+                else:
+                    intensity.value = (intensity_low, intensity_high)
+                    intensity.max = intensity_high
+
             for slider in (intensity, left_right, top_bottom):
                 slider.observe(update_roi_plot, names="value")
+            include_extreme_pixels.observe(update_intensity_extent, names="value")
 
             with self.roi_preview_output:
                 clear_output(wait=True)
@@ -1285,7 +1313,11 @@ class FrameEditor:
                         )
                     )
                 )
-                display(widgets.VBox([intensity, left_right, top_bottom, plot_output]))
+                display(
+                    widgets.VBox(
+                        [intensity, include_extreme_pixels, left_right, top_bottom, plot_output]
+                    )
+                )
             update_roi_plot()
         except Exception as error:
             with self.roi_preview_output:
