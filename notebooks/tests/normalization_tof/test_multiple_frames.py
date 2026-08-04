@@ -34,6 +34,7 @@ from __code.normalization_tof.multiple_frames import (
     convert_tof_schedule_to_energy_schedule,
     load_integrated_image_preview,
     load_native_roi_profile,
+    overlap_ratio_arrays,
     parse_run_numbers,
 )
 from __code.normalization_tof.multiple_frames_ui import (
@@ -357,6 +358,9 @@ def test_overlap_inspection_selects_all_frames_and_supports_focused_pair():
     names = ("6.3 A", "4.5 A", "2.5 A", "0.3 A", "resonance")
     assert ui.inspect_frames.value == names
     assert ui._selected_frame_names() == list(names)
+    assert tuple(ui.frame_scale_widgets) == names
+    assert all(widget.value == 1.0 for widget in ui.frame_scale_widgets.values())
+    assert ui.frame_scale_widgets["resonance"].disabled is True
     assert ui.overlap_min.disabled is True
     assert ui.overlap_max.disabled is True
 
@@ -364,6 +368,9 @@ def test_overlap_inspection_selects_all_frames_and_supports_focused_pair():
     assert ui._selected_frame_names() == list(names[:2])
     assert ui.overlap_min.disabled is False
     assert ui.overlap_max.disabled is False
+    assert ui._overlap_window_for_pair("0.3 A", "resonance", None) == (0.0, 0.2)
+    assert ui._overlap_window_for_pair("resonance", "0.3 A", (0.1, 0.3)) == (0.1, 0.2)
+    assert ui._overlap_window_for_pair("2.5 A", "0.3 A", None) is None
 
 
 def test_integrated_roi_preview_uses_production_orientation_and_subsampling(tmp_path):
@@ -675,6 +682,7 @@ def test_draw_plot_splits_transmission_and_each_adjacent_overlap(monkeypatch):
     ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
     ui.show_native.value = False
     names = list(ui.inspect_frames.value)
+    ui.frame_scale_widgets[names[1]].value = 2.0
     previews = {
         name: _preview(
             name,
@@ -693,9 +701,57 @@ def test_draw_plot_splits_transmission_and_each_adjacent_overlap(monkeypatch):
     transmission_figure, *overlap_figures = captured
     assert len(transmission_figure.data) == len(names)
     assert transmission_figure.layout.yaxis.title.text == "Transmission"
+    np.testing.assert_allclose(
+        transmission_figure.data[1].y,
+        previews[names[1]].transmission * 2.0,
+    )
+    np.testing.assert_allclose(
+        transmission_figure.data[1].error_y.array,
+        previews[names[1]].uncertainty * 2.0,
+    )
     assert len(overlap_figures) == len(names) - 1
     assert all(len(figure.data) == 1 for figure in overlap_figures)
     assert all(figure.layout.yaxis.title.text == "Ratio" for figure in overlap_figures)
+    _, unscaled_ratio, _ = overlap_ratio_arrays(previews[names[0]], previews[names[1]])
+    np.testing.assert_allclose(overlap_figures[0].data[0].y, unscaled_ratio * 2.0)
+    assert "multipliers: 4.5 A x2" in overlap_figures[0].layout.title.text
+
+
+def test_auto_scale_chains_from_fixed_resonance_to_lower_energy_frames(monkeypatch):
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+    names = list(ui.inspect_frames.value)
+    amplitudes = {
+        "6.3 A": 0.05,
+        "4.5 A": 0.10,
+        "2.5 A": 0.20,
+        "0.3 A": 0.40,
+        "resonance": 0.80,
+    }
+    previews = {
+        name: _preview(
+            name,
+            [0.01, 0.02, 0.03, 0.04],
+            [amplitudes[name]] * 4,
+            [0.01] * 4,
+        )
+        for name in names
+    }
+    ui.engine = SimpleNamespace(previews=previews)
+    monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
+
+    ui._auto_scale_from_resonance()
+
+    expected = {
+        "6.3 A": 16.0,
+        "4.5 A": 8.0,
+        "2.5 A": 4.0,
+        "0.3 A": 2.0,
+        "resonance": 1.0,
+    }
+    for name, scale in expected.items():
+        np.testing.assert_allclose(ui.frame_scale_widgets[name].value, scale)
+    assert ui.frame_scale_widgets["resonance"].disabled is True
+    assert "resonance x1 (fixed)" in ui.frame_scale_status.value
 
 
 def test_overlap_diagnostic_reports_scale_without_applying_it():

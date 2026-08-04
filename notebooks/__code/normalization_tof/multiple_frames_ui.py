@@ -25,6 +25,7 @@ from __code.normalization_tof.multiple_frames import (
     MeasuredBackgroundConfig,
     MultiFramePreviewEngine,
     MultiFrameRecipe,
+    RebinnedFramePreview,
     RebinConfig,
     RoiConfig,
     RunSpec,
@@ -1452,6 +1453,18 @@ class MultiFrameNormalizationTof:
             rows=5,
             layout=widgets.Layout(width="560px", height="130px"),
         )
+        self.frame_scale_widgets: dict[str, widgets.BoundedFloatText] = {}
+        self.frame_scale_box = widgets.HBox(layout=_wrapping_row_layout())
+        self.reset_frame_scales_button = widgets.Button(
+            description="Reset preview scales",
+            icon="undo",
+        )
+        self.auto_frame_scales_button = widgets.Button(
+            description="Auto-scale from resonance",
+            icon="magic",
+            button_style="info",
+        )
+        self.frame_scale_status = widgets.HTML()
         self.add_frame_button = widgets.Button(description="Add frame", icon="plus")
         self.remove_frame_button = widgets.Button(description="Remove last", icon="minus")
         self.same_rois_all_frames = widgets.Checkbox(
@@ -1473,6 +1486,7 @@ class MultiFrameNormalizationTof:
         self.loaded_frame_configs: dict[str, FrameConfig] = {}
         self.frame_editors: list[FrameEditor] = []
         self._syncing_frame_rois = False
+        self._updating_frame_scales = False
 
         _show_full_descriptions(
             [
@@ -1513,6 +1527,13 @@ class MultiFrameNormalizationTof:
                     [self.show_native, self.show_errors, self.force_reload],
                     layout=_wrapping_row_layout(),
                 ),
+                widgets.HTML("<b>Frame multipliers (preview plots only)</b>"),
+                self.frame_scale_box,
+                widgets.HBox(
+                    [self.auto_frame_scales_button, self.reset_frame_scales_button],
+                    layout=_wrapping_row_layout(),
+                ),
+                self.frame_scale_status,
                 widgets.HBox(
                     [self.preview_button, self.replot_button],
                     layout=_wrapping_row_layout(),
@@ -1561,6 +1582,8 @@ class MultiFrameNormalizationTof:
         self.save_button.on_click(self._save_recipe)
         self.load_button.on_click(self._load_recipe)
         self.run_button.on_click(self._run_full_normalization)
+        self.reset_frame_scales_button.on_click(self._reset_frame_scales)
+        self.auto_frame_scales_button.on_click(self._auto_scale_from_resonance)
         self.arm_full_run.observe(self._update_run_button, names="value")
         self.inspect_frames.observe(self._overlap_selection_changed, names="value")
         self.overlap_min.observe(self._plot_setting_changed, names="value")
@@ -1587,7 +1610,131 @@ class MultiFrameNormalizationTof:
         old_selection = tuple(name for name in self.inspect_frames.value if name in names)
         self.inspect_frames.options = names
         self.inspect_frames.value = old_selection or tuple(names)
+        self._refresh_frame_scale_controls(names)
         self._update_manual_overlap_state()
+
+    def _refresh_frame_scale_controls(self, names: list[str]) -> None:
+        if tuple(self.frame_scale_widgets) == tuple(names):
+            return
+        old_values = {
+            name: float(widget.value)
+            for name, widget in self.frame_scale_widgets.items()
+        }
+        controls: dict[str, widgets.BoundedFloatText] = {}
+        for name in names:
+            is_resonance = "resonance" in name.strip().lower()
+            control = widgets.BoundedFloatText(
+                value=1.0 if is_resonance else old_values.get(name, 1.0),
+                min=1e-6,
+                max=1e6,
+                step=0.001,
+                description=f"{name} x",
+                disabled=is_resonance,
+                layout=_layout("230px"),
+            )
+            control.style.description_width = "initial"
+            control.observe(self._plot_setting_changed, names="value")
+            controls[name] = control
+        self.frame_scale_widgets = controls
+        self.frame_scale_box.children = tuple(controls.values())
+
+    def _reset_frame_scales(self, _button=None) -> None:
+        self._updating_frame_scales = True
+        try:
+            for control in self.frame_scale_widgets.values():
+                control.value = 1.0
+        finally:
+            self._updating_frame_scales = False
+        self.frame_scale_status.value = ""
+        if self.engine is not None and self.engine.previews:
+            self._draw_plot()
+
+    def _auto_scale_from_resonance(self, _button=None) -> None:
+        try:
+            if self.engine is None or not self.engine.previews:
+                raise ValueError("Load the ROI profiles before auto-scaling frames.")
+            names = [
+                str(name)
+                for name in self.inspect_frames.options
+                if str(name) in self.engine.previews
+            ]
+            resonance_names = [name for name in names if "resonance" in name.strip().lower()]
+            if len(resonance_names) != 1:
+                raise ValueError("Auto-scaling requires exactly one frame named resonance.")
+            resonance_name = resonance_names[0]
+            resonance_index = names.index(resonance_name)
+            if resonance_index != len(names) - 1:
+                raise ValueError("The resonance frame must follow the lower-energy frames.")
+
+            fitted_scales = {resonance_name: 1.0}
+            result_lines = [f"{resonance_name} x1 (fixed)"]
+            reference = self._scaled_preview_for_plot(
+                self.engine.previews[resonance_name],
+                1.0,
+            )
+            for comparison_name in reversed(names[:resonance_index]):
+                comparison = self.engine.previews[comparison_name]
+                fit_window = self._overlap_window_for_pair(
+                    reference.name,
+                    comparison_name,
+                    manual_window=None,
+                )
+                diagnostics = calculate_overlap_diagnostics(
+                    reference,
+                    comparison,
+                    fit_window,
+                )
+                scale = float(diagnostics.scale_comparison_to_reference)
+                if not np.isfinite(scale) or scale <= 0:
+                    raise ValueError(
+                        f"Could not determine a positive finite scale for {comparison_name}."
+                    )
+                fitted_scales[comparison_name] = scale
+                result_lines.append(
+                    f"{comparison_name} x{scale:.7g} "
+                    f"({diagnostics.point_count} overlap points, "
+                    f"reduced chi2={diagnostics.reduced_chi_square:.3g})"
+                )
+                reference = self._scaled_preview_for_plot(comparison, scale)
+
+            self._updating_frame_scales = True
+            try:
+                for name, scale in fitted_scales.items():
+                    self.frame_scale_widgets[name].value = scale
+            finally:
+                self._updating_frame_scales = False
+            self.frame_scale_status.value = (
+                "<span style='font-size:12px; color:#176b36'>"
+                + "<br>".join(_escape(line) for line in result_lines)
+                + "</span>"
+            )
+            self._draw_plot()
+        except Exception as error:
+            self.frame_scale_status.value = (
+                "<span style='font-size:12px; color:#b00020'>"
+                f"Auto-scale unavailable: {_escape(error)}</span>"
+            )
+
+    def _frame_scale(self, name: str) -> float:
+        control = self.frame_scale_widgets.get(name)
+        return 1.0 if control is None else float(control.value)
+
+    def _scaled_preview_for_plot(
+        self,
+        preview: RebinnedFramePreview,
+        scale: float,
+    ) -> RebinnedFramePreview:
+        scaled_native = replace(
+            preview.native,
+            transmission=np.asarray(preview.native.transmission) * scale,
+            uncertainty=np.asarray(preview.native.uncertainty) * abs(scale),
+        )
+        return replace(
+            preview,
+            transmission=np.asarray(preview.transmission) * scale,
+            uncertainty=np.asarray(preview.uncertainty) * abs(scale),
+            native=scaled_native,
+        )
 
     def _frame_changed(self, change=None) -> None:
         if self.same_rois_all_frames.value and not self._syncing_frame_rois and change is not None:
@@ -1766,6 +1913,11 @@ class MultiFrameNormalizationTof:
             return
         selected_names = self._selected_frame_names()
         overlap_pairs = list(zip(selected_names[:-1], selected_names[1:]))
+        scales = {name: self._frame_scale(name) for name in selected_names}
+        scaled_previews = {
+            name: self._scaled_preview_for_plot(self.engine.previews[name], scales[name])
+            for name in selected_names
+        }
         transmission_figure = go.Figure()
         overlap_figures: list[go.Figure] = []
         palette = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf"]
@@ -1774,7 +1926,8 @@ class MultiFrameNormalizationTof:
             for index, name in enumerate(self.engine.previews)
         }
         for name in selected_names:
-            preview = self.engine.previews[name]
+            preview = scaled_previews[name]
+            scale = scales[name]
             color = color_by_name[name]
             if self.show_native.value:
                 native_order = np.argsort(preview.native.energy_eV)
@@ -1785,14 +1938,20 @@ class MultiFrameNormalizationTof:
                         mode="lines",
                         line=dict(color=color, width=1),
                         opacity=0.25,
-                        name=f"{name} native",
+                        name=f"{name} native (x{scale:.7g})",
                         legendgroup=name,
                     )
                 )
             order = np.argsort(preview.energy_eV)
             error = None
             if self.show_errors.value:
-                error = dict(type="data", array=preview.uncertainty[order], visible=True, thickness=0.8, width=0)
+                error = dict(
+                    type="data",
+                    array=preview.uncertainty[order],
+                    visible=True,
+                    thickness=1.2,
+                    width=2,
+                )
             transmission_figure.add_trace(
                 go.Scatter(
                     x=preview.energy_eV[order],
@@ -1801,7 +1960,7 @@ class MultiFrameNormalizationTof:
                     marker=dict(color=color, size=5),
                     line=dict(color=color, width=1),
                     error_y=error,
-                    name=f"{name} proposed bins",
+                    name=f"{name} proposed bins (x{scale:.7g})",
                     legendgroup=name,
                     customdata=preview.source_frame_count[order],
                     hovertemplate=(
@@ -1813,13 +1972,26 @@ class MultiFrameNormalizationTof:
 
         manual_window = self._energy_window() if len(selected_names) == 2 else None
         for reference_name, comparison_name in overlap_pairs:
-            reference = self.engine.previews.get(reference_name)
-            comparison = self.engine.previews.get(comparison_name)
+            reference = scaled_previews.get(reference_name)
+            comparison = scaled_previews.get(comparison_name)
+            pair_window = self._overlap_window_for_pair(
+                reference_name,
+                comparison_name,
+                manual_window,
+            )
             ratio_figure = go.Figure()
             if reference is not None and comparison is not None:
                 try:
-                    energy, ratio, uncertainty = overlap_ratio_arrays(reference, comparison, manual_window)
-                    diagnostics = calculate_overlap_diagnostics(reference, comparison, manual_window)
+                    energy, ratio, uncertainty = overlap_ratio_arrays(
+                        reference,
+                        comparison,
+                        pair_window,
+                    )
+                    diagnostics = calculate_overlap_diagnostics(
+                        reference,
+                        comparison,
+                        pair_window,
+                    )
                     ratio_figure.add_trace(
                         go.Scatter(
                             x=energy,
@@ -1847,8 +2019,12 @@ class MultiFrameNormalizationTof:
                         title=(
                             f"{comparison_name} / {reference_name} overlap"
                             "<br><sup>"
+                            f"multipliers: {comparison_name} x{scales[comparison_name]:.7g}, "
+                            f"{reference_name} x{scales[reference_name]:.7g}; "
+                            f"overlap={diagnostics.energy_min_eV * 1e3:.4g}-"
+                            f"{diagnostics.energy_max_eV * 1e3:.4g} meV; "
                             f"ratio={diagnostics.comparison_over_reference:.5g}; "
-                            f"scale={diagnostics.scale_comparison_to_reference:.5g} +/- "
+                            f"residual scale={diagnostics.scale_comparison_to_reference:.5g} +/- "
                             f"{diagnostics.scale_uncertainty:.2g}; "
                             f"reduced chi2={diagnostics.reduced_chi_square:.3g}</sup>"
                         ),
@@ -1878,7 +2054,7 @@ class MultiFrameNormalizationTof:
         transmission_figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)")
         transmission_figure.update_yaxes(title_text="Transmission")
         transmission_figure.update_layout(
-            title="Selected frame transmission previews",
+            title="Selected frame transmission previews with frame multipliers",
             template="plotly_white",
             height=650,
             hovermode="closest",
@@ -1898,6 +2074,31 @@ class MultiFrameNormalizationTof:
             return self.overlap_min.value, self.overlap_max.value
         return None
 
+    @staticmethod
+    def _overlap_window_for_pair(
+        reference_name: str,
+        comparison_name: str,
+        manual_window: tuple[float, float] | None,
+    ) -> tuple[float, float] | None:
+        normalized_names = {
+            reference_name.strip().lower(),
+            comparison_name.strip().lower(),
+        }
+        is_resonance_0p3_pair = (
+            any("resonance" in name for name in normalized_names)
+            and any(name.startswith("0.3") for name in normalized_names)
+        )
+        if not is_resonance_0p3_pair:
+            return manual_window
+
+        lower_eV = 0.0 if manual_window is None else float(manual_window[0])
+        upper_eV = 0.2 if manual_window is None else min(float(manual_window[1]), 0.2)
+        if upper_eV <= lower_eV:
+            raise ValueError(
+                "The 0.3 A/resonance overlap window must extend below 0.200 eV."
+            )
+        return lower_eV, upper_eV
+
     def _selected_frame_names(self) -> list[str]:
         selected = set(self.inspect_frames.value)
         ordered = [str(name) for name in self.inspect_frames.options]
@@ -1914,6 +2115,8 @@ class MultiFrameNormalizationTof:
             self._draw_plot()
 
     def _plot_setting_changed(self, _change=None) -> None:
+        if self._updating_frame_scales:
+            return
         if self.engine is not None and self.engine.previews:
             self._draw_plot()
 
