@@ -2051,7 +2051,11 @@ class MultiFrameNormalizationTof:
                     )
             overlap_figures.append(ratio_figure)
 
-        transmission_figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)")
+        transmission_figure.update_xaxes(
+            type="log",
+            range=[np.log10(0.001), np.log10(30.0)],
+            title_text="Incident neutron energy (eV)",
+        )
         transmission_figure.update_yaxes(title_text="Transmission")
         transmission_figure.update_layout(
             title="Selected frame transmission previews with frame multipliers",

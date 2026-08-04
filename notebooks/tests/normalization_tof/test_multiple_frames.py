@@ -702,6 +702,10 @@ def test_draw_plot_splits_transmission_and_each_adjacent_overlap(monkeypatch):
     assert len(transmission_figure.data) == len(names)
     assert transmission_figure.layout.yaxis.title.text == "Transmission"
     np.testing.assert_allclose(
+        transmission_figure.layout.xaxis.range,
+        [np.log10(0.001), np.log10(30.0)],
+    )
+    np.testing.assert_allclose(
         transmission_figure.data[1].y,
         previews[names[1]].transmission * 2.0,
     )
