@@ -55,6 +55,7 @@ from __code.normalization_tof.multiple_frames_ui import (
     RunInputEditor,
     _add_prompt_flash_lines,
     _empty_frame,
+    _frame_energy_log_range,
     _roi_preview_intensity_limits,
 )
 from __code.normalization_tof.utilities import (
@@ -729,6 +730,27 @@ def test_prompt_flash_helper_adds_only_visible_fixed_markers():
     hidden = go.Figure()
     _add_prompt_flash_lines(hidden, False)
     assert not hidden.layout.shapes
+
+
+def test_prompt_flash_marker_does_not_expand_frame_energy_axis():
+    frame_energy = np.asarray([0.0035, 0.0049, 0.0065, 0.0117628, 0.013])
+    expected_range = _frame_energy_log_range(frame_energy)
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(x=frame_energy, y=np.ones(frame_energy.size)))
+    figure.update_xaxes(type="log", range=expected_range)
+
+    _add_prompt_flash_lines(
+        figure,
+        True,
+        energy_min_eV=float(np.min(frame_energy)),
+        energy_max_eV=float(np.max(frame_energy)),
+    )
+
+    np.testing.assert_allclose(figure.layout.xaxis.range, expected_range)
+    np.testing.assert_allclose(
+        [float(shape.x0) for shape in figure.layout.shapes],
+        [PROMPT_FLASH_ENERGIES_EV[-1]],
+    )
 
 
 def test_direct_data_folder_infers_nexus_from_its_own_ipts(tmp_path):

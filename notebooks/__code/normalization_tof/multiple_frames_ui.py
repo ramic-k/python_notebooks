@@ -57,6 +57,27 @@ _REBIN_MODES = [
 PROMPT_FLASH_ENERGIES_EV = (0.001307, 0.0029404, 0.0117628)
 
 
+def _frame_energy_log_range(
+    *energy_arrays: np.ndarray,
+    padding_fraction: float = 0.02,
+) -> list[float] | None:
+    """Return a padded Plotly log-axis range based only on frame energies."""
+    finite_positive = []
+    for values in energy_arrays:
+        array = np.asarray(values, dtype=np.float64).reshape(-1)
+        finite_positive.append(array[np.isfinite(array) & (array > 0)])
+    finite_positive = [values for values in finite_positive if values.size]
+    if not finite_positive:
+        return None
+
+    log_values = np.log10(np.concatenate(finite_positive))
+    lower = float(np.min(log_values))
+    upper = float(np.max(log_values))
+    span = upper - lower
+    padding = max(span * float(padding_fraction), 0.005)
+    return [lower - padding, upper + padding]
+
+
 def _add_prompt_flash_lines(
     figure: go.Figure,
     enabled: bool,
@@ -1402,7 +1423,15 @@ class FrameEditor:
                 margin=dict(l=70, r=30, t=75, b=60),
                 hovermode="closest",
             )
-            transmission_figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)")
+            frame_energy_log_range = _frame_energy_log_range(
+                native.energy_eV,
+                preview.energy_eV,
+            )
+            transmission_figure.update_xaxes(
+                type="log",
+                title_text="Incident neutron energy (eV)",
+                range=frame_energy_log_range,
+            )
             transmission_figure.update_yaxes(title_text="Transmission")
             finite_plot_energy = np.concatenate(
                 [
@@ -1467,7 +1496,11 @@ class FrameEditor:
                 hovermode="x unified",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
             )
-            flux_figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)")
+            flux_figure.update_xaxes(
+                type="log",
+                title_text="Incident neutron energy (eV)",
+                range=frame_energy_log_range,
+            )
             flux_figure.update_yaxes(title_text=flux_ylabel)
 
             construction_figure = go.Figure()
@@ -1496,7 +1529,11 @@ class FrameEditor:
                 template="plotly_white",
                 height=380,
                 margin=dict(l=70, r=70, t=70, b=60),
-                xaxis=dict(type="log", title="Incident neutron energy (eV)"),
+                xaxis=dict(
+                    type="log",
+                    title="Incident neutron energy (eV)",
+                    range=frame_energy_log_range,
+                ),
                 yaxis=dict(title="Native frames per output bin"),
                 yaxis2=dict(title="Actual TOF span (us)", overlaying="y", side="right"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
