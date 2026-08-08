@@ -21,29 +21,39 @@ from __code.normalization_tof import (
 from __code.normalization_tof import normalization_for_timepix1_timepix3 as production_normalization
 from __code.normalization_tof import utilities as normalization_utilities
 from __code.normalization_tof.multiple_frames import (
+    AutoRoiConfig,
     BlackFilterBackgroundConfig,
     FrameConfig,
     MeasuredBackgroundConfig,
     MultiFramePreviewEngine,
     MultiFrameRecipe,
     NativeFrameProfile,
+    OverlapWindowConfig,
     RebinnedFramePreview,
     RebinConfig,
     ResolvedRun,
     RoiConfig,
     RoiProfileCache,
     RunSpec,
+    SlitGapMetadata,
     calculate_overlap_diagnostics,
     convert_tof_schedule_to_energy_schedule,
+    export_scaled_spectrum_profile,
     load_integrated_image_preview,
     load_native_roi_profile,
     overlap_ratio_arrays,
     parse_run_numbers,
+    propose_roi_from_nexus,
+    propose_roi_from_slit_gaps,
+    read_slit_gaps_from_nexus,
+    export_selected_spectrum_profile,
 )
 from __code.normalization_tof.multiple_frames_ui import (
     FrameEditor,
     MultiFrameNormalizationTof,
+    PROMPT_FLASH_ENERGIES_EV,
     RunInputEditor,
+    _add_prompt_flash_lines,
     _empty_frame,
     _roi_preview_intensity_limits,
 )
@@ -80,6 +90,93 @@ def _write_run(root: Path, run_number: str, frames: list[np.ndarray], charge_c: 
         delay = daslogs.create_group("BL10:Det:TH:DSPT1:TIDelay")
         delay.create_dataset("value", data=[0.0])
     return data_path, nexus_path
+
+
+def _write_slit_logs(
+    nexus_path: Path,
+    horizontal_value: float,
+    vertical_value: float,
+    units: str = "mm",
+) -> None:
+    with h5py.File(nexus_path, "a") as nexus:
+        daslogs = nexus["entry/DASlogs"]
+        for axis, value in (("X", horizontal_value), ("Y", vertical_value)):
+            group = daslogs.create_group(f"BL10:Mot:s1:{axis}:Gap.RBV")
+            dataset = group.create_dataset("average_value", data=[value])
+            dataset.attrs["units"] = units
+
+
+def test_read_slit_gaps_from_nexus_converts_length_units(tmp_path):
+    _data_path, nexus_path = _write_run(
+        tmp_path,
+        "97",
+        [np.ones((4, 4), dtype=np.uint16)],
+    )
+    _write_slit_logs(nexus_path, horizontal_value=1.5, vertical_value=1.2, units="cm")
+
+    metadata = read_slit_gaps_from_nexus(nexus_path)
+
+    assert metadata.horizontal_mm == 15.0
+    assert metadata.vertical_mm == 12.0
+    assert metadata.horizontal_path.endswith("X:Gap.RBV/average_value")
+    assert metadata.vertical_path.endswith("Y:Gap.RBV/average_value")
+
+
+def test_slit_roi_projection_uses_default_quarter_mm_edge_inset():
+    image = np.ones((512, 512), dtype=np.float64)
+    proposal = propose_roi_from_slit_gaps(
+        image,
+        SlitGapMetadata(
+            horizontal_mm=15.0,
+            vertical_mm=10.0,
+            horizontal_path="x",
+            vertical_path="y",
+        ),
+        AutoRoiConfig(refine_center_from_image=False),
+    )
+
+    assert proposal.roi == RoiConfig(left=124, top=170, width=263, height=172)
+    assert proposal.center_x_pixels == 255.5
+    assert proposal.center_y_pixels == 255.5
+
+
+def test_slit_roi_projection_refines_center_from_integrated_image(tmp_path):
+    image = np.zeros((512, 512), dtype=np.float64)
+    image[170:370, 190:390] = 100.0
+    _data_path, nexus_path = _write_run(
+        tmp_path,
+        "96",
+        [np.ones((4, 4), dtype=np.uint16)],
+    )
+    _write_slit_logs(nexus_path, horizontal_value=10.0, vertical_value=10.0)
+
+    proposal = propose_roi_from_nexus(
+        image,
+        nexus_path,
+        AutoRoiConfig(edge_inset_mm=1.25, max_center_shift_pixels=64.0),
+    )
+
+    assert proposal.roi.width == 136
+    assert proposal.roi.height == 136
+    assert proposal.center_x_pixels == 288.5
+    assert proposal.center_y_pixels == 268.5
+    assert proposal.roi.left == 221
+    assert proposal.roi.top == 201
+
+
+def test_old_frame_recipe_defaults_to_pending_automatic_roi():
+    frame = FrameConfig.from_dict(
+        {
+            "name": "0.3 A",
+            "detector_type": DetectorType.tpx1,
+            "sample_runs": ["1"],
+            "ob_runs": ["2"],
+            "roi": {"left": 10, "top": 11, "width": 12, "height": 13},
+        }
+    )
+
+    assert frame.auto_roi.enabled
+    assert not frame.auto_roi.applied
 
 
 def test_tiff_stack_loader_preserves_frame_order_orientation_and_dtype(tmp_path):
@@ -433,6 +530,7 @@ def _frame(
         sample_runs=specs(sample),
         ob_runs=specs(ob),
         roi=roi,
+        auto_roi=AutoRoiConfig(enabled=False),
         ob_roi=ob_roi,
         rebin=rebin or RebinConfig(),
         use_experimental_uncertainties=False,
@@ -458,6 +556,9 @@ def test_run_parser_and_recipe_round_trip(tmp_path):
             delta_tof_us=100,
             full_bins_only=True,
         ),
+        output_energy_min_eV=0.011,
+        output_energy_max_eV=0.2,
+        output_excluded_energy_ranges_eV=((0.031, 0.034), (0.071, 0.072)),
     )
     recipe = MultiFrameRecipe(
         working_dir="/SNS/VENUS/IPTS-36914",
@@ -465,6 +566,12 @@ def test_run_parser_and_recipe_round_trip(tmp_path):
         output_root=str(tmp_path),
         cache_dir=str(tmp_path / "cache"),
         same_rois_all_frames=True,
+        export_scaled_spectra=True,
+        frame_multipliers={"0.3 A": 0.987},
+        overlap_windows=(
+            OverlapWindowConfig("0.3 A", "resonance", 0.11, 0.19),
+        ),
+        show_prompt_flash_lines=True,
     )
     recipe_path = recipe.save(tmp_path / "recipe.json")
     loaded = MultiFrameRecipe.load(recipe_path)
@@ -472,7 +579,188 @@ def test_run_parser_and_recipe_round_trip(tmp_path):
     assert loaded.frames[0].effective_ob_roi() == RoiConfig(left=53, top=63, width=410, height=400)
     assert loaded.frames[0].spectrum_only is True
     assert loaded.same_rois_all_frames is True
+    assert loaded.export_scaled_spectra is True
+    assert loaded.frame_multipliers == {"0.3 A": 0.987}
+    assert loaded.overlap_windows == (
+        OverlapWindowConfig("0.3 A", "resonance", 0.11, 0.19),
+    )
+    assert loaded.frames[0].output_energy_min_eV == 0.011
+    assert loaded.frames[0].output_energy_max_eV == 0.2
+    assert loaded.frames[0].output_excluded_energy_ranges_eV == (
+        (0.031, 0.034),
+        (0.071, 0.072),
+    )
+    assert loaded.show_prompt_flash_lines is True
     assert json.loads(recipe_path.read_text())["recipe_version"] == 1
+
+
+def test_scaled_spectrum_profile_scales_transmissions_but_not_counts(tmp_path):
+    source = tmp_path / "spectrum_normalization_profile.txt"
+    source.write_text(
+        "# uncertainty model: test\n"
+        "sample ROI counts,spectrum normalization,spectrum normalization uncertainty,"
+        "closed-slits corrected spectrum normalization,"
+        "closed-slits corrected spectrum normalization uncertainty\n"
+        "10,0.5,0.02,0.4,0.03\n"
+        "20,0.6,0.04,0.5,0.05\n",
+        encoding="utf-8",
+    )
+
+    output = export_scaled_spectrum_profile(source, 1.25)
+    original = pd.read_csv(source, comment="#")
+    scaled = pd.read_csv(output, comment="#")
+
+    np.testing.assert_allclose(scaled["sample ROI counts"], original["sample ROI counts"])
+    np.testing.assert_allclose(scaled["spectrum normalization"], [0.625, 0.75])
+    np.testing.assert_allclose(scaled["spectrum normalization uncertainty"], [0.025, 0.05])
+    np.testing.assert_allclose(
+        scaled["closed-slits corrected spectrum normalization"],
+        [0.5, 0.625],
+    )
+    np.testing.assert_allclose(
+        scaled["closed-slits corrected spectrum normalization uncertainty"],
+        [0.0375, 0.0625],
+    )
+    assert "# frame multiplier: 1.25" in output.read_text(encoding="utf-8")
+
+
+def test_scaled_spectrum_profile_applies_optional_energy_limits(tmp_path):
+    source = tmp_path / "spectrum_normalization_profile.txt"
+    source.write_text(
+        "mean_energy (eV),sample ROI counts,spectrum normalization,"
+        "spectrum normalization uncertainty\n"
+        "0.01,10,0.5,0.02\n"
+        "0.1,20,0.6,0.03\n"
+        "1.0,30,0.7,0.04\n",
+        encoding="utf-8",
+    )
+
+    output = export_scaled_spectrum_profile(
+        source,
+        2.0,
+        energy_min_eV=0.05,
+        energy_max_eV=0.5,
+    )
+    scaled = pd.read_csv(output, comment="#")
+
+    np.testing.assert_allclose(scaled["mean_energy (eV)"], [0.1])
+    np.testing.assert_allclose(scaled["sample ROI counts"], [20])
+    np.testing.assert_allclose(scaled["spectrum normalization"], [1.2])
+
+
+def test_selected_spectrum_profile_preserves_full_profile(tmp_path):
+    source = tmp_path / "spectrum_normalization_profile.txt"
+    source.write_text(
+        "# uncertainty model: test\n"
+        "mean_energy (eV),sample ROI counts,spectrum normalization\n"
+        "0.01,10,0.5\n"
+        "0.1,20,0.6\n"
+        "1.0,30,0.7\n",
+        encoding="utf-8",
+    )
+    original = source.read_bytes()
+
+    output = export_selected_spectrum_profile(
+        source,
+        energy_min_eV=0.05,
+        energy_max_eV=0.5,
+    )
+
+    assert output.name == "spectrum_normalization_profile_selected.txt"
+    assert source.read_bytes() == original
+    selected = pd.read_csv(output, comment="#")
+    np.testing.assert_allclose(selected["mean_energy (eV)"], [0.1])
+    assert "# uncertainty model: test" in output.read_text(encoding="utf-8")
+    assert "# frame output energy range (eV): 0.05, 0.5" in output.read_text(
+        encoding="utf-8"
+    )
+
+    second_output = export_selected_spectrum_profile(source, energy_min_eV=0.5)
+    reselection = pd.read_csv(second_output, comment="#")
+    np.testing.assert_allclose(reselection["mean_energy (eV)"], [1.0])
+    assert source.read_bytes() == original
+
+
+def test_selected_and_scaled_profiles_apply_inclusive_excluded_ranges(tmp_path):
+    source = tmp_path / "spectrum_normalization_profile.txt"
+    source.write_text(
+        "mean_energy (eV),sample ROI counts,spectrum normalization,"
+        "spectrum normalization uncertainty\n"
+        "0.01,10,0.5,0.02\n"
+        "0.1,20,0.6,0.03\n"
+        "0.2,30,0.7,0.04\n"
+        "0.3,40,0.8,0.05\n",
+        encoding="utf-8",
+    )
+
+    selected_path = export_selected_spectrum_profile(
+        source,
+        excluded_energy_ranges_eV=((0.1, 0.2),),
+    )
+    scaled_path = export_scaled_spectrum_profile(
+        source,
+        2.0,
+        output_name="scaled_selected.txt",
+        excluded_energy_ranges_eV=((0.1, 0.2),),
+    )
+
+    selected = pd.read_csv(selected_path, comment="#")
+    scaled = pd.read_csv(scaled_path, comment="#")
+    np.testing.assert_allclose(selected["mean_energy (eV)"], [0.01, 0.3])
+    np.testing.assert_allclose(scaled["mean_energy (eV)"], [0.01, 0.3])
+    np.testing.assert_allclose(scaled["spectrum normalization"], [1.0, 1.6])
+    assert "# excluded output energy ranges (eV, inclusive):" in (
+        selected_path.read_text(encoding="utf-8")
+    )
+
+
+def test_prompt_flash_helper_adds_only_visible_fixed_markers():
+    figure = go.Figure()
+    _add_prompt_flash_lines(
+        figure,
+        True,
+        energy_min_eV=0.002,
+        energy_max_eV=0.012,
+    )
+
+    marker_positions = [float(shape.x0) for shape in figure.layout.shapes]
+    np.testing.assert_allclose(marker_positions, PROMPT_FLASH_ENERGIES_EV[1:])
+
+    hidden = go.Figure()
+    _add_prompt_flash_lines(hidden, False)
+    assert not hidden.layout.shapes
+
+
+def test_direct_data_folder_infers_nexus_from_its_own_ipts(tmp_path):
+    source_ipts = tmp_path / "SNS" / "VENUS" / "IPTS-36914"
+    data_path = (
+        source_ipts
+        / "shared"
+        / "autoreduce"
+        / "images"
+        / "tpx1"
+        / "raw"
+        / "radiography"
+        / "Run_19560"
+    )
+    data_path.mkdir(parents=True)
+    nexus_path = source_ipts / "nexus" / "VENUS_19560.nxs.h5"
+    nexus_path.parent.mkdir()
+    with h5py.File(nexus_path, "w") as nexus:
+        entry = nexus.create_group("entry")
+        entry.create_dataset("proton_charge", data=[1.0e12])
+
+    recipe = MultiFrameRecipe(
+        working_dir=str(tmp_path / "SNS" / "VENUS" / "IPTS-35167"),
+        frames=[],
+    )
+    resolved = MultiFramePreviewEngine(recipe).resolve_run(
+        RunSpec("19560", data_path=str(data_path)),
+        DetectorType.tpx1,
+    )
+
+    assert resolved.data_path == data_path
+    assert resolved.nexus_path == nexus_path
 
 
 def test_new_frame_defaults_match_single_frame_notebook():
@@ -484,12 +772,17 @@ def test_new_frame_defaults_match_single_frame_notebook():
     assert editor.roi_top.value == 156
     assert editor.roi_width.value == 200
     assert editor.roi_height.value == 200
-    assert editor.ob_roi_linked.value is True
+    assert editor.auto_roi_enabled.value is True
+    assert editor.auto_roi_projection_scale.value == 1.0
+    assert editor.auto_roi_edge_inset_mm.value == 0.25
+    assert editor.auto_roi_refine_center.value is True
+    assert editor.ob_roi_linked.value is False
+    assert editor.ob_roi_linked.disabled is True
     assert editor.ob_roi_left.value == 156
     assert editor.ob_roi_top.value == 156
     assert editor.ob_roi_width.value == 200
     assert editor.ob_roi_height.value == 200
-    assert editor.ob_roi_left.disabled is True
+    assert editor.ob_roi_left.disabled is False
     assert editor.rebin_mode.value == RebinMode.none
     assert editor.custom_basis.value == RebinCustomBasis.energy_tof
     assert editor.preview_bins_button.disabled is True
@@ -531,6 +824,14 @@ def test_new_frame_defaults_match_single_frame_notebook():
         "combined_normalized_integrated": False,
         "x_axis": True,
     }
+
+    editor.auto_roi_enabled.value = False
+    assert editor.ob_roi_linked.disabled is False
+    editor.ob_roi_linked.value = True
+    assert editor.ob_roi_linked.value is True
+    editor.auto_roi_enabled.value = True
+    assert editor.ob_roi_linked.value is False
+    assert editor.ob_roi_linked.disabled is True
 
     editor.detector.value = DetectorType.tpx3
     assert editor.experimental_uncertainties.value is False
@@ -695,24 +996,36 @@ def test_direct_folder_override_can_infer_run_number(tmp_path):
     assert editor.runs.value == "19558"
 
 
-def test_overlap_inspection_selects_all_frames_and_supports_focused_pair():
+def test_overlap_inspection_provides_manual_window_for_each_adjacent_pair():
     ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
     names = ("6.3 A", "4.5 A", "2.5 A", "0.3 A", "resonance")
     assert ui.inspect_frames.value == names
     assert ui._selected_frame_names() == list(names)
     assert tuple(ui.frame_scale_widgets) == names
     assert all(widget.value == 1.0 for widget in ui.frame_scale_widgets.values())
-    assert ui.frame_scale_widgets["resonance"].disabled is True
-    assert ui.overlap_min.disabled is True
-    assert ui.overlap_max.disabled is True
+    assert all(widget.disabled is False for widget in ui.frame_scale_widgets.values())
+    assert len(ui.overlap_window_widgets) == len(names) - 1
+    assert all(
+        controls["auto"].value
+        and controls["minimum"].disabled
+        and controls["maximum"].disabled
+        for controls in ui.overlap_window_widgets.values()
+    )
 
-    ui.inspect_frames.value = names[:2]
-    assert ui._selected_frame_names() == list(names[:2])
-    assert ui.overlap_min.disabled is False
-    assert ui.overlap_max.disabled is False
+    pair = ui.overlap_window_widgets[ui._overlap_pair_key("2.5 A", "0.3 A")]
+    pair["auto"].value = False
+    pair["minimum"].value = 0.0105
+    pair["maximum"].value = 0.0115
+
+    assert ui._overlap_window_for_pair("2.5 A", "0.3 A") == (0.0105, 0.0115)
+    assert ui._overlap_window_for_pair("0.3 A", "2.5 A") == (0.0105, 0.0115)
     assert ui._overlap_window_for_pair("0.3 A", "resonance", None) == (0.0, 0.2)
-    assert ui._overlap_window_for_pair("resonance", "0.3 A", (0.1, 0.3)) == (0.1, 0.2)
-    assert ui._overlap_window_for_pair("2.5 A", "0.3 A", None) is None
+    assert ui._overlap_window_for_pair("resonance", "0.3 A", (0.1, 0.3)) == (0.1, 0.3)
+
+    windows = ui.recipe().overlap_windows
+    assert windows == (
+        OverlapWindowConfig("2.5 A", "0.3 A", 0.0105, 0.0115),
+    )
 
 
 def test_integrated_roi_preview_uses_production_orientation_and_subsampling(tmp_path):
@@ -1052,6 +1365,12 @@ def test_draw_plot_splits_transmission_and_each_adjacent_overlap(monkeypatch):
     ui.show_native.value = False
     names = list(ui.inspect_frames.value)
     ui.frame_scale_widgets[names[1]].value = 2.0
+    first_pair = ui.overlap_window_widgets[
+        ui._overlap_pair_key(names[0], names[1])
+    ]
+    first_pair["auto"].value = False
+    first_pair["minimum"].value = 0.015
+    first_pair["maximum"].value = 0.035
     previews = {
         name: _preview(
             name,
@@ -1062,6 +1381,7 @@ def test_draw_plot_splits_transmission_and_each_adjacent_overlap(monkeypatch):
         for index, name in enumerate(names)
     }
     ui.engine = SimpleNamespace(previews=previews)
+    ui.show_prompt_flash_lines.value = True
     captured = []
     monkeypatch.setattr(go.Figure, "show", lambda figure: captured.append(figure))
     ui._draw_plot()
@@ -1070,6 +1390,14 @@ def test_draw_plot_splits_transmission_and_each_adjacent_overlap(monkeypatch):
     transmission_figure, *overlap_figures = captured
     assert len(transmission_figure.data) == len(names)
     assert transmission_figure.layout.yaxis.title.text == "Transmission"
+    np.testing.assert_allclose(
+        [
+            float(shape.x0)
+            for shape in transmission_figure.layout.shapes
+            if shape.line.color == "#b2182b"
+        ],
+        PROMPT_FLASH_ENERGIES_EV,
+    )
     np.testing.assert_allclose(
         transmission_figure.layout.xaxis.range,
         [np.log10(0.001), np.log10(30.0)],
@@ -1086,11 +1414,54 @@ def test_draw_plot_splits_transmission_and_each_adjacent_overlap(monkeypatch):
     assert all(len(figure.data) == 1 for figure in overlap_figures)
     assert all(figure.layout.yaxis.title.text == "Ratio" for figure in overlap_figures)
     _, unscaled_ratio, _ = overlap_ratio_arrays(previews[names[0]], previews[names[1]])
-    np.testing.assert_allclose(overlap_figures[0].data[0].y, unscaled_ratio * 2.0)
+    np.testing.assert_allclose(overlap_figures[0].data[0].x, [0.02, 0.03])
+    np.testing.assert_allclose(overlap_figures[0].data[0].y, unscaled_ratio[1:3] * 2.0)
     assert "multipliers: 4.5 A x2" in overlap_figures[0].layout.title.text
 
 
-def test_auto_scale_chains_from_fixed_resonance_to_lower_energy_frames(monkeypatch):
+def test_overlap_preview_hides_native_profiles_by_default():
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+
+    assert ui.show_native.value is False
+
+
+def test_output_spectra_preview_applies_frame_ranges_and_export_scales(monkeypatch):
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+    names = list(ui.inspect_frames.value)
+    previews = {
+        name: _preview(
+            name,
+            [0.01, 0.02, 0.03, 0.04],
+            [0.5, 0.6, 0.7, 0.8],
+            [0.01] * 4,
+        )
+        for name in names
+    }
+    ui.engine = SimpleNamespace(previews=previews)
+    ui.export_scaled_spectra.value = True
+    ui.frame_scale_widgets[names[0]].value = 2.0
+    ui.frame_editors[0].output_energy_min.value = 0.02
+    ui.frame_editors[0].output_energy_max.value = 0.04
+    ui.frame_editors[0]._add_output_exclusion_range(values=(0.029, 0.031))
+    ui.show_prompt_flash_lines.value = True
+    captured = []
+    monkeypatch.setattr(go.Figure, "show", lambda figure: captured.append(figure))
+
+    ui._preview_output_spectra()
+
+    assert len(captured) == 1
+    figure = captured[0]
+    assert len(figure.data) == len(names)
+    np.testing.assert_allclose(figure.data[0].x, [0.02, 0.04])
+    np.testing.assert_allclose(figure.data[0].y, [1.2, 1.6])
+    np.testing.assert_allclose(figure.data[0].error_y.array, [0.02, 0.02])
+    np.testing.assert_allclose(
+        [float(shape.x0) for shape in figure.layout.shapes],
+        PROMPT_FLASH_ENERGIES_EV,
+    )
+
+
+def test_auto_scale_chains_from_highest_energy_frame(monkeypatch):
     ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
     names = list(ui.inspect_frames.value)
     amplitudes = {
@@ -1110,21 +1481,174 @@ def test_auto_scale_chains_from_fixed_resonance_to_lower_energy_frames(monkeypat
         for name in names
     }
     ui.engine = SimpleNamespace(previews=previews)
+    ui.frame_scale_widgets["resonance"].value = 0.75
+    for controls in ui.overlap_window_widgets.values():
+        controls["auto"].value = False
+        controls["minimum"].value = 0.015
+        controls["maximum"].value = 0.035
     monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
 
-    ui._auto_scale_from_resonance()
+    ui._auto_scale_from_highest_energy()
 
     expected = {
-        "6.3 A": 16.0,
-        "4.5 A": 8.0,
-        "2.5 A": 4.0,
-        "0.3 A": 2.0,
-        "resonance": 1.0,
+        "6.3 A": 12.0,
+        "4.5 A": 6.0,
+        "2.5 A": 3.0,
+        "0.3 A": 1.5,
+        "resonance": 0.75,
     }
     for name, scale in expected.items():
         np.testing.assert_allclose(ui.frame_scale_widgets[name].value, scale)
-    assert ui.frame_scale_widgets["resonance"].disabled is True
-    assert "resonance x1 (fixed)" in ui.frame_scale_status.value
+        assert ui.frame_scale_widgets[name].disabled is False
+    assert "resonance x0.75 (editable highest-energy anchor" in ui.frame_scale_status.value
+    assert "2 overlap points" in ui.frame_scale_status.value
+
+
+def test_auto_scale_highest_energy_anchor_does_not_depend_on_frame_name(monkeypatch):
+    frames = [
+        _empty_frame("thermal", DetectorType.tpx1),
+        _empty_frame("fast", DetectorType.tpx3),
+    ]
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914", frames=frames)
+    previews = {
+        "thermal": _preview("thermal", [0.01, 0.02, 0.03, 0.04], [0.4] * 4, [0.01] * 4),
+        "fast": _preview("fast", [0.02, 0.04, 0.2, 2.0], [0.8] * 4, [0.01] * 4),
+    }
+    ui.engine = SimpleNamespace(previews=previews)
+    ui.frame_scale_widgets["fast"].value = 0.9
+    monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
+
+    ui._auto_scale_from_highest_energy()
+
+    np.testing.assert_allclose(ui.frame_scale_widgets["thermal"].value, 1.8)
+    np.testing.assert_allclose(ui.frame_scale_widgets["fast"].value, 0.9)
+    assert ui.frame_scale_widgets["fast"].disabled is False
+    assert ui.frame_scale_widgets["thermal"].disabled is False
+    assert "fast x0.9 (editable highest-energy anchor" in ui.frame_scale_status.value
+
+
+def test_ui_recipe_captures_scaled_spectrum_export_settings():
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+    ui.export_scaled_spectra.value = True
+    ui.frame_editors[0].output_energy_min.value = 0.0012
+    ui.frame_editors[0].output_energy_max.value = 0.0021
+    ui.frame_editors[0]._add_output_exclusion_range(values=(0.0014, 0.0015))
+    ui.show_prompt_flash_lines.value = True
+    ui.frame_scale_widgets["4.5 A"].value = 1.011
+    ui.frame_scale_widgets["2.5 A"].value = 0.966
+    ui.frame_scale_widgets["resonance"].value = 0.973
+    pair = ui.overlap_window_widgets[
+        ui._overlap_pair_key("4.5 A", "2.5 A")
+    ]
+    pair["auto"].value = False
+    pair["minimum"].value = 0.0033
+    pair["maximum"].value = 0.0038
+
+    recipe = ui.recipe()
+
+    assert recipe.export_scaled_spectra is True
+    assert recipe.frame_multipliers["4.5 A"] == 1.011
+    assert recipe.frame_multipliers["2.5 A"] == 0.966
+    assert recipe.frame_multipliers["resonance"] == 0.973
+    assert recipe.frames[0].output_energy_min_eV == 0.0012
+    assert recipe.frames[0].output_energy_max_eV == 0.0021
+    assert recipe.frames[0].output_excluded_energy_ranges_eV == ((0.0014, 0.0015),)
+    assert recipe.show_prompt_flash_lines is True
+    assert recipe.overlap_windows == (
+        OverlapWindowConfig("4.5 A", "2.5 A", 0.0033, 0.0038),
+    )
+
+
+def test_ui_load_recipe_restores_frame_multipliers(tmp_path):
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+    ui.export_scaled_spectra.value = True
+    ui.frame_scale_widgets["6.3 A"].value = 1.06
+    ui.frame_scale_widgets["4.5 A"].value = 1.01
+    ui.frame_scale_widgets["2.5 A"].value = 0.966
+    ui.frame_scale_widgets["resonance"].value = 0.973
+    ui.frame_editors[0].output_energy_min.value = 0.0011
+    ui.frame_editors[0].output_energy_max.value = 0.0022
+    ui.frame_editors[0]._add_output_exclusion_range(values=(0.0014, 0.0015))
+    ui.show_prompt_flash_lines.value = True
+    pair = ui.overlap_window_widgets[
+        ui._overlap_pair_key("0.3 A", "resonance")
+    ]
+    pair["auto"].value = False
+    pair["minimum"].value = 0.11
+    pair["maximum"].value = 0.19
+    recipe_path = ui.recipe().save(tmp_path / "scaled_recipe.json")
+
+    restored = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+    restored.recipe_file.value = str(recipe_path)
+    restored._load_recipe(None)
+
+    assert restored.export_scaled_spectra.value is True
+    assert restored.frame_scale_widgets["6.3 A"].value == 1.06
+    assert restored.frame_scale_widgets["4.5 A"].value == 1.01
+    assert restored.frame_scale_widgets["2.5 A"].value == 0.966
+    assert restored.frame_scale_widgets["resonance"].value == 0.973
+    assert restored.frame_editors[0].output_energy_min.value == 0.0011
+    assert restored.frame_editors[0].output_energy_max.value == 0.0022
+    assert restored.frame_editors[0].output_excluded_energy_ranges() == (
+        (0.0014, 0.0015),
+    )
+    assert restored.show_prompt_flash_lines.value is True
+    restored_pair = restored.overlap_window_widgets[
+        restored._overlap_pair_key("0.3 A", "resonance")
+    ]
+    assert restored_pair["auto"].value is False
+    assert restored_pair["minimum"].value == 0.11
+    assert restored_pair["maximum"].value == 0.19
+
+
+def test_ui_header_path_browsers_select_directories_and_recipe(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    recipe = tmp_path / "recipe.json"
+    recipe.write_text("{}", encoding="utf-8")
+    selectors = []
+
+    class FakeFileSelectorPanel:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            selectors.append(self)
+
+        def show(self):
+            return None
+
+    monkeypatch.setattr(
+        "__code.normalization_tof.multiple_frames_ui.FileSelectorPanel",
+        FakeFileSelectorPanel,
+    )
+    ui = MultiFrameNormalizationTof(str(tmp_path))
+
+    ui._browse_output_root(None)
+    output_selector = selectors[-1].kwargs
+    assert output_selector["type"] == "directory"
+    assert output_selector["multiple"] is False
+    assert output_selector["newdir_toolbar_button"] is True
+    output_selector["next"](str(output))
+    assert ui.output_root.value == str(output)
+
+    ui._browse_cache_dir(None)
+    cache_selector = selectors[-1].kwargs
+    assert cache_selector["type"] == "directory"
+    assert cache_selector["newdir_toolbar_button"] is True
+    cache_selector["next"](str(cache))
+    assert ui.cache_dir.value == str(cache)
+
+    ui._browse_recipe_file(None)
+    recipe_selector = selectors[-1].kwargs
+    assert recipe_selector["type"] == "file"
+    assert recipe_selector["newdir_toolbar_button"] is False
+    assert recipe_selector["filters"] == {"JSON recipes": "*.json"}
+    assert recipe_selector["default_filter"] == "JSON recipes"
+    recipe_selector["next"](str(recipe))
+    assert ui.recipe_file.value == str(recipe)
 
 
 def test_overlap_diagnostic_reports_scale_without_applying_it():
@@ -1274,6 +1798,81 @@ def test_full_normalization_forwards_measured_background_runs(tmp_path, monkeypa
     assert list(configs[0]["ob_background_dict"]) == [paths["504"][0].name]
 
 
+def test_full_image_production_retains_full_and_selected_profiles(tmp_path, monkeypatch):
+    sample_path, sample_nexus = _write_run(
+        tmp_path,
+        "601",
+        [np.ones((2, 2), dtype=np.uint16)],
+    )
+    ob_path, ob_nexus = _write_run(
+        tmp_path,
+        "602",
+        [np.ones((2, 2), dtype=np.uint16)],
+    )
+    frame = _frame(
+        "full image",
+        [("601", sample_path, sample_nexus)],
+        [("602", ob_path, ob_nexus)],
+        RoiConfig(left=0, top=0, width=2, height=2),
+    )
+    frame = replace(
+        frame,
+        spectrum_only=False,
+        output_energy_min_eV=0.005,
+        output_energy_max_eV=1.1,
+        output_excluded_energy_ranges_eV=((0.05, 0.5),),
+    )
+
+    def write_profile(**kwargs):
+        output = Path(kwargs["output_folder"]) / "spectrum_normalization_profile.txt"
+        output.write_text(
+            "mean_energy (eV),sample ROI counts,spectrum normalization,"
+            "spectrum normalization uncertainty\n"
+            "0.01,10,0.5,0.02\n"
+            "0.1,20,0.6,0.03\n"
+            "1.0,30,0.7,0.04\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        "__code.normalization_tof.multiple_frames.normalization_with_list_of_full_path",
+        write_profile,
+    )
+    recipe = MultiFrameRecipe(
+        working_dir=str(tmp_path),
+        frames=[frame],
+        output_root=str(tmp_path / "output"),
+        export_scaled_spectra=True,
+        frame_multipliers={"full image": 1.5},
+    )
+
+    campaign = MultiFramePreviewEngine(recipe).run_full_normalization(
+        "full image selected",
+        preview=False,
+    )
+    profile_path = next(campaign.rglob("spectrum_normalization_profile.txt"))
+    scaled = pd.read_csv(
+        profile_path.with_name("spectrum_normalization_profile_scaled.txt"),
+        comment="#",
+    )
+    selected = pd.read_csv(
+        profile_path.with_name("spectrum_normalization_profile_selected.txt"),
+        comment="#",
+    )
+    scaled_selected = pd.read_csv(
+        profile_path.with_name("spectrum_normalization_profile_scaled_selected.txt"),
+        comment="#",
+    )
+
+    np.testing.assert_allclose(
+        pd.read_csv(profile_path, comment="#")["mean_energy (eV)"],
+        [0.01, 0.1, 1.0],
+    )
+    np.testing.assert_allclose(scaled["spectrum normalization"], [0.75, 0.9, 1.05])
+    np.testing.assert_allclose(selected["mean_energy (eV)"], [0.01, 1.0])
+    np.testing.assert_allclose(scaled_selected["spectrum normalization"], [0.75, 1.05])
+
+
 def test_stage3_spectrum_only_exports_rebinned_and_native_roi_profiles(tmp_path, monkeypatch):
     sample_values = np.asarray([10, 20, 30, 40], dtype=np.float64)
     ob_values = np.asarray([20, 40, 60, 80], dtype=np.float64)
@@ -1288,7 +1887,7 @@ def test_stage3_spectrum_only_exports_rebinned_and_native_roi_profiles(tmp_path,
         [np.asarray([[value]], dtype=np.uint16) for value in ob_values],
     )
     frame = _frame(
-        "0.3 A",
+        "resonance",
         [("701", sample_path, sample_nexus)],
         [("702", ob_path, ob_nexus)],
         RoiConfig(left=0, top=0, width=1, height=1),
@@ -1298,11 +1897,14 @@ def test_stage3_spectrum_only_exports_rebinned_and_native_roi_profiles(tmp_path,
             full_bins_only=False,
         ),
     )
+    frame = replace(frame, output_energy_max_eV=1.0e6)
     recipe = MultiFrameRecipe(
         working_dir=str(tmp_path),
         frames=[frame],
         output_root=str(tmp_path / "output"),
         cache_dir=str(tmp_path / "cache"),
+        export_scaled_spectra=True,
+        frame_multipliers={"resonance": 0.8},
     )
 
     def fail_full_image_engine(**_kwargs):
@@ -1317,13 +1919,31 @@ def test_stage3_spectrum_only_exports_rebinned_and_native_roi_profiles(tmp_path,
         preview=False,
     )
     profile_path = next(campaign.rglob("spectrum_normalization_profile.txt"))
+    scaled_path = profile_path.with_name("spectrum_normalization_profile_scaled.txt")
+    selected_path = profile_path.with_name("spectrum_normalization_profile_selected.txt")
+    scaled_selected_path = profile_path.with_name(
+        "spectrum_normalization_profile_scaled_selected.txt"
+    )
     native_path = profile_path.with_name("native_spectrum_normalization_inputs.txt")
     profile = pd.read_csv(profile_path, comment="#")
+    scaled = pd.read_csv(scaled_path, comment="#")
+    selected = pd.read_csv(selected_path, comment="#")
+    scaled_selected = pd.read_csv(scaled_selected_path, comment="#")
     native = pd.read_csv(native_path, comment="#")
 
     np.testing.assert_allclose(profile["sample ROI counts"], [30.0, 70.0])
     np.testing.assert_allclose(profile["ob ROI counts"], [60.0, 140.0])
     np.testing.assert_allclose(profile["spectrum normalization"], [0.5, 0.5])
+    np.testing.assert_allclose(scaled["spectrum normalization"], [0.4, 0.4])
+    np.testing.assert_allclose(scaled["sample ROI counts"], [30.0, 70.0])
+    np.testing.assert_allclose(selected["sample ROI counts"], [70.0])
+    np.testing.assert_allclose(selected["spectrum normalization"], [0.5])
+    np.testing.assert_allclose(scaled_selected["sample ROI counts"], [70.0])
+    np.testing.assert_allclose(scaled_selected["spectrum normalization"], [0.4])
+    np.testing.assert_allclose(
+        scaled["spectrum normalization uncertainty"],
+        profile["spectrum normalization uncertainty"] * 0.8,
+    )
     np.testing.assert_allclose(native["native sample ROI counts"], sample_values)
     np.testing.assert_allclose(native["native OB ROI counts"], ob_values)
     np.testing.assert_allclose(

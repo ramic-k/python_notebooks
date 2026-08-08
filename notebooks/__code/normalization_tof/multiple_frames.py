@@ -58,6 +58,21 @@ from __code.normalization_tof.utilities import (
 RECIPE_VERSION = 1
 _ROI_PREVIEW_IO_WORKERS = 8
 _ROI_PREVIEW_PREFETCH_FACTOR = 2
+SCALED_SPECTRUM_PROFILE_NAME = "spectrum_normalization_profile_scaled.txt"
+SELECTED_SPECTRUM_PROFILE_NAME = "spectrum_normalization_profile_selected.txt"
+SCALED_SELECTED_SPECTRUM_PROFILE_NAME = (
+    "spectrum_normalization_profile_scaled_selected.txt"
+)
+_SLIT_GAP_LOG_PATHS = {
+    "horizontal": (
+        "/entry/DASlogs/BL10:Mot:s1:X:Gap.RBV",
+        "/entry/DASlogs/BL10:Mot:s1:X:Gap",
+    ),
+    "vertical": (
+        "/entry/DASlogs/BL10:Mot:s1:Y:Gap.RBV",
+        "/entry/DASlogs/BL10:Mot:s1:Y:Gap",
+    ),
+}
 
 
 def _clean_run_number(value: str | int) -> str:
@@ -87,6 +102,18 @@ def parse_run_numbers(value: str | Iterable[str | int]) -> list[str]:
     return runs
 
 
+def _infer_nexus_path_from_data_path(
+    data_path: Path,
+    instrument: str,
+    run_number: str,
+) -> Path | None:
+    for parent in (data_path, *data_path.parents):
+        if re.fullmatch(r"IPTS-\d+", parent.name, flags=re.IGNORECASE):
+            nexus_path = parent / "nexus" / f"{instrument.upper()}_{run_number}.nxs.h5"
+            return nexus_path if nexus_path.exists() else None
+    return None
+
+
 @dataclass(frozen=True)
 class RoiConfig:
     left: int = 0
@@ -103,6 +130,265 @@ class RoiConfig:
     def to_roi(self) -> Roi:
         self.validate()
         return Roi(left=self.left, top=self.top, width=self.width, height=self.height)
+
+
+@dataclass(frozen=True)
+class AutoRoiConfig:
+    """Settings for a slit-size-derived detector ROI proposal."""
+
+    enabled: bool = True
+    pixel_size_mm: float = 0.055
+    projection_scale: float = 1.0
+    edge_inset_mm: float = 0.25
+    refine_center_from_image: bool = True
+    max_center_shift_pixels: float = 64.0
+    applied: bool = False
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any] | None) -> "AutoRoiConfig":
+        return cls(**(values or {}))
+
+    def validate(self) -> None:
+        if self.pixel_size_mm <= 0:
+            raise ValueError("Automatic ROI detector pixel size must be positive.")
+        if self.projection_scale <= 0:
+            raise ValueError("Automatic ROI projection scale must be positive.")
+        if self.edge_inset_mm < 0:
+            raise ValueError("Automatic ROI edge inset cannot be negative.")
+        if self.max_center_shift_pixels < 0:
+            raise ValueError("Automatic ROI maximum center shift cannot be negative.")
+
+
+@dataclass(frozen=True)
+class SlitGapMetadata:
+    horizontal_mm: float
+    vertical_mm: float
+    horizontal_path: str
+    vertical_path: str
+
+
+@dataclass(frozen=True)
+class AutoRoiProposal:
+    roi: RoiConfig
+    slit_gaps: SlitGapMetadata
+    projected_width_pixels: int
+    projected_height_pixels: int
+    center_x_pixels: float
+    center_y_pixels: float
+
+
+def _decode_hdf5_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    array = np.asarray(value)
+    if array.ndim == 0:
+        scalar = array.item()
+        if isinstance(scalar, bytes):
+            return scalar.decode("utf-8", errors="replace")
+        return str(scalar)
+    return str(value)
+
+
+def _length_to_mm(value: float, units: str | None) -> float:
+    normalized = (units or "mm").strip().lower().replace("µ", "u")
+    factors = {
+        "m": 1000.0,
+        "meter": 1000.0,
+        "meters": 1000.0,
+        "cm": 10.0,
+        "mm": 1.0,
+        "millimeter": 1.0,
+        "millimeters": 1.0,
+        "um": 1.0e-3,
+        "micrometer": 1.0e-3,
+        "micrometers": 1.0e-3,
+    }
+    if normalized not in factors:
+        raise ValueError(f"Unsupported slit-gap length unit {units!r} in NeXus metadata.")
+    converted = float(value) * factors[normalized]
+    if not np.isfinite(converted) or converted <= 0:
+        raise ValueError(f"Invalid slit gap {value!r} {units or 'mm'} in NeXus metadata.")
+    return converted
+
+
+def _read_nexus_log_scalar(nexus: h5py.File, group_path: str) -> tuple[float, str | None, str]:
+    group = nexus.get(group_path)
+    if group is None:
+        raise KeyError(group_path)
+    for dataset_name in ("average_value", "value"):
+        dataset = group.get(dataset_name)
+        if dataset is None:
+            continue
+        values = np.asarray(dataset[()], dtype=np.float64).reshape(-1)
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            continue
+        units_value = dataset.attrs.get("units", group.attrs.get("units"))
+        units = None if units_value is None else _decode_hdf5_text(units_value)
+        return float(finite[-1]), units, f"{group_path}/{dataset_name}"
+    raise ValueError(f"NeXus log {group_path} has no finite average_value or value dataset.")
+
+
+def read_slit_gaps_from_nexus(nexus_path: str | os.PathLike[str]) -> SlitGapMetadata:
+    """Read the VENUS s1 horizontal and vertical slit openings in millimeters."""
+    path = Path(nexus_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"NeXus file not found for automatic ROI: {path}")
+
+    found: dict[str, tuple[float, str]] = {}
+    missing: list[str] = []
+    with h5py.File(path, "r") as nexus:
+        for axis, candidates in _SLIT_GAP_LOG_PATHS.items():
+            last_error: Exception | None = None
+            for group_path in candidates:
+                try:
+                    value, units, source_path = _read_nexus_log_scalar(nexus, group_path)
+                    found[axis] = (_length_to_mm(value, units), source_path)
+                    break
+                except (KeyError, ValueError) as error:
+                    last_error = error
+            if axis not in found:
+                missing.append(f"{axis} ({last_error})")
+    if missing:
+        raise ValueError(
+            "Automatic ROI requires VENUS s1 X/Y slit-gap logs; missing " + ", ".join(missing)
+        )
+    return SlitGapMetadata(
+        horizontal_mm=found["horizontal"][0],
+        vertical_mm=found["vertical"][0],
+        horizontal_path=found["horizontal"][1],
+        vertical_path=found["vertical"][1],
+    )
+
+
+def _robust_image_center(
+    integrated_image: np.ndarray,
+    opening_width_pixels: float,
+    opening_height_pixels: float,
+    max_shift_pixels: float,
+) -> tuple[float, float]:
+    image = np.asarray(integrated_image, dtype=np.float64)
+    if image.ndim != 2 or not np.any(np.isfinite(image)):
+        raise ValueError("Automatic ROI center refinement requires a finite two-dimensional image.")
+    image = np.where(np.isfinite(image), image, np.nan)
+    low, high = np.nanpercentile(image, [5.0, 99.5])
+    weights = np.clip(image, low, high) - low
+    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    nominal_x = (image.shape[1] - 1) / 2.0
+    nominal_y = (image.shape[0] - 1) / 2.0
+    def edge_center(profile: np.ndarray, opening_pixels: float, nominal: float) -> float:
+        opening_pixels = float(np.clip(opening_pixels, 2.0, len(profile)))
+        smoothing_width = max(5, int(round(opening_pixels * 0.05)))
+        if smoothing_width % 2 == 0:
+            smoothing_width += 1
+        smooth = np.convolve(
+            np.asarray(profile, dtype=np.float64),
+            np.ones(smoothing_width, dtype=np.float64) / smoothing_width,
+            mode="same",
+        )
+        derivative = np.gradient(smooth)
+        search_radius = max(8.0, opening_pixels * 0.30)
+        expected_left = nominal - opening_pixels / 2.0
+        expected_right = nominal + opening_pixels / 2.0
+        left_min = max(1, int(np.floor(expected_left - search_radius)))
+        left_max = min(len(profile) - 2, int(np.ceil(expected_left + search_radius)))
+        right_min = max(1, int(np.floor(expected_right - search_radius)))
+        right_max = min(len(profile) - 2, int(np.ceil(expected_right + search_radius)))
+        if left_max < left_min or right_max < right_min:
+            return nominal
+        left = left_min + int(np.argmax(derivative[left_min : left_max + 1]))
+        right = right_min + int(np.argmin(derivative[right_min : right_max + 1]))
+        measured_width = right - left
+        valid_edges = (
+            derivative[left] > 0
+            and derivative[right] < 0
+            and 0.5 * opening_pixels <= measured_width <= 1.5 * opening_pixels
+        )
+        if not valid_edges:
+            return nominal
+        detected = (left + right) / 2.0
+        return float(
+            np.clip(
+                detected,
+                nominal - float(max_shift_pixels),
+                nominal + float(max_shift_pixels),
+            )
+        )
+
+    profile_x = np.sum(weights, axis=0, dtype=np.float64)
+    profile_y = np.sum(weights, axis=1, dtype=np.float64)
+    center_x = edge_center(profile_x, opening_width_pixels, nominal_x)
+    center_y = edge_center(profile_y, opening_height_pixels, nominal_y)
+    return center_x, center_y
+
+
+def propose_roi_from_slit_gaps(
+    integrated_image: np.ndarray,
+    slit_gaps: SlitGapMetadata,
+    config: AutoRoiConfig | None = None,
+) -> AutoRoiProposal:
+    """Project slit openings onto the detector and return an interior ROI proposal."""
+    settings = config or AutoRoiConfig()
+    settings.validate()
+    image = np.asarray(integrated_image)
+    if image.ndim != 2:
+        raise ValueError("Automatic ROI requires a two-dimensional integrated detector image.")
+    image_height, image_width = image.shape
+    usable_width_mm = slit_gaps.horizontal_mm * settings.projection_scale - 2.0 * settings.edge_inset_mm
+    usable_height_mm = slit_gaps.vertical_mm * settings.projection_scale - 2.0 * settings.edge_inset_mm
+    if usable_width_mm <= 0 or usable_height_mm <= 0:
+        raise ValueError(
+            "Automatic ROI edge inset removes the complete projected slit opening; "
+            "reduce the inset or increase the projection scale."
+        )
+    width = min(image_width, max(1, int(np.floor(usable_width_mm / settings.pixel_size_mm))))
+    height = min(image_height, max(1, int(np.floor(usable_height_mm / settings.pixel_size_mm))))
+    if settings.refine_center_from_image:
+        center_x, center_y = _robust_image_center(
+            image,
+            slit_gaps.horizontal_mm * settings.projection_scale / settings.pixel_size_mm,
+            slit_gaps.vertical_mm * settings.projection_scale / settings.pixel_size_mm,
+            settings.max_center_shift_pixels,
+        )
+    else:
+        center_x = (image_width - 1) / 2.0
+        center_y = (image_height - 1) / 2.0
+    left = int(
+        np.clip(
+            np.rint(center_x - (width - 1) / 2.0),
+            0,
+            image_width - width,
+        )
+    )
+    top = int(
+        np.clip(
+            np.rint(center_y - (height - 1) / 2.0),
+            0,
+            image_height - height,
+        )
+    )
+    roi = RoiConfig(left=left, top=top, width=width, height=height)
+    roi.validate()
+    return AutoRoiProposal(
+        roi=roi,
+        slit_gaps=slit_gaps,
+        projected_width_pixels=width,
+        projected_height_pixels=height,
+        center_x_pixels=center_x,
+        center_y_pixels=center_y,
+    )
+
+
+def propose_roi_from_nexus(
+    integrated_image: np.ndarray,
+    nexus_path: str | os.PathLike[str],
+    config: AutoRoiConfig | None = None,
+) -> AutoRoiProposal:
+    return propose_roi_from_slit_gaps(
+        integrated_image,
+        read_slit_gaps_from_nexus(nexus_path),
+        config=config,
+    )
 
 
 @dataclass(frozen=True)
@@ -308,6 +594,7 @@ class FrameConfig:
     sample_runs: tuple[RunSpec, ...]
     ob_runs: tuple[RunSpec, ...]
     roi: RoiConfig
+    auto_roi: AutoRoiConfig = field(default_factory=AutoRoiConfig)
     ob_roi: RoiConfig | None = None
     container_roi: RoiConfig | None = None
     container_roi_file: str | None = None
@@ -318,6 +605,9 @@ class FrameConfig:
     distance_source_detector_m: float = 25.0
     detector_delay_us: float | None = None
     manual_tof_bin_size_ns: float | None = None
+    output_energy_min_eV: float | None = None
+    output_energy_max_eV: float | None = None
+    output_excluded_energy_ranges_eV: tuple[tuple[float, float], ...] = ()
     use_proton_charge: bool = True
     use_experimental_uncertainties: bool = True
     spectrum_only: bool = True
@@ -335,6 +625,7 @@ class FrameConfig:
         values["ob_runs"] = tuple(RunSpec.from_value(item) for item in values.get("ob_runs", ()))
         values["dc_runs"] = tuple(RunSpec.from_value(item) for item in values.get("dc_runs", ()))
         values["roi"] = RoiConfig(**values.get("roi", {}))
+        values["auto_roi"] = AutoRoiConfig.from_dict(values.get("auto_roi"))
         if values.get("ob_roi") is not None:
             values["ob_roi"] = RoiConfig(**values["ob_roi"])
         if values.get("container_roi") is not None:
@@ -349,6 +640,10 @@ class FrameConfig:
         values["rebin"] = RebinConfig.from_dict(values.get("rebin"))
         if values.get("local_median_kernel") is not None:
             values["local_median_kernel"] = tuple(values["local_median_kernel"])
+        values["output_excluded_energy_ranges_eV"] = tuple(
+            (float(item[0]), float(item[1]))
+            for item in values.get("output_excluded_energy_ranges_eV", ())
+        )
         return cls(**values)
 
     def validate(self) -> None:
@@ -362,6 +657,35 @@ class FrameConfig:
             raise ValueError(f"{self.name}: source-detector distance must be positive.")
         if self.manual_tof_bin_size_ns is not None and self.manual_tof_bin_size_ns <= 0:
             raise ValueError(f"{self.name}: manual TOF bin size must be positive.")
+        if self.output_energy_min_eV is not None and (
+            not np.isfinite(self.output_energy_min_eV) or self.output_energy_min_eV <= 0
+        ):
+            raise ValueError(f"{self.name}: output minimum energy must be positive and finite.")
+        if self.output_energy_max_eV is not None and (
+            not np.isfinite(self.output_energy_max_eV) or self.output_energy_max_eV <= 0
+        ):
+            raise ValueError(f"{self.name}: output maximum energy must be positive and finite.")
+        if (
+            self.output_energy_min_eV is not None
+            and self.output_energy_max_eV is not None
+            and self.output_energy_max_eV <= self.output_energy_min_eV
+        ):
+            raise ValueError(
+                f"{self.name}: output maximum energy must be greater than minimum."
+            )
+        for index, (energy_min_eV, energy_max_eV) in enumerate(
+            self.output_excluded_energy_ranges_eV,
+            start=1,
+        ):
+            if not np.isfinite(energy_min_eV) or energy_min_eV <= 0:
+                raise ValueError(
+                    f"{self.name}: excluded range {index} minimum must be positive and finite."
+                )
+            if not np.isfinite(energy_max_eV) or energy_max_eV <= energy_min_eV:
+                raise ValueError(
+                    f"{self.name}: excluded range {index} maximum must be finite and "
+                    "greater than its minimum."
+                )
         enabled_backgrounds = [item for item in self.measured_backgrounds if item.enabled]
         for background in enabled_backgrounds:
             if not background.sample_runs or not background.ob_runs:
@@ -386,6 +710,7 @@ class FrameConfig:
         if self.local_median_max_iterations is not None and self.local_median_max_iterations <= 0:
             raise ValueError(f"{self.name}: local median maximum iterations must be positive.")
         self.roi.validate()
+        self.auto_roi.validate()
         if self.ob_roi is not None:
             self.ob_roi.validate()
         if self.container_roi is not None:
@@ -419,6 +744,10 @@ class MultiFrameRecipe:
     local_median_kernel: tuple[int, int, int] = (3, 3, 1)
     local_median_max_iterations: int = 2
     same_rois_all_frames: bool = False
+    export_scaled_spectra: bool = False
+    frame_multipliers: dict[str, float] = field(default_factory=dict)
+    overlap_windows: tuple["OverlapWindowConfig", ...] = ()
+    show_prompt_flash_lines: bool = False
     recipe_version: int = RECIPE_VERSION
 
     @classmethod
@@ -430,6 +759,14 @@ class MultiFrameRecipe:
         values["frames"] = [FrameConfig.from_dict(frame) for frame in values.get("frames", [])]
         if "local_median_kernel" in values:
             values["local_median_kernel"] = tuple(values["local_median_kernel"])
+        values["frame_multipliers"] = {
+            str(name): float(multiplier)
+            for name, multiplier in values.get("frame_multipliers", {}).items()
+        }
+        values["overlap_windows"] = tuple(
+            OverlapWindowConfig.from_dict(item)
+            for item in values.get("overlap_windows", ())
+        )
         return cls(**values)
 
     @classmethod
@@ -447,6 +784,254 @@ class MultiFrameRecipe:
             json.dump(self.to_dict(), stream, indent=2)
             stream.write("\n")
         return output
+
+
+@dataclass(frozen=True)
+class OverlapWindowConfig:
+    """User-selected energy window for one pair of frames."""
+
+    frame_a: str
+    frame_b: str
+    energy_min_eV: float
+    energy_max_eV: float
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "OverlapWindowConfig":
+        window = cls(
+            frame_a=str(values["frame_a"]),
+            frame_b=str(values["frame_b"]),
+            energy_min_eV=float(values["energy_min_eV"]),
+            energy_max_eV=float(values["energy_max_eV"]),
+        )
+        window.validate()
+        return window
+
+    def validate(self) -> None:
+        if not self.frame_a.strip() or not self.frame_b.strip():
+            raise ValueError("Overlap-window frame names must be non-empty.")
+        if self.frame_a == self.frame_b:
+            raise ValueError("An overlap window requires two different frames.")
+        if not np.isfinite(self.energy_min_eV) or self.energy_min_eV <= 0:
+            raise ValueError("Overlap minimum energy must be positive and finite.")
+        if not np.isfinite(self.energy_max_eV):
+            raise ValueError("Overlap maximum energy must be finite.")
+        if self.energy_max_eV <= self.energy_min_eV:
+            raise ValueError("Overlap maximum energy must be greater than minimum.")
+
+
+def export_scaled_spectrum_profile(
+    profile_path: str | os.PathLike[str],
+    multiplier: float,
+    output_name: str = SCALED_SPECTRUM_PROFILE_NAME,
+    energy_min_eV: float | None = None,
+    energy_max_eV: float | None = None,
+    excluded_energy_ranges_eV: tuple[tuple[float, float], ...] = (),
+) -> Path:
+    """Write a scaled, optionally energy-selected transmission-profile companion."""
+    source = Path(profile_path)
+    scale = float(multiplier)
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Spectrum multiplier must be positive and finite.")
+    if energy_min_eV is not None and (
+        not np.isfinite(energy_min_eV) or energy_min_eV <= 0
+    ):
+        raise ValueError("Output minimum energy must be positive and finite.")
+    if energy_max_eV is not None and (
+        not np.isfinite(energy_max_eV) or energy_max_eV <= 0
+    ):
+        raise ValueError("Output maximum energy must be positive and finite.")
+    if (
+        energy_min_eV is not None
+        and energy_max_eV is not None
+        and energy_max_eV <= energy_min_eV
+    ):
+        raise ValueError("Output maximum energy must be greater than minimum.")
+
+    comments = []
+    with source.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.startswith("#"):
+                break
+            comments.append(line)
+
+    profile = pd.read_csv(source, comment="#")
+    energy_columns = [
+        column
+        for column in profile.columns
+        if "energy" in column.lower() and "ev" in column.lower()
+    ]
+    excluded_energy_ranges_eV = tuple(
+        (float(item[0]), float(item[1])) for item in excluded_energy_ranges_eV
+    )
+    for index, (excluded_min, excluded_max) in enumerate(
+        excluded_energy_ranges_eV,
+        start=1,
+    ):
+        if not np.isfinite(excluded_min) or excluded_min <= 0:
+            raise ValueError(
+                f"Excluded range {index} minimum must be positive and finite."
+            )
+        if not np.isfinite(excluded_max) or excluded_max <= excluded_min:
+            raise ValueError(
+                f"Excluded range {index} maximum must be finite and greater than its minimum."
+            )
+    energy_selection_requested = (
+        energy_min_eV is not None
+        or energy_max_eV is not None
+        or bool(excluded_energy_ranges_eV)
+    )
+    if energy_selection_requested and not energy_columns:
+        raise ValueError(f"No energy-in-eV column found in {source}.")
+    if energy_selection_requested:
+        energy = pd.to_numeric(profile[energy_columns[0]], errors="raise")
+        selected = np.isfinite(energy)
+        if energy_min_eV is not None:
+            selected &= energy >= float(energy_min_eV)
+        if energy_max_eV is not None:
+            selected &= energy <= float(energy_max_eV)
+        for excluded_min, excluded_max in excluded_energy_ranges_eV:
+            selected &= ~energy.between(excluded_min, excluded_max, inclusive="both")
+        profile = profile.loc[selected].copy()
+        if profile.empty:
+            raise ValueError(
+                f"The selected output energy range contains no rows in {source}."
+            )
+    scaled_columns = [
+        column
+        for column in profile.columns
+        if "spectrum normalization" in column.lower()
+    ]
+    if not scaled_columns:
+        raise ValueError(f"No spectrum-normalization columns found in {source}.")
+
+    for column in scaled_columns:
+        column_scale = abs(scale) if "uncertainty" in column.lower() else scale
+        profile[column] = pd.to_numeric(profile[column], errors="raise") * column_scale
+
+    output = source.with_name(output_name)
+    with output.open("w", encoding="utf-8") as stream:
+        stream.writelines(comments)
+        stream.write(f"# frame multiplier: {scale:.17g}\n")
+        stream.write(f"# scaled from: {source.name}\n")
+        stream.write(
+            "# output energy range (eV): "
+            f"{energy_min_eV if energy_min_eV is not None else 'native minimum'}, "
+            f"{energy_max_eV if energy_max_eV is not None else 'native maximum'}\n"
+        )
+        stream.write(
+            "# excluded output energy ranges (eV, inclusive): "
+            + (
+                "; ".join(
+                    f"{energy_min:.17g}, {energy_max:.17g}"
+                    for energy_min, energy_max in excluded_energy_ranges_eV
+                )
+                if excluded_energy_ranges_eV
+                else "none"
+            )
+            + "\n"
+        )
+        stream.write(
+            "# scaling: spectrum-normalization columns were multiplied by the frame "
+            "multiplier; their uncertainty columns used its absolute value; ROI count "
+            "columns were not changed\n"
+        )
+        profile.to_csv(stream, index=False)
+    return output
+
+
+def export_selected_spectrum_profile(
+    profile_path: str | os.PathLike[str],
+    energy_min_eV: float | None = None,
+    energy_max_eV: float | None = None,
+    output_name: str = SELECTED_SPECTRUM_PROFILE_NAME,
+    excluded_energy_ranges_eV: tuple[tuple[float, float], ...] = (),
+) -> Path:
+    """Write an energy-selected companion without changing the full profile."""
+    source = Path(profile_path)
+    excluded_energy_ranges_eV = tuple(
+        (float(item[0]), float(item[1])) for item in excluded_energy_ranges_eV
+    )
+    if energy_min_eV is None and energy_max_eV is None and not excluded_energy_ranges_eV:
+        raise ValueError("At least one output energy limit or exclusion range is required.")
+    if energy_min_eV is not None and (
+        not np.isfinite(energy_min_eV) or energy_min_eV <= 0
+    ):
+        raise ValueError("Output minimum energy must be positive and finite.")
+    if energy_max_eV is not None and (
+        not np.isfinite(energy_max_eV) or energy_max_eV <= 0
+    ):
+        raise ValueError("Output maximum energy must be positive and finite.")
+    if (
+        energy_min_eV is not None
+        and energy_max_eV is not None
+        and energy_max_eV <= energy_min_eV
+    ):
+        raise ValueError("Output maximum energy must be greater than minimum.")
+    for index, (excluded_min, excluded_max) in enumerate(
+        excluded_energy_ranges_eV,
+        start=1,
+    ):
+        if not np.isfinite(excluded_min) or excluded_min <= 0:
+            raise ValueError(
+                f"Excluded range {index} minimum must be positive and finite."
+            )
+        if not np.isfinite(excluded_max) or excluded_max <= excluded_min:
+            raise ValueError(
+                f"Excluded range {index} maximum must be finite and greater than its minimum."
+            )
+
+    comments = []
+    with source.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.startswith("#"):
+                break
+            comments.append(line)
+
+    profile = pd.read_csv(source, comment="#")
+    energy_columns = [
+        column
+        for column in profile.columns
+        if "energy" in column.lower() and "ev" in column.lower()
+    ]
+    if not energy_columns:
+        raise ValueError(f"No energy-in-eV column found in {source}.")
+    energy = pd.to_numeric(profile[energy_columns[0]], errors="raise")
+    selected = np.isfinite(energy)
+    if energy_min_eV is not None:
+        selected &= energy >= float(energy_min_eV)
+    if energy_max_eV is not None:
+        selected &= energy <= float(energy_max_eV)
+    for excluded_min, excluded_max in excluded_energy_ranges_eV:
+        selected &= ~energy.between(excluded_min, excluded_max, inclusive="both")
+    selected_profile = profile.loc[selected].copy()
+    if selected_profile.empty:
+        raise ValueError(
+            f"The selected output energy range contains no rows in {source}."
+        )
+
+    output = source.with_name(output_name)
+    with output.open("w", encoding="utf-8") as stream:
+        stream.writelines(comments)
+        stream.write(
+            "# frame output energy range (eV): "
+            f"{energy_min_eV if energy_min_eV is not None else 'native minimum'}, "
+            f"{energy_max_eV if energy_max_eV is not None else 'native maximum'}\n"
+        )
+        stream.write(
+            "# excluded output energy ranges (eV, inclusive): "
+            + (
+                "; ".join(
+                    f"{energy_min:.17g}, {energy_max:.17g}"
+                    for energy_min, energy_max in excluded_energy_ranges_eV
+                )
+                if excluded_energy_ranges_eV
+                else "none"
+            )
+            + "\n"
+        )
+        stream.write(f"# selected from: {source.name}\n")
+        selected_profile.to_csv(stream, index=False)
+    return output
 
 
 @dataclass(frozen=True)
@@ -661,6 +1246,12 @@ class MultiFramePreviewEngine:
 
         if spec.data_path:
             data_path = Path(spec.data_path).expanduser()
+            if nexus_path is None:
+                nexus_path = _infer_nexus_path_from_data_path(
+                    data_path,
+                    self.recipe.instrument,
+                    run_number,
+                )
         elif detector_type == DetectorType.tpx1_legacy:
             base = (
                 Path(autoreduce_dir[self.recipe.instrument][detector_type][0])
@@ -1100,6 +1691,90 @@ class MultiFramePreviewEngine:
                 native_spectrum_inputs=native_inputs,
             )
 
+    def _export_scaled_frame_profiles(
+        self,
+        frame: FrameConfig,
+        frame_output: Path,
+    ) -> list[Path]:
+        if not self.recipe.export_scaled_spectra:
+            return []
+
+        multiplier = float(self.recipe.frame_multipliers.get(frame.name, 1.0))
+        if not np.isfinite(multiplier) or multiplier <= 0:
+            raise ValueError(
+                f"{frame.name}: frame multiplier must be positive and finite."
+            )
+
+        outputs = []
+        for profile_path in frame_output.rglob("spectrum_normalization_profile.txt"):
+            outputs.append(
+                export_scaled_spectrum_profile(
+                    profile_path,
+                    multiplier,
+                )
+            )
+            if (
+                frame.output_energy_min_eV is not None
+                or frame.output_energy_max_eV is not None
+                or frame.output_excluded_energy_ranges_eV
+            ):
+                outputs.append(
+                    export_scaled_spectrum_profile(
+                        profile_path,
+                        multiplier,
+                        output_name=SCALED_SELECTED_SPECTRUM_PROFILE_NAME,
+                        energy_min_eV=frame.output_energy_min_eV,
+                        energy_max_eV=frame.output_energy_max_eV,
+                        excluded_energy_ranges_eV=frame.output_excluded_energy_ranges_eV,
+                    )
+                )
+        if not outputs:
+            raise FileNotFoundError(
+                f"{frame.name}: normalization completed without a spectrum profile to scale."
+            )
+        logging.info(
+            "Exported %d scaled spectrum profile(s) for %s with multiplier %.8g.",
+            len(outputs),
+            frame.name,
+            multiplier,
+        )
+        return outputs
+
+    def _export_selected_frame_profiles(
+        self,
+        frame: FrameConfig,
+        frame_output: Path,
+    ) -> list[Path]:
+        if (
+            frame.output_energy_min_eV is None
+            and frame.output_energy_max_eV is None
+            and not frame.output_excluded_energy_ranges_eV
+        ):
+            return []
+
+        outputs = []
+        for profile_path in frame_output.rglob("spectrum_normalization_profile.txt"):
+            outputs.append(
+                export_selected_spectrum_profile(
+                    profile_path,
+                    energy_min_eV=frame.output_energy_min_eV,
+                    energy_max_eV=frame.output_energy_max_eV,
+                    excluded_energy_ranges_eV=frame.output_excluded_energy_ranges_eV,
+                )
+            )
+        if not outputs:
+            raise FileNotFoundError(
+                f"{frame.name}: normalization completed without a spectrum profile to select."
+            )
+        logging.info(
+            "Exported %d selected-energy spectrum profile(s) for %s: %s to %s eV.",
+            len(outputs),
+            frame.name,
+            frame.output_energy_min_eV or "native minimum",
+            frame.output_energy_max_eV or "native maximum",
+        )
+        return outputs
+
     def run_full_normalization(self, campaign_label: str | None = None, preview: bool = True) -> Path:
         output_root = Path(self.recipe.output_root or (self.working_dir / "shared")).expanduser()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1186,6 +1861,8 @@ class MultiFramePreviewEngine:
                         frame.name,
                     )
                     self._run_spectrum_only_normalization(frame, frame_output)
+                    self._export_selected_frame_profiles(frame, frame_output)
+                    self._export_scaled_frame_profiles(frame, frame_output)
                     continue
                 logging.info(
                     "Stage 3 spectrum-only production unavailable for %s; using the "
@@ -1224,6 +1901,8 @@ class MultiFramePreviewEngine:
                 measured_background_correction_configs=measured_background_configs,
                 **frame.rebin.engine_kwargs(),
             )
+            self._export_selected_frame_profiles(frame, frame_output)
+            self._export_scaled_frame_profiles(frame, frame_output)
         return campaign_dir
 
     def _manual_axis_for_frame(self, frame: FrameConfig, runs: list[ResolvedRun]) -> np.ndarray | None:

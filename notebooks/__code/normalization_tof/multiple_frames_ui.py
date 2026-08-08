@@ -20,11 +20,13 @@ from __code.normalization_tof import (
     RebinMode,
 )
 from __code.normalization_tof.multiple_frames import (
+    AutoRoiConfig,
     BlackFilterBackgroundConfig,
     FrameConfig,
     MeasuredBackgroundConfig,
     MultiFramePreviewEngine,
     MultiFrameRecipe,
+    OverlapWindowConfig,
     RebinnedFramePreview,
     RebinConfig,
     RoiConfig,
@@ -34,6 +36,7 @@ from __code.normalization_tof.multiple_frames import (
     load_integrated_image_preview,
     overlap_ratio_arrays,
     parse_run_numbers,
+    propose_roi_from_nexus,
 )
 from __code.normalization_tof.utilities import (
     build_rebin_bin_groups,
@@ -50,6 +53,33 @@ _REBIN_MODES = [
     RebinMode.inverse_log_lambda,
     RebinMode.custom_schedule,
 ]
+
+PROMPT_FLASH_ENERGIES_EV = (0.001307, 0.0029404, 0.0117628)
+
+
+def _add_prompt_flash_lines(
+    figure: go.Figure,
+    enabled: bool,
+    energy_min_eV: float | None = None,
+    energy_max_eV: float | None = None,
+) -> None:
+    """Add the fixed VENUS prompt-flash markers without changing plot coverage."""
+    if not enabled:
+        return
+    for energy_eV in PROMPT_FLASH_ENERGIES_EV:
+        if energy_min_eV is not None and energy_eV < energy_min_eV:
+            continue
+        if energy_max_eV is not None and energy_eV > energy_max_eV:
+            continue
+        figure.add_vline(
+            x=energy_eV,
+            line_color="#b2182b",
+            line_dash="dash",
+            line_width=1.4,
+            annotation_text=f"prompt flash {energy_eV:.7g} eV",
+            annotation_position="top left",
+            annotation_font=dict(color="#8b0a1a", size=10),
+        )
 
 
 _EARLIER_FRAME_TOF_SCHEDULES_US: dict[str, tuple[tuple[float | None, float], ...]] = {
@@ -203,9 +233,11 @@ class FrameEditor:
         working_dir: str,
         on_change=None,
         on_delete=None,
+        show_prompt_flash_lines=None,
     ):
         self.on_change = on_change
         self.working_dir = working_dir
+        self.show_prompt_flash_lines = show_prompt_flash_lines
         self.enabled = widgets.Checkbox(value=config.enabled, description="Use frame", indent=False)
         self.name = widgets.Text(value=config.name, description="Name", layout=_layout("360px"))
         self.delete_button = widgets.Button(
@@ -238,6 +270,50 @@ class FrameEditor:
         )
         self.roi_height = widgets.BoundedIntText(
             value=config.roi.height, min=1, max=10000, description="height", layout=_layout()
+        )
+        self._auto_roi_applied_sources = (
+            {"sample", "ob"} if config.auto_roi.applied else set()
+        )
+        self.auto_roi_enabled = widgets.Checkbox(
+            value=config.auto_roi.enabled,
+            description="Auto ROI from NeXus slit gaps",
+            indent=False,
+            layout=_layout("280px"),
+        )
+        self.auto_roi_projection_scale = widgets.BoundedFloatText(
+            value=config.auto_roi.projection_scale,
+            min=0.01,
+            max=100.0,
+            step=0.01,
+            description="Projection scale",
+            layout=_layout("230px"),
+        )
+        self.auto_roi_edge_inset_mm = widgets.BoundedFloatText(
+            value=config.auto_roi.edge_inset_mm,
+            min=0.0,
+            max=100.0,
+            step=0.05,
+            description="Edge inset (mm)",
+            layout=_layout("230px"),
+        )
+        self.auto_roi_refine_center = widgets.Checkbox(
+            value=config.auto_roi.refine_center_from_image,
+            description="Refine center from image",
+            indent=False,
+            layout=_layout("240px"),
+        )
+        self.auto_roi_max_center_shift = widgets.BoundedFloatText(
+            value=config.auto_roi.max_center_shift_pixels,
+            min=0.0,
+            max=512.0,
+            step=1.0,
+            description="Max center shift (px)",
+            layout=_layout("260px"),
+        )
+        self.auto_roi_help = widgets.HTML(
+            "<span style='font-size:12px'>Uses the 512 x 512 detector at 0.055 mm/pixel. "
+            "The projected slit opening is inset on every edge; opening an ROI preview "
+            "applies the proposal before showing the editable rectangle.</span>"
         )
         ob_roi = config.effective_ob_roi()
         self.ob_roi_linked = widgets.Checkbox(
@@ -325,6 +401,27 @@ class FrameEditor:
             description="Manual TOF bin (ns)",
             layout=_layout("280px"),
         )
+        self.output_energy_min = widgets.FloatText(
+            value=0.0 if config.output_energy_min_eV is None else config.output_energy_min_eV,
+            description="min energy (eV)",
+            layout=_layout("250px"),
+        )
+        self.output_energy_max = widgets.FloatText(
+            value=0.0 if config.output_energy_max_eV is None else config.output_energy_max_eV,
+            description="max energy (eV)",
+            layout=_layout("250px"),
+        )
+        self.output_exclusion_rows: list[dict[str, widgets.Widget]] = []
+        self.output_exclusion_box = widgets.VBox()
+        self.add_output_exclusion_button = widgets.Button(
+            description="Add excluded range",
+            icon="plus",
+            tooltip="Exclude another inclusive energy interval from this frame's selected output",
+            layout=_layout("210px"),
+        )
+        self.add_output_exclusion_button.on_click(self._add_output_exclusion_range)
+        for excluded_range in config.output_excluded_energy_ranges_eV:
+            self._add_output_exclusion_range(values=excluded_range)
         self.use_proton_charge = widgets.Checkbox(
             value=config.use_proton_charge,
             description="Normalize by proton charge",
@@ -554,6 +651,19 @@ class FrameEditor:
         self.cd_background_enabled.observe(self._update_background_state, names="value")
         self.closed_background_enabled.observe(self._update_background_state, names="value")
         self.ob_roi_linked.observe(self._update_ob_roi_state, names="value")
+        self.auto_roi_enabled.observe(self._update_auto_roi_state, names="value")
+        for auto_roi_widget in (
+            self.auto_roi_projection_scale,
+            self.auto_roi_edge_inset_mm,
+            self.auto_roi_refine_center,
+            self.auto_roi_max_center_shift,
+            self.roi_preview_images,
+            self.detector,
+            self.ob_roi_linked,
+            *self.sample_input.value_widgets,
+            *self.ob_input.value_widgets,
+        ):
+            auto_roi_widget.observe(self._invalidate_auto_roi, names="value")
         for sample_roi_widget in (
             self.roi_left,
             self.roi_top,
@@ -567,6 +677,7 @@ class FrameEditor:
         self._update_median_state()
         self._update_background_state()
         self._update_ob_roi_state()
+        self._update_auto_roi_state()
 
         all_widgets = self._all_widgets()
         _show_full_descriptions(all_widgets)
@@ -577,6 +688,21 @@ class FrameEditor:
         self.roi_row = widgets.HBox(
             [self.roi_left, self.roi_top, self.roi_width, self.roi_height],
             layout=_wrapping_row_layout(),
+        )
+        self.auto_roi_controls = widgets.VBox(
+            [
+                widgets.HBox(
+                    [
+                        self.auto_roi_enabled,
+                        self.auto_roi_projection_scale,
+                        self.auto_roi_edge_inset_mm,
+                        self.auto_roi_refine_center,
+                        self.auto_roi_max_center_shift,
+                    ],
+                    layout=_wrapping_row_layout(),
+                ),
+                self.auto_roi_help,
+            ]
         )
         self.roi_preview_row = widgets.HBox(
             [self.roi_preview_images, self.roi_preview_button],
@@ -698,6 +824,7 @@ class FrameEditor:
                 self.detector,
                 self.sample_input.widget,
                 self.ob_input.widget,
+                self.auto_roi_controls,
                 widgets.HTML("<b>Sample ROI</b>"),
                 self.roi_row,
                 self.roi_preview_row,
@@ -745,6 +872,11 @@ class FrameEditor:
             self.roi_top,
             self.roi_width,
             self.roi_height,
+            self.auto_roi_enabled,
+            self.auto_roi_projection_scale,
+            self.auto_roi_edge_inset_mm,
+            self.auto_roi_refine_center,
+            self.auto_roi_max_center_shift,
             self.ob_roi_linked,
             self.ob_roi_left,
             self.ob_roi_top,
@@ -795,6 +927,78 @@ class FrameEditor:
             self.full_bins_only,
             self.snap_to_native,
         ]
+
+    def _add_output_exclusion_range(
+        self,
+        _button=None,
+        values: tuple[float, float] | None = None,
+    ) -> None:
+        minimum = widgets.FloatText(
+            value=0.0 if values is None else float(values[0]),
+            description="min (eV)",
+            layout=_layout("220px"),
+        )
+        maximum = widgets.FloatText(
+            value=0.0 if values is None else float(values[1]),
+            description="max (eV)",
+            layout=_layout("220px"),
+        )
+        remove = widgets.Button(
+            icon="trash",
+            tooltip="Remove this excluded range",
+            layout=_layout("42px"),
+        )
+        controls: dict[str, widgets.Widget] = {
+            "minimum": minimum,
+            "maximum": maximum,
+            "remove": remove,
+        }
+        remove.on_click(lambda _clicked, row=controls: self._remove_output_exclusion_range(row))
+        self.output_exclusion_rows.append(controls)
+        self._refresh_output_exclusion_rows()
+
+    def _remove_output_exclusion_range(self, controls: dict[str, widgets.Widget]) -> None:
+        if controls in self.output_exclusion_rows:
+            self.output_exclusion_rows.remove(controls)
+        self._refresh_output_exclusion_rows()
+
+    def _refresh_output_exclusion_rows(self) -> None:
+        rows = []
+        for index, controls in enumerate(self.output_exclusion_rows, start=1):
+            rows.append(
+                widgets.HBox(
+                    [
+                        widgets.HTML(
+                            f"exclude {index}",
+                            layout=_layout("180px"),
+                        ),
+                        controls["minimum"],
+                        controls["maximum"],
+                        controls["remove"],
+                    ],
+                    layout=_wrapping_row_layout(),
+                )
+            )
+        self.output_exclusion_box.children = tuple(rows)
+
+    def output_excluded_energy_ranges(self) -> tuple[tuple[float, float], ...]:
+        ranges = []
+        frame_name = self.name.value.strip() or "frame"
+        for index, controls in enumerate(self.output_exclusion_rows, start=1):
+            minimum = float(controls["minimum"].value)
+            maximum = float(controls["maximum"].value)
+            if minimum == 0.0 and maximum == 0.0:
+                continue
+            if minimum <= 0 or maximum <= 0:
+                raise ValueError(
+                    f"{frame_name}: excluded range {index} needs both positive endpoints."
+                )
+            if maximum <= minimum:
+                raise ValueError(
+                    f"{frame_name}: excluded range {index} maximum must be greater than minimum."
+                )
+            ranges.append((minimum, maximum))
+        return tuple(ranges)
 
     def _update_delay_state(self, _change=None) -> None:
         self.detector_delay.disabled = self.auto_detector_delay.value
@@ -847,9 +1051,12 @@ class FrameEditor:
         self.ob_roi_height.value = self.roi_height.value
 
     def _update_ob_roi_state(self, _change=None) -> None:
+        if self.auto_roi_enabled.value and self.ob_roi_linked.value:
+            self.ob_roi_linked.value = False
         linked = self.ob_roi_linked.value
         if linked:
             self._sync_ob_roi_from_sample()
+        self.ob_roi_linked.disabled = self.auto_roi_enabled.value
         for widget in (
             self.ob_roi_left,
             self.ob_roi_top,
@@ -857,6 +1064,110 @@ class FrameEditor:
             self.ob_roi_height,
         ):
             widget.disabled = linked
+
+    def _invalidate_auto_roi(self, _change=None) -> None:
+        self._auto_roi_applied_sources.clear()
+
+    def _update_auto_roi_state(self, _change=None) -> None:
+        enabled = self.auto_roi_enabled.value
+        if enabled:
+            self.ob_roi_linked.value = False
+        self.ob_roi_linked.disabled = enabled
+        for widget in (
+            self.auto_roi_projection_scale,
+            self.auto_roi_edge_inset_mm,
+            self.auto_roi_refine_center,
+            self.auto_roi_max_center_shift,
+        ):
+            widget.disabled = not enabled
+        if not enabled:
+            self._auto_roi_applied_sources.clear()
+
+    def _auto_roi_config(self) -> AutoRoiConfig:
+        required_sources = {"sample"}
+        if not self.ob_roi_linked.value:
+            required_sources.add("ob")
+        return AutoRoiConfig(
+            enabled=self.auto_roi_enabled.value,
+            pixel_size_mm=0.055,
+            projection_scale=self.auto_roi_projection_scale.value,
+            edge_inset_mm=self.auto_roi_edge_inset_mm.value,
+            refine_center_from_image=self.auto_roi_refine_center.value,
+            max_center_shift_pixels=self.auto_roi_max_center_shift.value,
+            applied=required_sources.issubset(self._auto_roi_applied_sources),
+        )
+
+    def _apply_auto_roi(self, source: str) -> tuple[Any, Any, np.ndarray, int, int]:
+        is_sample = source == "sample"
+        run_input = self.sample_input if is_sample else self.ob_input
+        source_label = "sample" if is_sample else "OB"
+        run_specs = run_input.specs()
+        if not run_specs:
+            raise ValueError(f"Enter or select at least one {source_label} run first.")
+        resolver = MultiFramePreviewEngine(
+            MultiFrameRecipe(working_dir=self.working_dir, frames=[])
+        )
+        run = resolver.resolve_run(run_specs[0], self.detector.value)
+        if run.nexus_path is None:
+            raise ValueError(
+                f"Run {run.run_number} has no resolved NeXus file. Disable automatic ROI "
+                "for this frame or provide the matching NeXus path."
+            )
+        integrated, selected_count, total_count = load_integrated_image_preview(
+            run.data_path,
+            max_images=self.roi_preview_images.value,
+        )
+        proposal = propose_roi_from_nexus(
+            integrated,
+            run.nexus_path,
+            config=self._auto_roi_config(),
+        )
+        if is_sample or self.ob_roi_linked.value:
+            roi_widgets = (self.roi_left, self.roi_top, self.roi_width, self.roi_height)
+            self._auto_roi_applied_sources.add("sample")
+            if self.ob_roi_linked.value:
+                self._auto_roi_applied_sources.add("ob")
+        else:
+            roi_widgets = (
+                self.ob_roi_left,
+                self.ob_roi_top,
+                self.ob_roi_width,
+                self.ob_roi_height,
+            )
+            self._auto_roi_applied_sources.add("ob")
+        for widget, value in zip(
+            roi_widgets,
+            (
+                proposal.roi.left,
+                proposal.roi.top,
+                proposal.roi.width,
+                proposal.roi.height,
+            ),
+        ):
+            widget.value = value
+        return run, proposal, integrated, selected_count, total_count
+
+    def ensure_auto_roi(self) -> list[str]:
+        """Resolve any enabled automatic ROI proposals not already accepted in this editor."""
+        if not self.auto_roi_enabled.value:
+            return []
+        sources = ["sample"]
+        if not self.ob_roi_linked.value:
+            sources.append("ob")
+        notes = []
+        for source in sources:
+            if source in self._auto_roi_applied_sources:
+                continue
+            run, proposal, _integrated, selected_count, total_count = self._apply_auto_roi(source)
+            notes.append(
+                f"{self.name.value or 'frame'} {source}: ROI "
+                f"({proposal.roi.left}, {proposal.roi.top}, {proposal.roi.width}, "
+                f"{proposal.roi.height}) from {proposal.slit_gaps.horizontal_mm:.4g} x "
+                f"{proposal.slit_gaps.vertical_mm:.4g} mm slits in run {run.run_number}; "
+                f"center ({proposal.center_x_pixels:.1f}, {proposal.center_y_pixels:.1f}); "
+                f"integrated {selected_count}/{total_count} TIFFs."
+            )
+        return notes
 
     def _update_rebin_parameters(self, _change=None) -> None:
         controls: list[widgets.Widget]
@@ -947,6 +1258,7 @@ class FrameEditor:
             clear_output(wait=True)
             display(HTML("Loading the sample and OB ROI profiles for this frame..."))
         try:
+            auto_roi_notes = self.ensure_auto_roi()
             frame = self.to_config()
             if frame.rebin.mode == RebinMode.none:
                 raise ValueError("Select a rebin mode before previewing bins.")
@@ -998,6 +1310,7 @@ class FrameEditor:
             )
             self.rebin_bin_summary.value = (
                 "<span style='font-size:12px; color:#176b36'>"
+                + (f"{' '.join(_escape(note) for note in auto_roi_notes)} " if auto_roi_notes else "")
                 + (f"{_escape(conversion_note)} " if conversion_note else "")
                 + f"Native bins: {len(native.tof_s)}; active output bins: {len(preview.tof_s)}; "
                 f"{frame_count_summary}. {width_summary}.</span>"
@@ -1091,6 +1404,24 @@ class FrameEditor:
             )
             transmission_figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)")
             transmission_figure.update_yaxes(title_text="Transmission")
+            finite_plot_energy = np.concatenate(
+                [
+                    np.asarray(native.energy_eV, dtype=np.float64),
+                    np.asarray(preview.energy_eV, dtype=np.float64),
+                ]
+            )
+            finite_plot_energy = finite_plot_energy[
+                np.isfinite(finite_plot_energy) & (finite_plot_energy > 0)
+            ]
+            _add_prompt_flash_lines(
+                transmission_figure,
+                bool(
+                    self.show_prompt_flash_lines is not None
+                    and self.show_prompt_flash_lines.value
+                ),
+                energy_min_eV=(float(np.min(finite_plot_energy)) if finite_plot_energy.size else None),
+                energy_max_eV=(float(np.max(finite_plot_energy)) if finite_plot_energy.size else None),
+            )
 
             flux_figure = go.Figure()
             flux_ylabel = (
@@ -1213,17 +1544,32 @@ class FrameEditor:
             clear_output(wait=True)
             display(HTML(f"Resolving the first {source_label} run and integrating the ROI preview..."))
         try:
-            run_specs = run_input.specs()
-            if not run_specs:
-                raise ValueError(f"Enter or select at least one {source_label} run first.")
-            resolver = MultiFramePreviewEngine(
-                MultiFrameRecipe(working_dir=self.working_dir, frames=[])
-            )
-            run = resolver.resolve_run(run_specs[0], self.detector.value)
-            integrated, selected_count, total_count = load_integrated_image_preview(
-                run.data_path,
-                max_images=self.roi_preview_images.value,
-            )
+            auto_roi_note = ""
+            if self.auto_roi_enabled.value:
+                run, proposal, integrated, selected_count, total_count = self._apply_auto_roi(
+                    source
+                )
+                auto_roi_note = (
+                    "<br><span style='color:#176b36'><b>Automatic ROI proposal applied:</b> "
+                    f"slits {proposal.slit_gaps.horizontal_mm:.4g} x "
+                    f"{proposal.slit_gaps.vertical_mm:.4g} mm; detector ROI "
+                    f"({proposal.roi.left}, {proposal.roi.top}, {proposal.roi.width}, "
+                    f"{proposal.roi.height}); center "
+                    f"({proposal.center_x_pixels:.1f}, {proposal.center_y_pixels:.1f}) px. "
+                    "Adjust the rectangle below if needed.</span>"
+                )
+            else:
+                run_specs = run_input.specs()
+                if not run_specs:
+                    raise ValueError(f"Enter or select at least one {source_label} run first.")
+                resolver = MultiFramePreviewEngine(
+                    MultiFrameRecipe(working_dir=self.working_dir, frames=[])
+                )
+                run = resolver.resolve_run(run_specs[0], self.detector.value)
+                integrated, selected_count, total_count = load_integrated_image_preview(
+                    run.data_path,
+                    max_images=self.roi_preview_images.value,
+                )
             if integrated is None or integrated.ndim != 2:
                 raise ValueError(f"The integrated {source_label} preview is not a two-dimensional image.")
             if not np.any(np.isfinite(integrated)):
@@ -1337,6 +1683,7 @@ class FrameEditor:
                             if not is_sample and self.ob_roi_linked.value
                             else ""
                         )
+                        + auto_roi_note
                     )
                 )
                 display(
@@ -1396,6 +1743,21 @@ class FrameEditor:
             full_bins_only=self.full_bins_only.value,
             snap_to_native_grid=self.snap_to_native.value,
         )
+        output_energy_min_eV = (
+            self.output_energy_min.value if self.output_energy_min.value > 0 else None
+        )
+        output_energy_max_eV = (
+            self.output_energy_max.value if self.output_energy_max.value > 0 else None
+        )
+        if (
+            output_energy_min_eV is not None
+            and output_energy_max_eV is not None
+            and output_energy_max_eV <= output_energy_min_eV
+        ):
+            raise ValueError(
+                f"{self.name.value or 'frame'}: output maximum energy must be greater "
+                "than minimum."
+            )
         return FrameConfig(
             name=self.name.value.strip(),
             detector_type=self.detector.value,
@@ -1408,6 +1770,7 @@ class FrameEditor:
                 width=self.roi_width.value,
                 height=self.roi_height.value,
             ),
+            auto_roi=self._auto_roi_config(),
             ob_roi=(
                 None
                 if self.ob_roi_linked.value
@@ -1437,6 +1800,9 @@ class FrameEditor:
             distance_source_detector_m=self.distance.value,
             detector_delay_us=None if self.auto_detector_delay.value else self.detector_delay.value,
             manual_tof_bin_size_ns=self.manual_tof.value if self.manual_tof.value > 0 else None,
+            output_energy_min_eV=output_energy_min_eV,
+            output_energy_max_eV=output_energy_max_eV,
+            output_excluded_energy_ranges_eV=self.output_excluded_energy_ranges(),
             use_proton_charge=self.use_proton_charge.value,
             use_experimental_uncertainties=self.experimental_uncertainties.value,
             spectrum_only=self.spectrum_only.value,
@@ -1500,11 +1866,34 @@ class MultiFrameNormalizationTof:
             description="Recipe JSON",
             layout=_layout("760px"),
         )
-        self.show_native = widgets.Checkbox(value=True, description="Show native profiles", indent=False)
+        self.output_root_browse = widgets.Button(
+            description="Browse...",
+            icon="folder-open",
+            tooltip="Select or create the full-normalization output directory",
+            layout=_layout("120px"),
+        )
+        self.cache_dir_browse = widgets.Button(
+            description="Browse...",
+            icon="folder-open",
+            tooltip="Select or create the preview-cache directory",
+            layout=_layout("120px"),
+        )
+        self.recipe_file_browse = widgets.Button(
+            description="Browse...",
+            icon="folder-open",
+            tooltip="Select an existing multi-frame recipe JSON file",
+            layout=_layout("120px"),
+        )
+        self.path_browser_output = widgets.Output()
+        self.show_native = widgets.Checkbox(value=False, description="Show native profiles", indent=False)
         self.show_errors = widgets.Checkbox(value=True, description="Show error bars", indent=False)
+        self.show_prompt_flash_lines = widgets.Checkbox(
+            value=False,
+            description="Show prompt-flash lines",
+            indent=False,
+            layout=_layout("240px"),
+        )
         self.force_reload = widgets.Checkbox(value=False, description="Ignore cached profiles", indent=False)
-        self.overlap_min = widgets.FloatText(value=0.0, description="Manual min (2 frames, eV)")
-        self.overlap_max = widgets.FloatText(value=0.0, description="Manual max (2 frames, eV)")
         self.inspect_frames = widgets.SelectMultiple(
             options=[],
             value=(),
@@ -1512,6 +1901,11 @@ class MultiFrameNormalizationTof:
             rows=5,
             layout=widgets.Layout(width="560px", height="130px"),
         )
+        self.overlap_window_widgets: dict[tuple[str, str], dict[str, Any]] = {}
+        self._overlap_window_state_cache: dict[
+            tuple[str, str], tuple[bool, float, float]
+        ] = {}
+        self.overlap_window_box = widgets.VBox()
         self.frame_scale_widgets: dict[str, widgets.BoundedFloatText] = {}
         self.frame_scale_box = widgets.HBox(layout=_wrapping_row_layout())
         self.reset_frame_scales_button = widgets.Button(
@@ -1519,11 +1913,26 @@ class MultiFrameNormalizationTof:
             icon="undo",
         )
         self.auto_frame_scales_button = widgets.Button(
-            description="Auto-scale from resonance",
+            description="Auto-scale from highest energy",
             icon="magic",
             button_style="info",
+            layout=_layout("280px"),
         )
         self.frame_scale_status = widgets.HTML()
+        self.frame_output_range_box = widgets.VBox()
+        self.preview_output_spectra_button = widgets.Button(
+            description="Preview output spectra",
+            icon="line-chart",
+            button_style="info",
+            layout=_layout("240px"),
+        )
+        self.output_spectra_plot_output = widgets.Output()
+        self.export_scaled_spectra = widgets.Checkbox(
+            value=False,
+            description="Export scaled spectra after normalization",
+            indent=False,
+            layout=_layout("360px"),
+        )
         self.add_frame_button = widgets.Button(description="Add frame", icon="plus")
         self.remove_frame_button = widgets.Button(description="Remove last", icon="minus")
         self.same_rois_all_frames = widgets.Checkbox(
@@ -1555,14 +1964,13 @@ class MultiFrameNormalizationTof:
         self.frame_editors: list[FrameEditor] = []
         self._syncing_frame_rois = False
         self._updating_frame_scales = False
+        self._updating_overlap_windows = False
 
         _show_full_descriptions(
             [
                 self.output_root,
                 self.cache_dir,
                 self.recipe_file,
-                self.overlap_min,
-                self.overlap_max,
                 self.inspect_frames,
             ]
         )
@@ -1579,27 +1987,52 @@ class MultiFrameNormalizationTof:
                     [self.add_frame_button, self.remove_frame_button],
                     layout=_wrapping_row_layout(),
                 ),
-                self.output_root,
-                self.cache_dir,
-                self.recipe_file,
+                widgets.HBox(
+                    [self.output_root, self.output_root_browse],
+                    layout=_wrapping_row_layout(),
+                ),
+                widgets.HBox(
+                    [self.cache_dir, self.cache_dir_browse],
+                    layout=_wrapping_row_layout(),
+                ),
+                widgets.HBox(
+                    [self.recipe_file, self.recipe_file_browse],
+                    layout=_wrapping_row_layout(),
+                ),
+                self.path_browser_output,
                 widgets.HBox([self.save_button, self.load_button]),
             ]
         )
         overlap_controls = widgets.VBox(
             [
+                self.inspect_frames,
+                widgets.HTML("<b>Overlap windows</b>"),
+                widgets.HTML(
+                    "<span style='font-size:12px'>Each row applies to one adjacent frame pair. "
+                    "Leave <b>Auto</b> checked to use their full common energy coverage, or "
+                    "uncheck it and enter the fit limits in eV.</span>"
+                ),
+                self.overlap_window_box,
                 widgets.HBox(
-                    [self.inspect_frames, self.overlap_min, self.overlap_max],
+                    [
+                        self.show_native,
+                        self.show_errors,
+                        self.show_prompt_flash_lines,
+                        self.force_reload,
+                    ],
                     layout=_wrapping_row_layout(),
                 ),
-                widgets.HBox(
-                    [self.show_native, self.show_errors, self.force_reload],
-                    layout=_wrapping_row_layout(),
-                ),
-                widgets.HTML("<b>Frame multipliers (preview plots only)</b>"),
+                widgets.HTML("<b>Frame multipliers</b>"),
                 self.frame_scale_box,
                 widgets.HBox(
                     [self.auto_frame_scales_button, self.reset_frame_scales_button],
                     layout=_wrapping_row_layout(),
+                ),
+                self.export_scaled_spectra,
+                widgets.HTML(
+                    "<span style='font-size:12px'>The original normalized profile is retained. "
+                    "When enabled, each frame also exports the full-range "
+                    "<code>spectrum_normalization_profile_scaled.txt</code>.</span>"
                 ),
                 self.frame_scale_status,
                 widgets.HBox(
@@ -1630,6 +2063,16 @@ class MultiFrameNormalizationTof:
                     overlap_controls,
                     self.status_output,
                     self.plot_output,
+                    widgets.HTML("<h3>Frame output spectra</h3>"),
+                    widgets.HTML(
+                        "<span style='font-size:12px'>Set optional inclusive output "
+                        "limits for each enabled frame. Use 0 for the native minimum or "
+                        "maximum. Full-range normalized and scaled profiles are retained; "
+                        "active limits add <code>..._selected.txt</code> companions.</span>"
+                    ),
+                    self.frame_output_range_box,
+                    self.preview_output_spectra_button,
+                    self.output_spectra_plot_output,
                     widgets.HTML("<h3>Full normalization</h3>"),
                     full_run_controls,
                 ]
@@ -1647,6 +2090,14 @@ class MultiFrameNormalizationTof:
             output_root=self.output_root.value.strip() or None,
             cache_dir=self.cache_dir.value.strip() or None,
             same_rois_all_frames=self.same_rois_all_frames.value,
+            export_scaled_spectra=self.export_scaled_spectra.value,
+            frame_multipliers={
+                frame.name: self._frame_scale(frame.name)
+                for frame in frames
+                if frame.enabled
+            },
+            overlap_windows=self._manual_overlap_window_configs(),
+            show_prompt_flash_lines=self.show_prompt_flash_lines.value,
         )
 
     def _wire_events(self) -> None:
@@ -1656,15 +2107,18 @@ class MultiFrameNormalizationTof:
         self.replot_button.on_click(self._replot)
         self.save_button.on_click(self._save_recipe)
         self.load_button.on_click(self._load_recipe)
+        self.output_root_browse.on_click(self._browse_output_root)
+        self.cache_dir_browse.on_click(self._browse_cache_dir)
+        self.recipe_file_browse.on_click(self._browse_recipe_file)
         self.run_button.on_click(self._run_full_normalization)
+        self.preview_output_spectra_button.on_click(self._preview_output_spectra)
         self.reset_frame_scales_button.on_click(self._reset_frame_scales)
-        self.auto_frame_scales_button.on_click(self._auto_scale_from_resonance)
+        self.auto_frame_scales_button.on_click(self._auto_scale_from_highest_energy)
         self.arm_full_run.observe(self._update_run_button, names="value")
         self.inspect_frames.observe(self._overlap_selection_changed, names="value")
-        self.overlap_min.observe(self._plot_setting_changed, names="value")
-        self.overlap_max.observe(self._plot_setting_changed, names="value")
         self.show_native.observe(self._plot_setting_changed, names="value")
         self.show_errors.observe(self._plot_setting_changed, names="value")
+        self.show_prompt_flash_lines.observe(self._plot_setting_changed, names="value")
         self.same_rois_all_frames.observe(self._same_rois_all_frames_changed, names="value")
         self.enable_spectrum_only_all_button.on_click(
             lambda _button: self._set_all_spectrum_only(True)
@@ -1672,6 +2126,70 @@ class MultiFrameNormalizationTof:
         self.disable_spectrum_only_all_button.on_click(
             lambda _button: self._set_all_spectrum_only(False)
         )
+
+    def _browse_output_root(self, _button) -> None:
+        self._show_path_browser(
+            target=self.output_root,
+            instruction="Select or create the full-normalization output directory",
+            selection_type="directory",
+        )
+
+    def _browse_cache_dir(self, _button) -> None:
+        self._show_path_browser(
+            target=self.cache_dir,
+            instruction="Select or create the preview-cache directory",
+            selection_type="directory",
+        )
+
+    def _browse_recipe_file(self, _button) -> None:
+        self._show_path_browser(
+            target=self.recipe_file,
+            instruction="Select an existing multi-frame recipe JSON file",
+            selection_type="file",
+            filters={"JSON recipes": "*.json"},
+            default_filter="JSON recipes",
+        )
+
+    def _show_path_browser(
+        self,
+        target: widgets.Text,
+        instruction: str,
+        selection_type: str,
+        filters: dict[str, str] | None = None,
+        default_filter: str | None = None,
+    ) -> None:
+        current = Path(target.value.strip()).expanduser() if target.value.strip() else None
+        if current is not None and selection_type == "directory" and current.is_dir():
+            start_dir = current
+        elif current is not None:
+            start_dir = current.parent
+        else:
+            start_dir = Path(self.working_dir) / "shared"
+        if not start_dir.is_dir():
+            shared_dir = Path(self.working_dir) / "shared"
+            start_dir = shared_dir if shared_dir.is_dir() else Path(self.working_dir)
+
+        def selected(path) -> None:
+            paths = path if isinstance(path, (list, tuple)) else [path]
+            if paths:
+                target.value = str(Path(paths[0]))
+            with self.path_browser_output:
+                clear_output(wait=True)
+
+        with self.path_browser_output:
+            clear_output(wait=True)
+            selector = FileSelectorPanel(
+                instruction=instruction,
+                start_dir=str(start_dir),
+                type=selection_type,
+                multiple=False,
+                newdir_toolbar_button=selection_type == "directory",
+                filters=filters or {},
+                default_filter=default_filter,
+                next=selected,
+            )
+            selector.show()
+            self._path_selector = selector
 
     def _set_all_spectrum_only(self, enabled: bool) -> None:
         for editor in self.frame_editors:
@@ -1684,6 +2202,7 @@ class MultiFrameNormalizationTof:
                 self.working_dir,
                 on_change=self._frame_changed,
                 on_delete=self._delete_frame,
+                show_prompt_flash_lines=self.show_prompt_flash_lines,
             )
             for frame in frames
         ]
@@ -1704,7 +2223,175 @@ class MultiFrameNormalizationTof:
         self.inspect_frames.options = names
         self.inspect_frames.value = old_selection or tuple(names)
         self._refresh_frame_scale_controls(names)
-        self._update_manual_overlap_state()
+        self._refresh_overlap_window_controls(names)
+        self._refresh_frame_output_range_controls(names)
+
+    def _refresh_frame_output_range_controls(self, names: list[str]) -> None:
+        editors_by_name = {
+            editor.name.value: editor
+            for editor in self.frame_editors
+            if editor.enabled.value and editor.name.value
+        }
+        rows = []
+        for name in names:
+            editor = editors_by_name[name]
+            editor.output_energy_min.description = "min (eV)"
+            editor.output_energy_max.description = "max (eV)"
+            editor.output_energy_min.layout = _layout("240px")
+            editor.output_energy_max.layout = _layout("240px")
+            rows.append(
+                widgets.VBox(
+                    [
+                        widgets.HBox(
+                            [
+                                widgets.HTML(
+                                    f"<b>{_escape(name)}</b>",
+                                    layout=_layout("180px"),
+                                ),
+                                editor.output_energy_min,
+                                editor.output_energy_max,
+                            ],
+                            layout=_wrapping_row_layout(),
+                        ),
+                        widgets.HBox(
+                            [
+                                widgets.HTML("", layout=_layout("180px")),
+                                editor.add_output_exclusion_button,
+                            ],
+                            layout=_wrapping_row_layout(),
+                        ),
+                        editor.output_exclusion_box,
+                    ]
+                )
+            )
+        self.frame_output_range_box.children = tuple(rows)
+
+    @staticmethod
+    def _overlap_pair_key(frame_a: str, frame_b: str) -> tuple[str, str]:
+        return tuple(sorted((str(frame_a), str(frame_b))))
+
+    def _cache_overlap_window_states(self) -> None:
+        for key, controls in self.overlap_window_widgets.items():
+            self._overlap_window_state_cache[key] = (
+                bool(controls["auto"].value),
+                float(controls["minimum"].value),
+                float(controls["maximum"].value),
+            )
+
+    def _refresh_overlap_window_controls(self, names: list[str]) -> None:
+        self._cache_overlap_window_states()
+        controls_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+        rows = []
+        self._updating_overlap_windows = True
+        try:
+            for frame_a, frame_b in zip(names[:-1], names[1:]):
+                key = self._overlap_pair_key(frame_a, frame_b)
+                automatic, minimum_value, maximum_value = (
+                    self._overlap_window_state_cache.get(key, (True, 0.0, 0.0))
+                )
+                automatic_control = widgets.Checkbox(
+                    value=automatic,
+                    description="Auto",
+                    indent=False,
+                    layout=_layout("90px"),
+                )
+                minimum_control = widgets.FloatText(
+                    value=minimum_value,
+                    description="min (eV)",
+                    disabled=automatic,
+                    layout=_layout("230px"),
+                )
+                maximum_control = widgets.FloatText(
+                    value=maximum_value,
+                    description="max (eV)",
+                    disabled=automatic,
+                    layout=_layout("230px"),
+                )
+                automatic_control.observe(
+                    self._overlap_window_setting_changed,
+                    names="value",
+                )
+                minimum_control.observe(self._overlap_window_setting_changed, names="value")
+                maximum_control.observe(self._overlap_window_setting_changed, names="value")
+                row = widgets.HBox(
+                    [
+                        widgets.HTML(
+                            f"<b>{_escape(frame_a)} / {_escape(frame_b)}</b>",
+                            layout=_layout("300px"),
+                        ),
+                        automatic_control,
+                        minimum_control,
+                        maximum_control,
+                    ],
+                    layout=_wrapping_row_layout(),
+                )
+                controls_by_pair[key] = {
+                    "frame_a": frame_a,
+                    "frame_b": frame_b,
+                    "auto": automatic_control,
+                    "minimum": minimum_control,
+                    "maximum": maximum_control,
+                }
+                rows.append(row)
+        finally:
+            self._updating_overlap_windows = False
+        self.overlap_window_widgets = controls_by_pair
+        self.overlap_window_box.children = tuple(rows)
+
+    def _overlap_window_setting_changed(self, _change=None) -> None:
+        for controls in self.overlap_window_widgets.values():
+            automatic = bool(controls["auto"].value)
+            controls["minimum"].disabled = automatic
+            controls["maximum"].disabled = automatic
+        self._cache_overlap_window_states()
+        if self._updating_overlap_windows:
+            return
+        try:
+            self._manual_overlap_window_configs()
+        except ValueError:
+            return
+        self._plot_setting_changed()
+
+    def _manual_overlap_window_configs(self) -> tuple[OverlapWindowConfig, ...]:
+        windows = []
+        for controls in self.overlap_window_widgets.values():
+            if controls["auto"].value:
+                continue
+            window = OverlapWindowConfig(
+                frame_a=str(controls["frame_a"]),
+                frame_b=str(controls["frame_b"]),
+                energy_min_eV=float(controls["minimum"].value),
+                energy_max_eV=float(controls["maximum"].value),
+            )
+            window.validate()
+            windows.append(window)
+        return tuple(windows)
+
+    def _restore_overlap_windows(
+        self,
+        windows: tuple[OverlapWindowConfig, ...],
+    ) -> None:
+        self._updating_overlap_windows = True
+        try:
+            for window in windows:
+                window.validate()
+                key = self._overlap_pair_key(window.frame_a, window.frame_b)
+                self._overlap_window_state_cache[key] = (
+                    False,
+                    float(window.energy_min_eV),
+                    float(window.energy_max_eV),
+                )
+                controls = self.overlap_window_widgets.get(key)
+                if controls is None:
+                    continue
+                controls["minimum"].value = float(window.energy_min_eV)
+                controls["maximum"].value = float(window.energy_max_eV)
+                controls["auto"].value = False
+                controls["minimum"].disabled = False
+                controls["maximum"].disabled = False
+        finally:
+            self._updating_overlap_windows = False
+        self._cache_overlap_window_states()
 
     def _refresh_frame_scale_controls(self, names: list[str]) -> None:
         if tuple(self.frame_scale_widgets) == tuple(names):
@@ -1715,14 +2402,13 @@ class MultiFrameNormalizationTof:
         }
         controls: dict[str, widgets.BoundedFloatText] = {}
         for name in names:
-            is_resonance = "resonance" in name.strip().lower()
             control = widgets.BoundedFloatText(
-                value=1.0 if is_resonance else old_values.get(name, 1.0),
+                value=old_values.get(name, 1.0),
                 min=1e-6,
                 max=1e6,
                 step=0.001,
                 description=f"{name} x",
-                disabled=is_resonance,
+                disabled=False,
                 layout=_layout("230px"),
             )
             control.style.description_width = "initial"
@@ -1736,36 +2422,61 @@ class MultiFrameNormalizationTof:
         try:
             for control in self.frame_scale_widgets.values():
                 control.value = 1.0
+                control.disabled = False
         finally:
             self._updating_frame_scales = False
         self.frame_scale_status.value = ""
         if self.engine is not None and self.engine.previews:
             self._draw_plot()
 
-    def _auto_scale_from_resonance(self, _button=None) -> None:
+    @staticmethod
+    def _maximum_usable_energy(preview: RebinnedFramePreview) -> float:
+        energy = np.asarray(preview.energy_eV, dtype=np.float64)
+        transmission = np.asarray(preview.transmission, dtype=np.float64)
+        valid = np.isfinite(energy) & (energy > 0) & np.isfinite(transmission)
+        if not np.any(valid):
+            raise ValueError(f"{preview.name}: no finite positive-energy transmission points.")
+        return float(np.max(energy[valid]))
+
+    def _auto_scale_from_highest_energy(self, _button=None) -> None:
         try:
             if self.engine is None or not self.engine.previews:
                 raise ValueError("Load the ROI profiles before auto-scaling frames.")
-            names = [
-                str(name)
-                for name in self.inspect_frames.options
-                if str(name) in self.engine.previews
+            selected_names = [
+                name for name in self._selected_frame_names() if name in self.engine.previews
             ]
-            resonance_names = [name for name in names if "resonance" in name.strip().lower()]
-            if len(resonance_names) != 1:
-                raise ValueError("Auto-scaling requires exactly one frame named resonance.")
-            resonance_name = resonance_names[0]
-            resonance_index = names.index(resonance_name)
-            if resonance_index != len(names) - 1:
-                raise ValueError("The resonance frame must follow the lower-energy frames.")
-
-            fitted_scales = {resonance_name: 1.0}
-            result_lines = [f"{resonance_name} x1 (fixed)"]
-            reference = self._scaled_preview_for_plot(
-                self.engine.previews[resonance_name],
-                1.0,
+            if len(selected_names) < 2:
+                raise ValueError("Select at least two loaded frames for automatic scaling.")
+            input_order = {name: index for index, name in enumerate(selected_names)}
+            maximum_energy = {
+                name: self._maximum_usable_energy(self.engine.previews[name])
+                for name in selected_names
+            }
+            names = sorted(
+                selected_names,
+                key=lambda name: (maximum_energy[name], input_order[name]),
             )
-            for comparison_name in reversed(names[:resonance_index]):
+            anchor_name = names[-1]
+            anchor_control = self.frame_scale_widgets.get(anchor_name)
+            anchor_scale = (
+                1.0 if anchor_control is None else float(anchor_control.value)
+            )
+            if not np.isfinite(anchor_scale) or anchor_scale <= 0:
+                raise ValueError(
+                    f"The highest-energy anchor scale for {anchor_name} must be "
+                    "positive and finite."
+                )
+
+            fitted_scales = {anchor_name: anchor_scale}
+            result_lines = [
+                f"{anchor_name} x{anchor_scale:.7g} (editable highest-energy anchor; "
+                f"Emax={maximum_energy[anchor_name]:.6g} eV)"
+            ]
+            reference = self._scaled_preview_for_plot(
+                self.engine.previews[anchor_name],
+                anchor_scale,
+            )
+            for comparison_name in reversed(names[:-1]):
                 comparison = self.engine.previews[comparison_name]
                 fit_window = self._overlap_window_for_pair(
                     reference.name,
@@ -1792,8 +2503,10 @@ class MultiFrameNormalizationTof:
 
             self._updating_frame_scales = True
             try:
-                for name, scale in fitted_scales.items():
-                    self.frame_scale_widgets[name].value = scale
+                for name, control in self.frame_scale_widgets.items():
+                    control.disabled = False
+                    if name in fitted_scales:
+                        control.value = fitted_scales[name]
             finally:
                 self._updating_frame_scales = False
             self.frame_scale_status.value = (
@@ -1870,9 +2583,24 @@ class MultiFrameNormalizationTof:
                     target.ob_roi_top.value = source.ob_roi_top.value
                     target.ob_roi_width.value = source.ob_roi_width.value
                     target.ob_roi_height.value = source.ob_roi_height.value
+                target._auto_roi_applied_sources = set(source._auto_roi_applied_sources)
                 target._update_ob_roi_state()
         finally:
             self._syncing_frame_rois = False
+
+    def _ensure_auto_rois(self) -> list[str]:
+        enabled_editors = [editor for editor in self.frame_editors if editor.enabled.value]
+        if not enabled_editors:
+            return []
+        if self.same_rois_all_frames.value:
+            source = enabled_editors[0]
+            notes = source.ensure_auto_roi()
+            self._sync_frame_rois(source)
+            return notes
+        notes = []
+        for editor in enabled_editors:
+            notes.extend(editor.ensure_auto_roi())
+        return notes
 
     def _add_frame(self, _button) -> None:
         index = len(self.frame_editors) + 1
@@ -1899,9 +2627,16 @@ class MultiFrameNormalizationTof:
         with self.status_output:
             clear_output(wait=True)
             try:
+                auto_roi_notes = self._ensure_auto_rois()
                 recipe = self.recipe()
                 self.engine = MultiFramePreviewEngine(recipe)
-                display(HTML("Loading ROI profiles..."))
+                display(
+                    HTML(
+                        ("<br>".join(_escape(note) for note in auto_roi_notes) + "<br>"
+                         if auto_roi_notes else "")
+                        + "Loading ROI profiles..."
+                    )
+                )
                 conversion_notes = []
                 for editor, frame in zip(self.frame_editors, recipe.frames):
                     if not frame.enabled:
@@ -2073,18 +2808,17 @@ class MultiFrameNormalizationTof:
                 )
             )
 
-        manual_window = self._energy_window() if len(selected_names) == 2 else None
         for reference_name, comparison_name in overlap_pairs:
             reference = scaled_previews.get(reference_name)
             comparison = scaled_previews.get(comparison_name)
-            pair_window = self._overlap_window_for_pair(
-                reference_name,
-                comparison_name,
-                manual_window,
-            )
             ratio_figure = go.Figure()
             if reference is not None and comparison is not None:
                 try:
+                    pair_window = self._overlap_window_for_pair(
+                        reference_name,
+                        comparison_name,
+                        manual_window=None,
+                    )
                     energy, ratio, uncertainty = overlap_ratio_arrays(
                         reference,
                         comparison,
@@ -2160,6 +2894,12 @@ class MultiFrameNormalizationTof:
             title_text="Incident neutron energy (eV)",
         )
         transmission_figure.update_yaxes(title_text="Transmission")
+        _add_prompt_flash_lines(
+            transmission_figure,
+            self.show_prompt_flash_lines.value,
+            energy_min_eV=0.001,
+            energy_max_eV=30.0,
+        )
         transmission_figure.update_layout(
             title="Selected frame transmission previews with frame multipliers",
             template="plotly_white",
@@ -2174,19 +2914,166 @@ class MultiFrameNormalizationTof:
             for ratio_figure in overlap_figures:
                 ratio_figure.show()
 
-    def _energy_window(self) -> tuple[float, float] | None:
-        if self.overlap_min.value > 0 and self.overlap_max.value > 0:
-            if self.overlap_max.value <= self.overlap_min.value:
-                raise ValueError("Overlap maximum must be greater than minimum.")
-            return self.overlap_min.value, self.overlap_max.value
-        return None
+    def _preview_output_spectra(self, _button=None) -> None:
+        with self.output_spectra_plot_output:
+            clear_output(wait=True)
+            try:
+                if self.engine is None or not self.engine.previews:
+                    raise ValueError("Load the ROI profiles before previewing output spectra.")
 
-    @staticmethod
+                palette = [
+                    "#1f77b4",
+                    "#d62728",
+                    "#2ca02c",
+                    "#9467bd",
+                    "#ff7f0e",
+                    "#17becf",
+                ]
+                figure = go.Figure()
+                trace_count = 0
+                for editor in self.frame_editors:
+                    name = editor.name.value
+                    if not editor.enabled.value or name not in self.engine.previews:
+                        continue
+                    minimum = (
+                        float(editor.output_energy_min.value)
+                        if editor.output_energy_min.value > 0
+                        else None
+                    )
+                    maximum = (
+                        float(editor.output_energy_max.value)
+                        if editor.output_energy_max.value > 0
+                        else None
+                    )
+                    if minimum is not None and maximum is not None and maximum <= minimum:
+                        raise ValueError(
+                            f"{name}: output maximum energy must be greater than minimum."
+                        )
+
+                    preview = self.engine.previews[name]
+                    energy = np.asarray(preview.energy_eV, dtype=np.float64)
+                    transmission = np.asarray(preview.transmission, dtype=np.float64)
+                    uncertainty = np.asarray(preview.uncertainty, dtype=np.float64)
+                    selected = (
+                        np.isfinite(energy)
+                        & (energy > 0)
+                        & np.isfinite(transmission)
+                    )
+                    if minimum is not None:
+                        selected &= energy >= minimum
+                    if maximum is not None:
+                        selected &= energy <= maximum
+                    for excluded_minimum, excluded_maximum in (
+                        editor.output_excluded_energy_ranges()
+                    ):
+                        selected &= ~(
+                            (energy >= excluded_minimum)
+                            & (energy <= excluded_maximum)
+                        )
+                    if not np.any(selected):
+                        raise ValueError(
+                            f"{name}: the selected output energy range contains no preview bins."
+                        )
+
+                    scale = self._frame_scale(name) if self.export_scaled_spectra.value else 1.0
+                    order = np.argsort(energy[selected])
+                    selected_energy = energy[selected][order]
+                    selected_transmission = transmission[selected][order] * scale
+                    selected_uncertainty = uncertainty[selected][order] * abs(scale)
+                    color = palette[trace_count % len(palette)]
+                    figure.add_trace(
+                        go.Scatter(
+                            x=selected_energy,
+                            y=selected_transmission,
+                            mode="markers+lines",
+                            marker=dict(color=color, size=5),
+                            line=dict(color=color, width=1),
+                            error_y=(
+                                dict(
+                                    type="data",
+                                    array=selected_uncertainty,
+                                    visible=True,
+                                    thickness=1.2,
+                                    width=2,
+                                )
+                                if self.show_errors.value
+                                else None
+                            ),
+                            name=(
+                                f"{name} selected x{scale:.7g}"
+                                if self.export_scaled_spectra.value
+                                else f"{name} selected"
+                            ),
+                        )
+                    )
+                    trace_count += 1
+
+                if trace_count == 0:
+                    raise ValueError("No enabled frame has a loaded preview profile.")
+                figure.update_xaxes(
+                    type="log",
+                    range=[np.log10(0.001), np.log10(30.0)],
+                    title_text="Incident neutron energy (eV)",
+                )
+                figure.update_yaxes(title_text="Transmission")
+                _add_prompt_flash_lines(
+                    figure,
+                    self.show_prompt_flash_lines.value,
+                    energy_min_eV=0.001,
+                    energy_max_eV=30.0,
+                )
+                figure.update_layout(
+                    title="Selected frame output spectra preview",
+                    template="plotly_white",
+                    height=650,
+                    hovermode="closest",
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="left",
+                        x=0,
+                    ),
+                    margin=dict(l=70, r=30, t=100, b=60),
+                )
+                figure.show()
+            except Exception as error:
+                display(
+                    HTML(
+                        "<span style='color:#b00020'>Output-spectrum preview failed: "
+                        f"{_escape(error)}</span>"
+                    )
+                )
+
     def _overlap_window_for_pair(
+        self,
         reference_name: str,
         comparison_name: str,
-        manual_window: tuple[float, float] | None,
+        manual_window: tuple[float, float] | None = None,
     ) -> tuple[float, float] | None:
+        if manual_window is None:
+            controls = self.overlap_window_widgets.get(
+                self._overlap_pair_key(reference_name, comparison_name)
+            )
+            if controls is not None and not controls["auto"].value:
+                window = OverlapWindowConfig(
+                    frame_a=reference_name,
+                    frame_b=comparison_name,
+                    energy_min_eV=float(controls["minimum"].value),
+                    energy_max_eV=float(controls["maximum"].value),
+                )
+                window.validate()
+                manual_window = (window.energy_min_eV, window.energy_max_eV)
+        if manual_window is not None:
+            window = OverlapWindowConfig(
+                frame_a=reference_name,
+                frame_b=comparison_name,
+                energy_min_eV=float(manual_window[0]),
+                energy_max_eV=float(manual_window[1]),
+            )
+            window.validate()
+            return window.energy_min_eV, window.energy_max_eV
+
         normalized_names = {
             reference_name.strip().lower(),
             comparison_name.strip().lower(),
@@ -2195,29 +3082,14 @@ class MultiFrameNormalizationTof:
             any("resonance" in name for name in normalized_names)
             and any(name.startswith("0.3") for name in normalized_names)
         )
-        if not is_resonance_0p3_pair:
-            return manual_window
-
-        lower_eV = 0.0 if manual_window is None else float(manual_window[0])
-        upper_eV = 0.2 if manual_window is None else min(float(manual_window[1]), 0.2)
-        if upper_eV <= lower_eV:
-            raise ValueError(
-                "The 0.3 A/resonance overlap window must extend below 0.200 eV."
-            )
-        return lower_eV, upper_eV
+        return (0.0, 0.2) if is_resonance_0p3_pair else None
 
     def _selected_frame_names(self) -> list[str]:
         selected = set(self.inspect_frames.value)
         ordered = [str(name) for name in self.inspect_frames.options]
         return [name for name in ordered if name in selected]
 
-    def _update_manual_overlap_state(self) -> None:
-        disabled = len(self.inspect_frames.value) != 2
-        self.overlap_min.disabled = disabled
-        self.overlap_max.disabled = disabled
-
     def _overlap_selection_changed(self, _change=None) -> None:
-        self._update_manual_overlap_state()
         if self.engine is not None and self.engine.previews:
             self._draw_plot()
 
@@ -2247,7 +3119,20 @@ class MultiFrameNormalizationTof:
                     Path(recipe.working_dir) / "shared" / ".normalization_tof_multiple_frames_cache"
                 )
                 self.same_rois_all_frames.value = recipe.same_rois_all_frames
+                self.export_scaled_spectra.value = recipe.export_scaled_spectra
+                self.show_prompt_flash_lines.value = recipe.show_prompt_flash_lines
+                self._overlap_window_state_cache.clear()
+                self.overlap_window_widgets = {}
                 self._set_frames(recipe.frames)
+                self._restore_overlap_windows(recipe.overlap_windows)
+                self._updating_frame_scales = True
+                try:
+                    for name, multiplier in recipe.frame_multipliers.items():
+                        control = self.frame_scale_widgets.get(name)
+                        if control is not None and not control.disabled:
+                            control.value = float(multiplier)
+                finally:
+                    self._updating_frame_scales = False
                 self.engine = None
                 self.loaded_frame_configs = {}
                 with self.plot_output:
@@ -2265,10 +3150,17 @@ class MultiFrameNormalizationTof:
             try:
                 if not self.arm_full_run.value:
                     raise ValueError("Enable the full run first.")
+                auto_roi_notes = self._ensure_auto_rois()
                 recipe = self.recipe()
                 recipe.save(self.recipe_file.value)
                 engine = MultiFramePreviewEngine(recipe)
-                display(HTML("Running each enabled frame in a separate output folder..."))
+                display(
+                    HTML(
+                        ("<br>".join(_escape(note) for note in auto_roi_notes) + "<br>"
+                         if auto_roi_notes else "")
+                        + "Running each enabled frame in a separate output folder..."
+                    )
+                )
                 campaign = engine.run_full_normalization(preview=True)
                 clear_output(wait=True)
                 display(HTML(f"Normalization campaign completed: <code>{_escape(campaign)}</code>"))
