@@ -817,7 +817,7 @@ def test_new_frame_defaults_match_single_frame_notebook():
     assert editor.use_proton_charge.value is True
     assert editor.experimental_uncertainties.value is True
     assert editor.spectrum_only.value is True
-    assert editor.combine_sample_runs.value is False
+    assert editor.combine_sample_runs.value is True
     assert editor.correct_chips_alignment.value is False
     assert editor.correct_chips_alignment.disabled is True
     assert editor.black_filter_enabled.value is False
@@ -1050,6 +1050,41 @@ def test_overlap_inspection_provides_manual_window_for_each_adjacent_pair():
     )
 
 
+def test_frame_move_controls_reorder_all_outputs_without_rebuilding_editors():
+    frames = [
+        _empty_frame("low", DetectorType.tpx1),
+        _empty_frame("middle", DetectorType.tpx1),
+        _empty_frame("high", DetectorType.tpx1),
+    ]
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914", frames=frames)
+    low, middle, high = ui.frame_editors
+    middle.roi_left.value = 123
+    middle.output_energy_min.value = 0.02
+    ui.frame_scale_widgets["middle"].value = 1.25
+
+    middle.move_up_button.click()
+
+    assert ui.frame_editors == [middle, low, high]
+    assert middle.roi_left.value == 123
+    assert middle.output_energy_min.value == 0.02
+    assert tuple(ui.inspect_frames.options) == ("middle", "low", "high")
+    assert tuple(ui.frame_scale_widgets) == ("middle", "low", "high")
+    assert ui.frame_scale_widgets["middle"].value == 1.25
+    assert [frame.name for frame in ui.recipe().frames] == ["middle", "low", "high"]
+    assert [
+        (controls["frame_a"], controls["frame_b"])
+        for controls in ui.overlap_window_widgets.values()
+    ] == [("middle", "low"), ("low", "high")]
+    assert middle.move_up_button.disabled is True
+    assert middle.move_down_button.disabled is False
+    assert high.move_down_button.disabled is True
+    assert ui.frame_box.selected_index == 0
+
+    middle.move_down_button.click()
+    assert ui.frame_editors == [low, middle, high]
+    assert ui.frame_box.selected_index == 1
+
+
 def test_integrated_roi_preview_uses_production_orientation_and_subsampling(tmp_path):
     frames = [np.arange(20, dtype=np.uint16).reshape(4, 5) + offset for offset in (0, 20, 40)]
     data_path, _ = _write_run(tmp_path, "200", frames)
@@ -1241,13 +1276,13 @@ def test_repeated_runs_are_charge_weighted_and_rebinned_before_division(tmp_path
     s1_path, s1_nexus = _write_run(tmp_path, "101", s1, charge_c=2.0)
     s2_path, s2_nexus = _write_run(tmp_path, "102", s2, charge_c=1.0)
     ob_path, ob_nexus = _write_run(tmp_path, "103", ob, charge_c=1.0)
-    frame = _frame(
+    frame = replace(_frame(
         "frame",
         [("101", s1_path, s1_nexus), ("102", s2_path, s2_nexus)],
         [("103", ob_path, ob_nexus)],
         RoiConfig(left=0, top=0, width=3, height=3),
         RebinConfig(mode=RebinMode.linear_tof, delta_tof_us=2.0, full_bins_only=False),
-    )
+    ), combine_sample_runs=False)
     recipe = MultiFrameRecipe(
         working_dir=str(tmp_path),
         frames=[frame],
@@ -1720,7 +1755,7 @@ def test_full_normalization_uses_separate_campaign_folders_and_snapshot(tmp_path
     assert calls[0]["sample_roi"].width == 2
     assert calls[0]["ob_roi"].left == 1
     assert calls[0]["ob_roi"].width == 1
-    assert calls[0]["combine_samples"] is False
+    assert calls[0]["combine_samples"] is True
     assert calls[0]["correct_chips_alignment_flag"] is False
     assert calls[0]["replace_ob_zeros_by_local_median_flag"] is False
     assert calls[0]["kernel_size_for_local_median"] == (3, 3, 1)
@@ -1947,11 +1982,29 @@ def test_stage3_spectrum_only_exports_rebinned_and_native_roi_profiles(tmp_path,
         "spectrum_normalization_profile_scaled_selected.txt"
     )
     native_path = profile_path.with_name("native_spectrum_normalization_inputs.txt")
+    native_profile_path = profile_path.with_name(
+        "spectrum_normalization_profile_native.txt"
+    )
+    native_scaled_path = profile_path.with_name(
+        "spectrum_normalization_profile_native_scaled.txt"
+    )
+    native_selected_path = profile_path.with_name(
+        "spectrum_normalization_profile_native_selected.txt"
+    )
+    native_scaled_selected_path = profile_path.with_name(
+        "spectrum_normalization_profile_native_scaled_selected.txt"
+    )
     profile = pd.read_csv(profile_path, comment="#")
     scaled = pd.read_csv(scaled_path, comment="#")
     selected = pd.read_csv(selected_path, comment="#")
     scaled_selected = pd.read_csv(scaled_selected_path, comment="#")
     native = pd.read_csv(native_path, comment="#")
+    native_profile = pd.read_csv(native_profile_path, comment="#")
+    native_scaled = pd.read_csv(native_scaled_path, comment="#")
+    native_selected = pd.read_csv(native_selected_path, comment="#")
+    native_scaled_selected = pd.read_csv(
+        native_scaled_selected_path, comment="#"
+    )
 
     np.testing.assert_allclose(profile["sample ROI counts"], [30.0, 70.0])
     np.testing.assert_allclose(profile["ob ROI counts"], [60.0, 140.0])
@@ -1976,10 +2029,83 @@ def test_stage3_spectrum_only_exports_rebinned_and_native_roi_profiles(tmp_path,
         native["native OB ROI uncertainty"],
         np.sqrt(ob_values),
     )
+    np.testing.assert_allclose(
+        native_profile["spectrum normalization"],
+        sample_values / ob_values,
+    )
+    np.testing.assert_allclose(
+        native_scaled["spectrum normalization"],
+        native_profile["spectrum normalization"] * 0.8,
+    )
+    np.testing.assert_allclose(
+        native_scaled["native sample ROI counts"],
+        native_profile["native sample ROI counts"],
+    )
+    assert np.all(native_selected["native_energy (eV)"] <= 1.0e6)
+    np.testing.assert_allclose(
+        native_scaled_selected["spectrum normalization"],
+        native_selected["spectrum normalization"] * 0.8,
+    )
+    assert "# grid: native, unrebinned TOF bins" in native_profile_path.read_text(
+        encoding="utf-8"
+    )
     assert "# native ROI input profile: native_spectrum_normalization_inputs.txt" in (
         profile_path.read_text(encoding="utf-8")
     )
     assert not any(campaign.rglob("stack"))
+
+
+def test_stage3_combines_multiple_sample_runs_by_default(tmp_path):
+    sample_1_path, sample_1_nexus = _write_run(
+        tmp_path,
+        "705",
+        [
+            np.asarray([[10]], dtype=np.uint16),
+            np.asarray([[20]], dtype=np.uint16),
+        ],
+    )
+    sample_2_path, sample_2_nexus = _write_run(
+        tmp_path,
+        "706",
+        [
+            np.asarray([[30]], dtype=np.uint16),
+            np.asarray([[40]], dtype=np.uint16),
+        ],
+    )
+    ob_path, ob_nexus = _write_run(
+        tmp_path,
+        "707",
+        [
+            np.asarray([[20]], dtype=np.uint16),
+            np.asarray([[40]], dtype=np.uint16),
+        ],
+    )
+    frame = _frame(
+        "resonance",
+        [
+            ("705", sample_1_path, sample_1_nexus),
+            ("706", sample_2_path, sample_2_nexus),
+        ],
+        [("707", ob_path, ob_nexus)],
+        RoiConfig(left=0, top=0, width=1, height=1),
+    )
+    assert frame.combine_sample_runs is True
+    recipe = MultiFrameRecipe(
+        working_dir=str(tmp_path),
+        frames=[frame],
+        output_root=str(tmp_path / "combined_output"),
+    )
+
+    campaign = MultiFramePreviewEngine(recipe).run_full_normalization(
+        "combined samples",
+        preview=False,
+    )
+    profile_paths = list(campaign.rglob("spectrum_normalization_profile.txt"))
+    assert len(profile_paths) == 1
+    profile = pd.read_csv(profile_paths[0], comment="#")
+    np.testing.assert_allclose(profile["sample ROI counts"], [20.0, 30.0])
+    np.testing.assert_allclose(profile["ob ROI counts"], [20.0, 40.0])
+    np.testing.assert_allclose(profile["spectrum normalization"], [1.0, 0.75])
 
 
 def test_stage3_measured_background_matches_count_domain_rebin(tmp_path):

@@ -254,6 +254,8 @@ class FrameEditor:
         working_dir: str,
         on_change=None,
         on_delete=None,
+        on_move_up=None,
+        on_move_down=None,
         show_prompt_flash_lines=None,
     ):
         self.on_change = on_change
@@ -261,6 +263,16 @@ class FrameEditor:
         self.show_prompt_flash_lines = show_prompt_flash_lines
         self.enabled = widgets.Checkbox(value=config.enabled, description="Use frame", indent=False)
         self.name = widgets.Text(value=config.name, description="Name", layout=_layout("360px"))
+        self.move_up_button = widgets.Button(
+            icon="arrow-up",
+            tooltip="Move frame earlier (toward lower energy)",
+            layout=_layout("42px"),
+        )
+        self.move_down_button = widgets.Button(
+            icon="arrow-down",
+            tooltip="Move frame later (toward higher energy)",
+            layout=_layout("42px"),
+        )
         self.delete_button = widgets.Button(
             description="Delete frame",
             icon="trash",
@@ -270,6 +282,10 @@ class FrameEditor:
         )
         if on_delete is not None:
             self.delete_button.on_click(lambda _button: on_delete(self))
+        if on_move_up is not None:
+            self.move_up_button.on_click(lambda _button: on_move_up(self))
+        if on_move_down is not None:
+            self.move_down_button.on_click(lambda _button: on_move_down(self))
         self.detector = widgets.Dropdown(
             options=[DetectorType.tpx1_legacy, DetectorType.tpx1, DetectorType.tpx3],
             value=config.detector_type,
@@ -339,7 +355,7 @@ class FrameEditor:
         ob_roi = config.effective_ob_roi()
         self.ob_roi_linked = widgets.Checkbox(
             value=config.ob_roi is None,
-            description="Use sample ROI for OB",
+            description="Use OB ROI for sample",
             indent=False,
             layout=_layout("240px"),
         )
@@ -467,9 +483,9 @@ class FrameEditor:
         )
         self.combine_sample_runs = widgets.Checkbox(
             value=config.combine_sample_runs,
-            description="Combine sample runs",
+            description="Combine sample runs before normalization",
             indent=False,
-            layout=_layout("220px"),
+            layout=_layout("340px"),
         )
         self.correct_chips_alignment = widgets.Checkbox(
             value=False if config.correct_chips_alignment is None else config.correct_chips_alignment,
@@ -685,13 +701,13 @@ class FrameEditor:
             *self.ob_input.value_widgets,
         ):
             auto_roi_widget.observe(self._invalidate_auto_roi, names="value")
-        for sample_roi_widget in (
-            self.roi_left,
-            self.roi_top,
-            self.roi_width,
-            self.roi_height,
+        for ob_roi_widget in (
+            self.ob_roi_left,
+            self.ob_roi_top,
+            self.ob_roi_width,
+            self.ob_roi_height,
         ):
-            sample_roi_widget.observe(self._sync_ob_roi_from_sample, names="value")
+            ob_roi_widget.observe(self._sync_sample_roi_from_ob, names="value")
         self._update_rebin_parameters()
         self._update_delay_state()
         self._update_detector_state()
@@ -726,7 +742,7 @@ class FrameEditor:
             ]
         )
         self.roi_preview_row = widgets.HBox(
-            [self.roi_preview_images, self.roi_preview_button],
+            [self.roi_preview_button],
             layout=_wrapping_row_layout(),
         )
         self.ob_roi_row = widgets.HBox(
@@ -734,7 +750,7 @@ class FrameEditor:
             layout=_wrapping_row_layout(),
         )
         self.ob_roi_preview_row = widgets.HBox(
-            [self.ob_roi_preview_button],
+            [self.roi_preview_images, self.ob_roi_preview_button],
             layout=_wrapping_row_layout(),
         )
         self.axis_row = widgets.HBox(
@@ -839,20 +855,26 @@ class FrameEditor:
         self.widget = widgets.VBox(
             [
                 widgets.HBox(
-                    [self.enabled, self.name, self.delete_button],
+                    [
+                        self.enabled,
+                        self.name,
+                        self.move_up_button,
+                        self.move_down_button,
+                        self.delete_button,
+                    ],
                     layout=_wrapping_row_layout(),
                 ),
                 self.detector,
                 self.sample_input.widget,
                 self.ob_input.widget,
                 self.auto_roi_controls,
-                widgets.HTML("<b>Sample ROI</b>"),
-                self.roi_row,
-                self.roi_preview_row,
                 widgets.HTML("<b>Open-beam ROI</b>"),
-                self.ob_roi_linked,
                 self.ob_roi_row,
                 self.ob_roi_preview_row,
+                widgets.HTML("<b>Sample ROI</b>"),
+                self.ob_roi_linked,
+                self.roi_row,
+                self.roi_preview_row,
                 self.roi_preview_output,
                 self.axis_row,
                 widgets.HTML("<b>Proposed rebinning</b>"),
@@ -1063,28 +1085,29 @@ class FrameEditor:
             None if self.closed_background_enabled.value else "none"
         )
 
-    def _sync_ob_roi_from_sample(self, _change=None) -> None:
+    def _sync_sample_roi_from_ob(self, _change=None) -> None:
         if not self.ob_roi_linked.value:
             return
-        self.ob_roi_left.value = self.roi_left.value
-        self.ob_roi_top.value = self.roi_top.value
-        self.ob_roi_width.value = self.roi_width.value
-        self.ob_roi_height.value = self.roi_height.value
+        self.roi_left.value = self.ob_roi_left.value
+        self.roi_top.value = self.ob_roi_top.value
+        self.roi_width.value = self.ob_roi_width.value
+        self.roi_height.value = self.ob_roi_height.value
 
     def _update_ob_roi_state(self, _change=None) -> None:
         if self.auto_roi_enabled.value and self.ob_roi_linked.value:
             self.ob_roi_linked.value = False
         linked = self.ob_roi_linked.value
         if linked:
-            self._sync_ob_roi_from_sample()
+            self._sync_sample_roi_from_ob()
         self.ob_roi_linked.disabled = self.auto_roi_enabled.value
         for widget in (
-            self.ob_roi_left,
-            self.ob_roi_top,
-            self.ob_roi_width,
-            self.ob_roi_height,
+            self.roi_left,
+            self.roi_top,
+            self.roi_width,
+            self.roi_height,
         ):
             widget.disabled = linked
+        self.roi_preview_button.disabled = linked
 
     def _invalidate_auto_roi(self, _change=None) -> None:
         self._auto_roi_applied_sources.clear()
@@ -1105,9 +1128,9 @@ class FrameEditor:
             self._auto_roi_applied_sources.clear()
 
     def _auto_roi_config(self) -> AutoRoiConfig:
-        required_sources = {"sample"}
+        required_sources = {"ob"}
         if not self.ob_roi_linked.value:
-            required_sources.add("ob")
+            required_sources.add("sample")
         return AutoRoiConfig(
             enabled=self.auto_roi_enabled.value,
             pixel_size_mm=0.055,
@@ -1143,11 +1166,9 @@ class FrameEditor:
             run.nexus_path,
             config=self._auto_roi_config(),
         )
-        if is_sample or self.ob_roi_linked.value:
+        if is_sample:
             roi_widgets = (self.roi_left, self.roi_top, self.roi_width, self.roi_height)
             self._auto_roi_applied_sources.add("sample")
-            if self.ob_roi_linked.value:
-                self._auto_roi_applied_sources.add("ob")
         else:
             roi_widgets = (
                 self.ob_roi_left,
@@ -1156,6 +1177,8 @@ class FrameEditor:
                 self.ob_roi_height,
             )
             self._auto_roi_applied_sources.add("ob")
+            if self.ob_roi_linked.value:
+                self._auto_roi_applied_sources.add("sample")
         for widget, value in zip(
             roi_widgets,
             (
@@ -1172,9 +1195,9 @@ class FrameEditor:
         """Resolve any enabled automatic ROI proposals not already accepted in this editor."""
         if not self.auto_roi_enabled.value:
             return []
-        sources = ["sample"]
+        sources = ["ob"]
         if not self.ob_roi_linked.value:
-            sources.append("ob")
+            sources.append("sample")
         notes = []
         for source in sources:
             if source in self._auto_roi_applied_sources:
@@ -1566,7 +1589,7 @@ class FrameEditor:
         preview_button = self.roi_preview_button if is_sample else self.ob_roi_preview_button
         run_input = self.sample_input if is_sample else self.ob_input
         source_label = "sample" if is_sample else "OB"
-        if is_sample or self.ob_roi_linked.value:
+        if is_sample:
             roi_widgets = (self.roi_left, self.roi_top, self.roi_width, self.roi_height)
         else:
             roi_widgets = (
@@ -1716,7 +1739,8 @@ class FrameEditor:
                         f"Integrated {selected_count} evenly sampled TIFFs out of {total_count}. "
                         f"The {source_label} ROI fields above update when the sliders are released."
                         + (
-                            " The OB ROI is linked, so this also updates the sample ROI."
+                            " The sample ROI is linked to the OB ROI, so this also updates "
+                            "the sample ROI."
                             if not is_sample and self.ob_roi_linked.value
                             else ""
                         )
@@ -1734,7 +1758,7 @@ class FrameEditor:
                 clear_output(wait=True)
                 display(HTML(f"<span style='color:#b00020'><b>ROI preview failed:</b> {_escape(error)}</span>"))
         finally:
-            preview_button.disabled = False
+            preview_button.disabled = is_sample and self.ob_roi_linked.value
 
     def _show_container_file_browser(self, _button) -> None:
         with self.container_file_browser_output:
@@ -2239,6 +2263,8 @@ class MultiFrameNormalizationTof:
                 self.working_dir,
                 on_change=self._frame_changed,
                 on_delete=self._delete_frame,
+                on_move_up=self._move_frame_up,
+                on_move_down=self._move_frame_down,
                 show_prompt_flash_lines=self.show_prompt_flash_lines,
             )
             for frame in frames
@@ -2246,9 +2272,7 @@ class MultiFrameNormalizationTof:
         only_one_frame = len(self.frame_editors) <= 1
         for editor in self.frame_editors:
             editor.delete_button.disabled = only_one_frame
-        self.frame_box.children = tuple(editor.widget for editor in self.frame_editors)
-        for index, editor in enumerate(self.frame_editors):
-            self.frame_box.set_title(index, editor.name.value or f"frame {index + 1}")
+        self._refresh_frame_order_widgets()
         self.frame_box.selected_index = 0 if self.frame_editors else None
         self._refresh_overlap_options()
         if self.same_rois_all_frames.value and self.frame_editors:
@@ -2595,6 +2619,37 @@ class MultiFrameNormalizationTof:
             self.frame_box.set_title(index, editor.name.value or f"frame {index + 1}")
         self._refresh_overlap_options()
 
+    def _refresh_frame_order_widgets(self) -> None:
+        self.frame_box.children = tuple(editor.widget for editor in self.frame_editors)
+        last_index = len(self.frame_editors) - 1
+        for index, editor in enumerate(self.frame_editors):
+            self.frame_box.set_title(index, editor.name.value or f"frame {index + 1}")
+            editor.move_up_button.disabled = index == 0
+            editor.move_down_button.disabled = index == last_index
+
+    def _move_frame_up(self, target: FrameEditor) -> None:
+        self._move_frame(target, -1)
+
+    def _move_frame_down(self, target: FrameEditor) -> None:
+        self._move_frame(target, 1)
+
+    def _move_frame(self, target: FrameEditor, offset: int) -> None:
+        if target not in self.frame_editors:
+            return
+        source_index = self.frame_editors.index(target)
+        destination_index = source_index + int(offset)
+        if destination_index < 0 or destination_index >= len(self.frame_editors):
+            return
+        self.frame_editors[source_index], self.frame_editors[destination_index] = (
+            self.frame_editors[destination_index],
+            self.frame_editors[source_index],
+        )
+        self._refresh_frame_order_widgets()
+        self.frame_box.selected_index = destination_index
+        self._refresh_overlap_options()
+        if self.engine is not None and self.engine.previews:
+            self._draw_plot()
+
     def _same_rois_all_frames_changed(self, change=None) -> None:
         if not self.same_rois_all_frames.value or not self.frame_editors:
             return
@@ -2610,16 +2665,15 @@ class MultiFrameNormalizationTof:
             for target in self.frame_editors:
                 if target is source:
                     continue
+                target.ob_roi_left.value = source.ob_roi_left.value
+                target.ob_roi_top.value = source.ob_roi_top.value
+                target.ob_roi_width.value = source.ob_roi_width.value
+                target.ob_roi_height.value = source.ob_roi_height.value
                 target.roi_left.value = source.roi_left.value
                 target.roi_top.value = source.roi_top.value
                 target.roi_width.value = source.roi_width.value
                 target.roi_height.value = source.roi_height.value
                 target.ob_roi_linked.value = source.ob_roi_linked.value
-                if not source.ob_roi_linked.value:
-                    target.ob_roi_left.value = source.ob_roi_left.value
-                    target.ob_roi_top.value = source.ob_roi_top.value
-                    target.ob_roi_width.value = source.ob_roi_width.value
-                    target.ob_roi_height.value = source.ob_roi_height.value
                 target._auto_roi_applied_sources = set(source._auto_roi_applied_sources)
                 target._update_ob_roi_state()
         finally:

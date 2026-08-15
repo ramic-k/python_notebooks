@@ -63,6 +63,17 @@ SELECTED_SPECTRUM_PROFILE_NAME = "spectrum_normalization_profile_selected.txt"
 SCALED_SELECTED_SPECTRUM_PROFILE_NAME = (
     "spectrum_normalization_profile_scaled_selected.txt"
 )
+NATIVE_SPECTRUM_INPUTS_NAME = "native_spectrum_normalization_inputs.txt"
+NATIVE_SPECTRUM_PROFILE_NAME = "spectrum_normalization_profile_native.txt"
+NATIVE_SCALED_SPECTRUM_PROFILE_NAME = (
+    "spectrum_normalization_profile_native_scaled.txt"
+)
+NATIVE_SELECTED_SPECTRUM_PROFILE_NAME = (
+    "spectrum_normalization_profile_native_selected.txt"
+)
+NATIVE_SCALED_SELECTED_SPECTRUM_PROFILE_NAME = (
+    "spectrum_normalization_profile_native_scaled_selected.txt"
+)
 _SLIT_GAP_LOG_PATHS = {
     "horizontal": (
         "/entry/DASlogs/BL10:Mot:s1:X:Gap.RBV",
@@ -611,7 +622,7 @@ class FrameConfig:
     use_proton_charge: bool = True
     use_experimental_uncertainties: bool = True
     spectrum_only: bool = True
-    combine_sample_runs: bool = False
+    combine_sample_runs: bool = True
     correct_chips_alignment: bool | None = None
     replace_ob_zeros_by_local_median: bool | None = None
     local_median_kernel: tuple[int, int, int] | None = (3, 3, 1)
@@ -1031,6 +1042,79 @@ def export_selected_spectrum_profile(
         )
         stream.write(f"# selected from: {source.name}\n")
         selected_profile.to_csv(stream, index=False)
+    return output
+
+
+def export_native_spectrum_profile(
+    native_inputs_path: str | os.PathLike[str],
+    output_name: str = NATIVE_SPECTRUM_PROFILE_NAME,
+) -> Path:
+    """Derive an unrebinned transmission profile from native-grid ROI inputs."""
+    source = Path(native_inputs_path)
+    comments = []
+    with source.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.startswith("#"):
+                break
+            comments.append(line)
+
+    profile = pd.read_csv(source, comment="#")
+    required_columns = (
+        "native sample ROI counts",
+        "native sample ROI uncertainty",
+        "native OB ROI counts",
+        "native OB ROI uncertainty",
+    )
+    missing_columns = [
+        column for column in required_columns if column not in profile.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            f"Missing native ROI input columns in {source}: "
+            + ", ".join(missing_columns)
+        )
+
+    sample_counts = pd.to_numeric(
+        profile["native sample ROI counts"], errors="raise"
+    ).to_numpy(dtype=np.float64)
+    sample_uncertainty = pd.to_numeric(
+        profile["native sample ROI uncertainty"], errors="raise"
+    ).to_numpy(dtype=np.float64)
+    ob_counts = pd.to_numeric(
+        profile["native OB ROI counts"], errors="raise"
+    ).to_numpy(dtype=np.float64)
+    ob_uncertainty = pd.to_numeric(
+        profile["native OB ROI uncertainty"], errors="raise"
+    ).to_numpy(dtype=np.float64)
+    transmission, uncertainty = calculate_ratio_and_uncertainty(
+        sample_counts,
+        ob_counts,
+        np.square(sample_uncertainty),
+        np.square(ob_uncertainty),
+    )
+    valid = (
+        np.isfinite(sample_counts)
+        & np.isfinite(sample_uncertainty)
+        & np.isfinite(ob_counts)
+        & np.isfinite(ob_uncertainty)
+        & (sample_counts >= 0)
+        & (ob_counts > 0)
+    )
+    profile["spectrum normalization"] = np.where(valid, transmission, np.nan)
+    profile["spectrum normalization uncertainty"] = np.where(
+        valid, uncertainty, np.nan
+    )
+
+    output = source.with_name(output_name)
+    with output.open("w", encoding="utf-8") as stream:
+        stream.writelines(comments)
+        stream.write("# grid: native, unrebinned TOF bins\n")
+        stream.write(f"# native transmission derived from: {source.name}\n")
+        stream.write(
+            "# calculation: sample ROI counts / OB ROI counts; independent sample "
+            "and OB uncertainties propagated through the ratio\n"
+        )
+        profile.to_csv(stream, index=False)
     return output
 
 
@@ -1775,6 +1859,72 @@ class MultiFramePreviewEngine:
         )
         return outputs
 
+    def _export_native_frame_profiles(
+        self,
+        frame: FrameConfig,
+        frame_output: Path,
+    ) -> list[Path]:
+        """Export native-grid transmission companions for rebinned frames."""
+        outputs = []
+        selection_requested = (
+            frame.output_energy_min_eV is not None
+            or frame.output_energy_max_eV is not None
+            or bool(frame.output_excluded_energy_ranges_eV)
+        )
+        multiplier = float(self.recipe.frame_multipliers.get(frame.name, 1.0))
+        if self.recipe.export_scaled_spectra and (
+            not np.isfinite(multiplier) or multiplier <= 0
+        ):
+            raise ValueError(
+                f"{frame.name}: frame multiplier must be positive and finite."
+            )
+
+        for native_inputs_path in frame_output.rglob(NATIVE_SPECTRUM_INPUTS_NAME):
+            native_profile = export_native_spectrum_profile(native_inputs_path)
+            outputs.append(native_profile)
+            if selection_requested:
+                outputs.append(
+                    export_selected_spectrum_profile(
+                        native_profile,
+                        energy_min_eV=frame.output_energy_min_eV,
+                        energy_max_eV=frame.output_energy_max_eV,
+                        output_name=NATIVE_SELECTED_SPECTRUM_PROFILE_NAME,
+                        excluded_energy_ranges_eV=(
+                            frame.output_excluded_energy_ranges_eV
+                        ),
+                    )
+                )
+            if self.recipe.export_scaled_spectra:
+                outputs.append(
+                    export_scaled_spectrum_profile(
+                        native_profile,
+                        multiplier,
+                        output_name=NATIVE_SCALED_SPECTRUM_PROFILE_NAME,
+                    )
+                )
+                if selection_requested:
+                    outputs.append(
+                        export_scaled_spectrum_profile(
+                            native_profile,
+                            multiplier,
+                            output_name=(
+                                NATIVE_SCALED_SELECTED_SPECTRUM_PROFILE_NAME
+                            ),
+                            energy_min_eV=frame.output_energy_min_eV,
+                            energy_max_eV=frame.output_energy_max_eV,
+                            excluded_energy_ranges_eV=(
+                                frame.output_excluded_energy_ranges_eV
+                            ),
+                        )
+                    )
+        if outputs:
+            logging.info(
+                "Exported %d native-grid spectrum profile companion(s) for %s.",
+                len(outputs),
+                frame.name,
+            )
+        return outputs
+
     def run_full_normalization(self, campaign_label: str | None = None, preview: bool = True) -> Path:
         output_root = Path(self.recipe.output_root or (self.working_dir / "shared")).expanduser()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1863,6 +2013,7 @@ class MultiFramePreviewEngine:
                     self._run_spectrum_only_normalization(frame, frame_output)
                     self._export_selected_frame_profiles(frame, frame_output)
                     self._export_scaled_frame_profiles(frame, frame_output)
+                    self._export_native_frame_profiles(frame, frame_output)
                     continue
                 logging.info(
                     "Stage 3 spectrum-only production unavailable for %s; using the "
@@ -1903,6 +2054,7 @@ class MultiFramePreviewEngine:
             )
             self._export_selected_frame_profiles(frame, frame_output)
             self._export_scaled_frame_profiles(frame, frame_output)
+            self._export_native_frame_profiles(frame, frame_output)
         return campaign_dir
 
     def _manual_axis_for_frame(self, frame: FrameConfig, runs: list[ResolvedRun]) -> np.ndarray | None:
