@@ -23,12 +23,17 @@ from __code.normalization_tof import utilities as normalization_utilities
 from __code.normalization_tof.multiple_frames import (
     AutoRoiConfig,
     BlackFilterBackgroundConfig,
+    FRAME_SCALING_HYBRID_NATIVE_FLUX,
+    PAIR_SCALING_NATIVE_FLUX,
+    PAIR_SCALING_TRANSMISSION,
     FrameConfig,
     MeasuredBackgroundConfig,
     MultiFramePreviewEngine,
     MultiFrameRecipe,
     NativeFrameProfile,
+    NativeFluxOverlapDiagnostics,
     OverlapWindowConfig,
+    PairScalingConfig,
     RebinnedFramePreview,
     RebinConfig,
     ResolvedRun,
@@ -37,10 +42,12 @@ from __code.normalization_tof.multiple_frames import (
     RunSpec,
     SlitGapMetadata,
     calculate_overlap_diagnostics,
+    calculate_native_flux_overlap_diagnostics,
     convert_tof_schedule_to_energy_schedule,
     export_scaled_spectrum_profile,
     load_integrated_image_preview,
     load_native_roi_profile,
+    native_flux_overlap_arrays,
     overlap_ratio_arrays,
     parse_run_numbers,
     propose_roi_from_nexus,
@@ -569,8 +576,15 @@ def test_run_parser_and_recipe_round_trip(tmp_path):
         same_rois_all_frames=True,
         export_scaled_spectra=True,
         frame_multipliers={"0.3 A": 0.987},
+        frame_scaling_mode=FRAME_SCALING_HYBRID_NATIVE_FLUX,
+        frame_sample_flux_multipliers={"0.3 A": 1.234},
+        frame_ob_flux_multipliers={"0.3 A": 1.25},
+        show_hybrid_flux_plots=False,
         overlap_windows=(
             OverlapWindowConfig("0.3 A", "resonance", 0.11, 0.19),
+        ),
+        pair_scaling_methods=(
+            PairScalingConfig("0.3 A", "resonance", PAIR_SCALING_NATIVE_FLUX),
         ),
         show_prompt_flash_lines=True,
     )
@@ -582,8 +596,15 @@ def test_run_parser_and_recipe_round_trip(tmp_path):
     assert loaded.same_rois_all_frames is True
     assert loaded.export_scaled_spectra is True
     assert loaded.frame_multipliers == {"0.3 A": 0.987}
+    assert loaded.frame_scaling_mode == FRAME_SCALING_HYBRID_NATIVE_FLUX
+    assert loaded.frame_sample_flux_multipliers == {"0.3 A": 1.234}
+    assert loaded.frame_ob_flux_multipliers == {"0.3 A": 1.25}
+    assert loaded.show_hybrid_flux_plots is False
     assert loaded.overlap_windows == (
         OverlapWindowConfig("0.3 A", "resonance", 0.11, 0.19),
+    )
+    assert loaded.pair_scaling_methods == (
+        PairScalingConfig("0.3 A", "resonance", PAIR_SCALING_NATIVE_FLUX),
     )
     assert loaded.frames[0].output_energy_min_eV == 0.011
     assert loaded.frames[0].output_energy_max_eV == 0.2
@@ -1041,13 +1062,44 @@ def test_overlap_inspection_provides_manual_window_for_each_adjacent_pair():
 
     assert ui._overlap_window_for_pair("2.5 A", "0.3 A") == (0.0105, 0.0115)
     assert ui._overlap_window_for_pair("0.3 A", "2.5 A") == (0.0105, 0.0115)
-    assert ui._overlap_window_for_pair("0.3 A", "resonance", None) == (0.0, 0.2)
+    assert ui._overlap_window_for_pair("0.3 A", "resonance", None) is None
     assert ui._overlap_window_for_pair("resonance", "0.3 A", (0.1, 0.3)) == (0.1, 0.3)
 
     windows = ui.recipe().overlap_windows
     assert windows == (
         OverlapWindowConfig("2.5 A", "0.3 A", 0.0105, 0.0115),
     )
+
+
+def test_highest_energy_overlap_cap_is_coverage_driven_not_name_driven():
+    ui = MultiFrameNormalizationTof(
+        "/SNS/VENUS/IPTS-36914",
+        frames=[
+            _empty_frame("thermal", DetectorType.tpx1),
+            _empty_frame("fast arbitrary name", DetectorType.tpx3),
+        ],
+    )
+    ui.engine = SimpleNamespace(
+        previews={
+            "thermal": _preview(
+                "thermal",
+                [0.05, 0.1, 0.2, 0.4],
+                [0.5] * 4,
+                [0.01] * 4,
+            ),
+            "fast arbitrary name": _preview(
+                "fast arbitrary name",
+                [0.08, 0.2, 1.0, 10.0],
+                [0.5] * 4,
+                [0.01] * 4,
+            ),
+        }
+    )
+
+    assert ui._overlap_window_for_pair(
+        "thermal",
+        "fast arbitrary name",
+    ) == (0.0, 0.2)
 
 
 def test_frame_move_controls_reorder_all_outputs_without_rebuilding_editors():
@@ -1276,13 +1328,13 @@ def test_repeated_runs_are_charge_weighted_and_rebinned_before_division(tmp_path
     s1_path, s1_nexus = _write_run(tmp_path, "101", s1, charge_c=2.0)
     s2_path, s2_nexus = _write_run(tmp_path, "102", s2, charge_c=1.0)
     ob_path, ob_nexus = _write_run(tmp_path, "103", ob, charge_c=1.0)
-    frame = replace(_frame(
+    frame = _frame(
         "frame",
         [("101", s1_path, s1_nexus), ("102", s2_path, s2_nexus)],
         [("103", ob_path, ob_nexus)],
         RoiConfig(left=0, top=0, width=3, height=3),
         RebinConfig(mode=RebinMode.linear_tof, delta_tof_us=2.0, full_bins_only=False),
-    ), combine_sample_runs=False)
+    )
     recipe = MultiFrameRecipe(
         working_dir=str(tmp_path),
         frames=[frame],
@@ -1315,7 +1367,10 @@ def test_repeated_runs_are_charge_weighted_and_rebinned_before_division(tmp_path
     np.testing.assert_allclose(preview.uncertainty, expected_uncertainty)
     assert not np.isclose(expected[0], np.mean(sample_native[:2] / ob_native[:2]))
     np.testing.assert_array_equal(preview.source_frame_count, [2, 2])
-    assert any("full normalization will process them separately" in item for item in preview.native.warnings)
+    assert not any(
+        "full normalization will process them separately" in item
+        for item in preview.native.warnings
+    )
 
 
 def test_measured_background_is_subtracted_before_preview_division(tmp_path):
@@ -1410,6 +1465,47 @@ def _preview(name, energy, transmission, uncertainty):
         sample_variance=native.sample_variance,
         ob_counts=native.ob_counts,
         ob_variance=native.ob_variance,
+        transmission=transmission,
+        uncertainty=uncertainty,
+        source_frame_count=np.ones(len(energy), dtype=int),
+        native=native,
+    )
+
+
+def _flux_preview(name, energy, sample_counts, ob_counts, variance=1.0):
+    energy = np.asarray(energy, dtype=float)
+    sample_counts = np.asarray(sample_counts, dtype=float)
+    ob_counts = np.asarray(ob_counts, dtype=float)
+    sample_variance = np.full(len(energy), float(variance))
+    ob_variance = np.full(len(energy), float(variance))
+    transmission = sample_counts / ob_counts
+    uncertainty = np.sqrt(
+        sample_variance / ob_counts**2
+        + sample_counts**2 * ob_variance / ob_counts**4
+    )
+    native = NativeFrameProfile(
+        name=name,
+        tof_s=np.arange(len(energy), dtype=float),
+        lambda_a=np.ones(len(energy)),
+        energy_eV=energy,
+        sample_counts=sample_counts,
+        sample_variance=sample_variance,
+        ob_counts=ob_counts,
+        ob_variance=ob_variance,
+        transmission=transmission,
+        uncertainty=uncertainty,
+        sample_total_proton_charge_c=1.0,
+        ob_total_proton_charge_c=1.0,
+    )
+    return RebinnedFramePreview(
+        name=name,
+        tof_s=native.tof_s,
+        lambda_a=native.lambda_a,
+        energy_eV=energy,
+        sample_counts=sample_counts,
+        sample_variance=sample_variance,
+        ob_counts=ob_counts,
+        ob_variance=ob_variance,
         transmission=transmission,
         uncertainty=uncertainty,
         source_frame_count=np.ones(len(energy), dtype=int),
@@ -1584,9 +1680,178 @@ def test_auto_scale_highest_energy_anchor_does_not_depend_on_frame_name(monkeypa
     assert "fast x0.9 (editable highest-energy anchor" in ui.frame_scale_status.value
 
 
+def test_hybrid_auto_scale_uses_transmission_then_native_flux_and_draws_flux_plots(
+    monkeypatch,
+):
+    names = ["low", "middle", "next", "high"]
+    frames = [_empty_frame(name, DetectorType.tpx1) for name in names]
+    ui = MultiFrameNormalizationTof(
+        "/SNS/VENUS/IPTS-36914",
+        frames=frames,
+    )
+    energy = [0.01, 0.02, 0.03, 0.04]
+    previews = {
+        "high": _flux_preview("high", energy, [80.0] * 4, [100.0] * 4),
+        "next": _flux_preview("next", energy, [40.0] * 4, [100.0] * 4),
+        "middle": _flux_preview("middle", energy, [20.0] * 4, [50.0] * 4),
+        "low": _flux_preview("low", energy, [20.0] * 4, [25.0] * 4),
+    }
+    monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
+    ui.frame_scaling_mode.value = FRAME_SCALING_HYBRID_NATIVE_FLUX
+    ui.engine = SimpleNamespace(previews=previews)
+    for controls in ui.overlap_window_widgets.values():
+        controls["auto"].value = False
+        controls["minimum"].value = 0.015
+        controls["maximum"].value = 0.035
+    ui._auto_scale_from_highest_energy()
+
+    expected_transmission = {"high": 1.0, "next": 2.0, "middle": 2.0, "low": 1.0}
+    for name, multiplier in expected_transmission.items():
+        np.testing.assert_allclose(ui.frame_scale_widgets[name].value, multiplier)
+    expected_sample = {
+        "high": 1.0,
+        "next": 2.0,
+        "middle": 4.0,
+        "low": 4.0,
+    }
+    expected_ob = {
+        "high": 1.0,
+        "next": 1.0,
+        "middle": 2.0,
+        "low": 4.0,
+    }
+    for name, multiplier in expected_sample.items():
+        np.testing.assert_allclose(
+            ui.frame_sample_flux_multipliers[name], multiplier
+        )
+    for name, multiplier in expected_ob.items():
+        np.testing.assert_allclose(ui.frame_ob_flux_multipliers[name], multiplier)
+    assert "next x2 from transmission" in ui.frame_scale_status.value
+    assert "middle x2 from native fluxes" in ui.frame_scale_status.value
+    assert "direct-transmission comparison" in ui.frame_scale_status.value
+
+    captured = []
+    monkeypatch.setattr(go.Figure, "show", lambda figure: captured.append(figure))
+    ui._draw_plot()
+
+    assert len(captured) == 6
+    flux_figures = captured[-2:]
+    assert all("Native-flux pair scaling" in figure.layout.title.text for figure in flux_figures)
+    assert all(len(figure.data) == 6 for figure in flux_figures)
+    assert all(figure.layout.yaxis.type == "log" for figure in flux_figures)
+
+
+def test_hybrid_auto_scale_requires_proton_charge_normalization(monkeypatch):
+    frames = [
+        replace(_empty_frame("low", DetectorType.tpx1), use_proton_charge=False),
+        _empty_frame("middle", DetectorType.tpx1),
+        _empty_frame("high", DetectorType.tpx1),
+    ]
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914", frames=frames)
+    monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
+    ui.frame_scaling_mode.value = FRAME_SCALING_HYBRID_NATIVE_FLUX
+    ui.engine = SimpleNamespace(
+        previews={
+            "low": _flux_preview("low", [1, 2, 3], [1, 1, 1], [2, 2, 2]),
+            "middle": _flux_preview(
+                "middle", [1, 2, 3], [1.5, 1.5, 1.5], [2, 2, 2]
+            ),
+            "high": _flux_preview("high", [1, 2, 4], [2, 2, 2], [2, 2, 2]),
+        }
+    )
+    ui._auto_scale_from_highest_energy()
+
+    assert "requires proton-charge normalization" in ui.frame_scale_status.value
+
+
+def test_pair_scaling_selectors_support_mixed_methods_without_named_resonance(
+    monkeypatch,
+):
+    names = ["low", "middle", "next", "high"]
+    ui = MultiFrameNormalizationTof(
+        "/SNS/VENUS/IPTS-36914",
+        frames=[_empty_frame(name, DetectorType.tpx1) for name in names],
+    )
+    monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
+    previews = {
+        "high": _flux_preview("high", [0.01, 0.02, 0.03, 0.04], [80] * 4, [100] * 4),
+        "next": _flux_preview("next", [0.01, 0.02, 0.03, 0.04], [40] * 4, [100] * 4),
+        "middle": _flux_preview("middle", [0.01, 0.02, 0.03, 0.04], [20] * 4, [50] * 4),
+        "low": _flux_preview("low", [0.01, 0.02, 0.03, 0.04], [20] * 4, [25] * 4),
+    }
+    ui.engine = SimpleNamespace(previews=previews)
+    for controls in ui.overlap_window_widgets.values():
+        controls["auto"].value = False
+        controls["minimum"].value = 0.015
+        controls["maximum"].value = 0.035
+        controls["scaling_method"].value = PAIR_SCALING_TRANSMISSION
+    ui.overlap_window_widgets[
+        ui._overlap_pair_key("next", "high")
+    ]["scaling_method"].value = PAIR_SCALING_NATIVE_FLUX
+    ui.overlap_window_widgets[
+        ui._overlap_pair_key("low", "middle")
+    ]["scaling_method"].value = PAIR_SCALING_NATIVE_FLUX
+
+    ui._auto_scale_from_highest_energy()
+
+    expected_transmission = {"high": 1.0, "next": 2.0, "middle": 2.0, "low": 1.0}
+    for name, multiplier in expected_transmission.items():
+        np.testing.assert_allclose(ui.frame_scale_widgets[name].value, multiplier)
+    for name, multiplier in {
+        "high": 1.0,
+        "next": 2.0,
+        "middle": 2.0,
+        "low": 2.0,
+    }.items():
+        np.testing.assert_allclose(
+            ui.frame_sample_flux_multipliers[name], multiplier
+        )
+    for name, multiplier in {
+        "high": 1.0,
+        "next": 1.0,
+        "middle": 1.0,
+        "low": 2.0,
+    }.items():
+        np.testing.assert_allclose(ui.frame_ob_flux_multipliers[name], multiplier)
+    assert "next x2 from native fluxes" in ui.frame_scale_status.value
+    assert "middle x2 from transmission" in ui.frame_scale_status.value
+    assert "low x1 from native fluxes" in ui.frame_scale_status.value
+    figures = ui._hybrid_flux_scaling_figures(
+        names,
+        {name: "#123456" for name in names},
+    )
+    assert len(figures) == 2
+
+
+def test_hybrid_two_frame_case_remains_transmission_only(monkeypatch):
+    frames = [
+        replace(_empty_frame("low", DetectorType.tpx1), use_proton_charge=False),
+        replace(_empty_frame("high", DetectorType.tpx3), use_proton_charge=False),
+    ]
+    ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914", frames=frames)
+    monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
+    ui.frame_scaling_mode.value = FRAME_SCALING_HYBRID_NATIVE_FLUX
+    ui.engine = SimpleNamespace(
+        previews={
+            "low": _flux_preview("low", [1, 2, 3], [1, 1, 1], [2, 2, 2]),
+            "high": _flux_preview("high", [1, 2, 4], [2, 2, 2], [2, 2, 2]),
+        }
+    )
+
+    ui._auto_scale_from_highest_energy()
+
+    np.testing.assert_allclose(ui.frame_scale_widgets["high"].value, 1.0)
+    np.testing.assert_allclose(ui.frame_scale_widgets["low"].value, 2.0)
+    assert "low x2 from transmission" in ui.frame_scale_status.value
+    assert "requires proton-charge normalization" not in ui.frame_scale_status.value
+    assert ui._hybrid_flux_scaling_figures(["low", "high"], {}) == []
+
+
 def test_ui_recipe_captures_scaled_spectrum_export_settings():
     ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
     ui.export_scaled_spectra.value = True
+    ui.frame_scaling_mode.value = FRAME_SCALING_HYBRID_NATIVE_FLUX
+    ui.show_hybrid_flux_plots.value = False
     ui.frame_editors[0].output_energy_min.value = 0.0012
     ui.frame_editors[0].output_energy_max.value = 0.0021
     ui.frame_editors[0]._add_output_exclusion_range(values=(0.0014, 0.0015))
@@ -1600,10 +1865,23 @@ def test_ui_recipe_captures_scaled_spectrum_export_settings():
     pair["auto"].value = False
     pair["minimum"].value = 0.0033
     pair["maximum"].value = 0.0038
+    pair["scaling_method"].value = PAIR_SCALING_NATIVE_FLUX
+    ui.frame_sample_flux_multipliers = {"0.3 A": 1.02, "resonance": 0.98}
+    ui.frame_ob_flux_multipliers = {"0.3 A": 1.01, "resonance": 1.0}
 
     recipe = ui.recipe()
 
     assert recipe.export_scaled_spectra is True
+    assert recipe.frame_scaling_mode == FRAME_SCALING_HYBRID_NATIVE_FLUX
+    assert recipe.frame_sample_flux_multipliers == {
+        "0.3 A": 1.02,
+        "resonance": 0.98,
+    }
+    assert recipe.frame_ob_flux_multipliers == {
+        "0.3 A": 1.01,
+        "resonance": 1.0,
+    }
+    assert recipe.show_hybrid_flux_plots is False
     assert recipe.frame_multipliers["4.5 A"] == 1.011
     assert recipe.frame_multipliers["2.5 A"] == 0.966
     assert recipe.frame_multipliers["resonance"] == 0.973
@@ -1614,11 +1892,18 @@ def test_ui_recipe_captures_scaled_spectrum_export_settings():
     assert recipe.overlap_windows == (
         OverlapWindowConfig("4.5 A", "2.5 A", 0.0033, 0.0038),
     )
+    assert PairScalingConfig(
+        "4.5 A",
+        "2.5 A",
+        PAIR_SCALING_NATIVE_FLUX,
+    ) in recipe.pair_scaling_methods
 
 
 def test_ui_load_recipe_restores_frame_multipliers(tmp_path):
     ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
     ui.export_scaled_spectra.value = True
+    ui.frame_scaling_mode.value = FRAME_SCALING_HYBRID_NATIVE_FLUX
+    ui.show_hybrid_flux_plots.value = False
     ui.frame_scale_widgets["6.3 A"].value = 1.06
     ui.frame_scale_widgets["4.5 A"].value = 1.01
     ui.frame_scale_widgets["2.5 A"].value = 0.966
@@ -1633,6 +1918,9 @@ def test_ui_load_recipe_restores_frame_multipliers(tmp_path):
     pair["auto"].value = False
     pair["minimum"].value = 0.11
     pair["maximum"].value = 0.19
+    pair["scaling_method"].value = PAIR_SCALING_NATIVE_FLUX
+    ui.frame_sample_flux_multipliers = {"0.3 A": 1.02, "resonance": 0.98}
+    ui.frame_ob_flux_multipliers = {"0.3 A": 1.01, "resonance": 1.0}
     recipe_path = ui.recipe().save(tmp_path / "scaled_recipe.json")
 
     restored = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
@@ -1640,6 +1928,16 @@ def test_ui_load_recipe_restores_frame_multipliers(tmp_path):
     restored._load_recipe(None)
 
     assert restored.export_scaled_spectra.value is True
+    assert restored.frame_scaling_mode.value == FRAME_SCALING_HYBRID_NATIVE_FLUX
+    assert restored.frame_sample_flux_multipliers == {
+        "0.3 A": 1.02,
+        "resonance": 0.98,
+    }
+    assert restored.frame_ob_flux_multipliers == {
+        "0.3 A": 1.01,
+        "resonance": 1.0,
+    }
+    assert restored.show_hybrid_flux_plots.value is False
     assert restored.frame_scale_widgets["6.3 A"].value == 1.06
     assert restored.frame_scale_widgets["4.5 A"].value == 1.01
     assert restored.frame_scale_widgets["2.5 A"].value == 0.966
@@ -1656,6 +1954,7 @@ def test_ui_load_recipe_restores_frame_multipliers(tmp_path):
     assert restored_pair["auto"].value is False
     assert restored_pair["minimum"].value == 0.11
     assert restored_pair["maximum"].value == 0.19
+    assert restored_pair["scaling_method"].value == PAIR_SCALING_NATIVE_FLUX
 
 
 def test_ui_header_path_browsers_select_directories_and_recipe(tmp_path, monkeypatch):
@@ -1715,6 +2014,69 @@ def test_overlap_diagnostic_reports_scale_without_applying_it():
     np.testing.assert_allclose(result.comparison_over_reference, 1.1, rtol=1e-12)
     np.testing.assert_allclose(result.scale_comparison_to_reference, 1 / 1.1, rtol=1e-12)
     assert result.point_count == 3
+
+
+def test_native_flux_overlap_fits_sample_and_ob_before_taking_scale_ratio():
+    reference = _flux_preview(
+        "reference",
+        [1.0, 2.0, 3.0, 4.0],
+        [100.0, 200.0, 300.0, 400.0],
+        [200.0, 400.0, 600.0, 800.0],
+    )
+    comparison = _flux_preview(
+        "comparison",
+        [1.5, 2.5, 3.5],
+        [75.0, 125.0, 175.0],
+        [75.0, 125.0, 175.0],
+    )
+    # Deliberately make the rebinned views unrelated. The native-flux
+    # estimator must use preview.native, not these output-bin arrays.
+    reference = replace(
+        reference,
+        energy_eV=np.asarray([100.0, 200.0]),
+        transmission=np.asarray([9.0, 9.0]),
+        uncertainty=np.asarray([1.0, 1.0]),
+    )
+    comparison = replace(
+        comparison,
+        energy_eV=np.asarray([150.0, 250.0]),
+        transmission=np.asarray([3.0, 3.0]),
+        uncertainty=np.asarray([1.0, 1.0]),
+    )
+
+    result = calculate_native_flux_overlap_diagnostics(reference, comparison)
+
+    assert isinstance(result, NativeFluxOverlapDiagnostics)
+    np.testing.assert_allclose(
+        result.sample.scale_comparison_to_reference,
+        2.0,
+        rtol=1e-12,
+    )
+    np.testing.assert_allclose(
+        result.ob.scale_comparison_to_reference,
+        4.0,
+        rtol=1e-12,
+    )
+    np.testing.assert_allclose(
+        result.transmission_scale_comparison_to_reference,
+        0.5,
+        rtol=1e-12,
+    )
+    assert result.sample.point_count == 3
+    assert result.ob.point_count == 3
+
+    arrays = native_flux_overlap_arrays(
+        reference,
+        comparison,
+        "sample",
+        reference_scale=1.0,
+        comparison_scale=2.0,
+    )
+    energy, reference_flux, _, raw_comparison, _, scaled_comparison, _ = arrays
+    np.testing.assert_allclose(energy, [1.5, 2.5, 3.5])
+    np.testing.assert_allclose(reference_flux, [150.0, 250.0, 350.0])
+    np.testing.assert_allclose(raw_comparison, [75.0, 125.0, 175.0])
+    np.testing.assert_allclose(scaled_comparison, reference_flux)
 
 
 def test_full_normalization_uses_separate_campaign_folders_and_snapshot(tmp_path, monkeypatch):
@@ -1982,29 +2344,11 @@ def test_stage3_spectrum_only_exports_rebinned_and_native_roi_profiles(tmp_path,
         "spectrum_normalization_profile_scaled_selected.txt"
     )
     native_path = profile_path.with_name("native_spectrum_normalization_inputs.txt")
-    native_profile_path = profile_path.with_name(
-        "spectrum_normalization_profile_native.txt"
-    )
-    native_scaled_path = profile_path.with_name(
-        "spectrum_normalization_profile_native_scaled.txt"
-    )
-    native_selected_path = profile_path.with_name(
-        "spectrum_normalization_profile_native_selected.txt"
-    )
-    native_scaled_selected_path = profile_path.with_name(
-        "spectrum_normalization_profile_native_scaled_selected.txt"
-    )
     profile = pd.read_csv(profile_path, comment="#")
     scaled = pd.read_csv(scaled_path, comment="#")
     selected = pd.read_csv(selected_path, comment="#")
     scaled_selected = pd.read_csv(scaled_selected_path, comment="#")
     native = pd.read_csv(native_path, comment="#")
-    native_profile = pd.read_csv(native_profile_path, comment="#")
-    native_scaled = pd.read_csv(native_scaled_path, comment="#")
-    native_selected = pd.read_csv(native_selected_path, comment="#")
-    native_scaled_selected = pd.read_csv(
-        native_scaled_selected_path, comment="#"
-    )
 
     np.testing.assert_allclose(profile["sample ROI counts"], [30.0, 70.0])
     np.testing.assert_allclose(profile["ob ROI counts"], [60.0, 140.0])
@@ -2029,83 +2373,10 @@ def test_stage3_spectrum_only_exports_rebinned_and_native_roi_profiles(tmp_path,
         native["native OB ROI uncertainty"],
         np.sqrt(ob_values),
     )
-    np.testing.assert_allclose(
-        native_profile["spectrum normalization"],
-        sample_values / ob_values,
-    )
-    np.testing.assert_allclose(
-        native_scaled["spectrum normalization"],
-        native_profile["spectrum normalization"] * 0.8,
-    )
-    np.testing.assert_allclose(
-        native_scaled["native sample ROI counts"],
-        native_profile["native sample ROI counts"],
-    )
-    assert np.all(native_selected["native_energy (eV)"] <= 1.0e6)
-    np.testing.assert_allclose(
-        native_scaled_selected["spectrum normalization"],
-        native_selected["spectrum normalization"] * 0.8,
-    )
-    assert "# grid: native, unrebinned TOF bins" in native_profile_path.read_text(
-        encoding="utf-8"
-    )
     assert "# native ROI input profile: native_spectrum_normalization_inputs.txt" in (
         profile_path.read_text(encoding="utf-8")
     )
     assert not any(campaign.rglob("stack"))
-
-
-def test_stage3_combines_multiple_sample_runs_by_default(tmp_path):
-    sample_1_path, sample_1_nexus = _write_run(
-        tmp_path,
-        "705",
-        [
-            np.asarray([[10]], dtype=np.uint16),
-            np.asarray([[20]], dtype=np.uint16),
-        ],
-    )
-    sample_2_path, sample_2_nexus = _write_run(
-        tmp_path,
-        "706",
-        [
-            np.asarray([[30]], dtype=np.uint16),
-            np.asarray([[40]], dtype=np.uint16),
-        ],
-    )
-    ob_path, ob_nexus = _write_run(
-        tmp_path,
-        "707",
-        [
-            np.asarray([[20]], dtype=np.uint16),
-            np.asarray([[40]], dtype=np.uint16),
-        ],
-    )
-    frame = _frame(
-        "resonance",
-        [
-            ("705", sample_1_path, sample_1_nexus),
-            ("706", sample_2_path, sample_2_nexus),
-        ],
-        [("707", ob_path, ob_nexus)],
-        RoiConfig(left=0, top=0, width=1, height=1),
-    )
-    assert frame.combine_sample_runs is True
-    recipe = MultiFrameRecipe(
-        working_dir=str(tmp_path),
-        frames=[frame],
-        output_root=str(tmp_path / "combined_output"),
-    )
-
-    campaign = MultiFramePreviewEngine(recipe).run_full_normalization(
-        "combined samples",
-        preview=False,
-    )
-    profile_paths = list(campaign.rglob("spectrum_normalization_profile.txt"))
-    assert len(profile_paths) == 1
-    profile = pd.read_csv(profile_paths[0], comment="#")
-    np.testing.assert_allclose(profile["sample ROI counts"], [20.0, 30.0])
-    np.testing.assert_allclose(profile["ob ROI counts"], [20.0, 40.0])
-    np.testing.assert_allclose(profile["spectrum normalization"], [1.0, 0.75])
 
 
 def test_stage3_measured_background_matches_count_domain_rebin(tmp_path):

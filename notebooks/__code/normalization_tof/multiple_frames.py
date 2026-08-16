@@ -74,6 +74,18 @@ NATIVE_SELECTED_SPECTRUM_PROFILE_NAME = (
 NATIVE_SCALED_SELECTED_SPECTRUM_PROFILE_NAME = (
     "spectrum_normalization_profile_native_scaled_selected.txt"
 )
+FRAME_SCALING_TRANSMISSION = "transmission"
+FRAME_SCALING_HYBRID_NATIVE_FLUX = "hybrid_native_flux"
+FRAME_SCALING_MODES = (
+    FRAME_SCALING_TRANSMISSION,
+    FRAME_SCALING_HYBRID_NATIVE_FLUX,
+)
+PAIR_SCALING_TRANSMISSION = "transmission"
+PAIR_SCALING_NATIVE_FLUX = "native_flux"
+PAIR_SCALING_METHODS = (
+    PAIR_SCALING_TRANSMISSION,
+    PAIR_SCALING_NATIVE_FLUX,
+)
 _SLIT_GAP_LOG_PATHS = {
     "horizontal": (
         "/entry/DASlogs/BL10:Mot:s1:X:Gap.RBV",
@@ -757,7 +769,12 @@ class MultiFrameRecipe:
     same_rois_all_frames: bool = False
     export_scaled_spectra: bool = False
     frame_multipliers: dict[str, float] = field(default_factory=dict)
+    frame_scaling_mode: str = FRAME_SCALING_TRANSMISSION
+    frame_sample_flux_multipliers: dict[str, float] = field(default_factory=dict)
+    frame_ob_flux_multipliers: dict[str, float] = field(default_factory=dict)
+    show_hybrid_flux_plots: bool = True
     overlap_windows: tuple["OverlapWindowConfig", ...] = ()
+    pair_scaling_methods: tuple["PairScalingConfig", ...] = ()
     show_prompt_flash_lines: bool = False
     recipe_version: int = RECIPE_VERSION
 
@@ -774,9 +791,41 @@ class MultiFrameRecipe:
             str(name): float(multiplier)
             for name, multiplier in values.get("frame_multipliers", {}).items()
         }
+        scaling_mode = str(
+            values.get("frame_scaling_mode", FRAME_SCALING_TRANSMISSION)
+        )
+        if scaling_mode not in FRAME_SCALING_MODES:
+            raise ValueError(
+                f"Unsupported frame scaling mode {scaling_mode!r}; expected one of "
+                f"{FRAME_SCALING_MODES}."
+            )
+        values["frame_scaling_mode"] = scaling_mode
+        for key in (
+            "frame_sample_flux_multipliers",
+            "frame_ob_flux_multipliers",
+        ):
+            multipliers = {
+                str(name): float(multiplier)
+                for name, multiplier in values.get(key, {}).items()
+            }
+            invalid = {
+                name: multiplier
+                for name, multiplier in multipliers.items()
+                if not np.isfinite(multiplier) or multiplier <= 0
+            }
+            if invalid:
+                raise ValueError(
+                    f"{key} values must be positive and finite; invalid values: "
+                    f"{invalid}."
+                )
+            values[key] = multipliers
         values["overlap_windows"] = tuple(
             OverlapWindowConfig.from_dict(item)
             for item in values.get("overlap_windows", ())
+        )
+        values["pair_scaling_methods"] = tuple(
+            PairScalingConfig.from_dict(item)
+            for item in values.get("pair_scaling_methods", ())
         )
         return cls(**values)
 
@@ -828,6 +877,36 @@ class OverlapWindowConfig:
             raise ValueError("Overlap maximum energy must be finite.")
         if self.energy_max_eV <= self.energy_min_eV:
             raise ValueError("Overlap maximum energy must be greater than minimum.")
+
+
+@dataclass(frozen=True)
+class PairScalingConfig:
+    """Scaling estimator selected for one adjacent pair of frames."""
+
+    frame_a: str
+    frame_b: str
+    method: str = PAIR_SCALING_TRANSMISSION
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "PairScalingConfig":
+        config = cls(
+            frame_a=str(values["frame_a"]),
+            frame_b=str(values["frame_b"]),
+            method=str(values.get("method", PAIR_SCALING_TRANSMISSION)),
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if not self.frame_a.strip() or not self.frame_b.strip():
+            raise ValueError("Pair-scaling frame names must be non-empty.")
+        if self.frame_a == self.frame_b:
+            raise ValueError("Pair scaling requires two different frames.")
+        if self.method not in PAIR_SCALING_METHODS:
+            raise ValueError(
+                f"Unsupported pair scaling method {self.method!r}; expected one of "
+                f"{PAIR_SCALING_METHODS}."
+            )
 
 
 def export_scaled_spectrum_profile(
@@ -1186,6 +1265,34 @@ class OverlapDiagnostics:
     scale_comparison_to_reference: float
     scale_uncertainty: float
     reduced_chi_square: float
+
+
+@dataclass(frozen=True)
+class FluxScaleDiagnostics:
+    """Multiplicative native-flux fit for one sample or open-beam channel."""
+
+    channel: str
+    energy_min_eV: float
+    energy_max_eV: float
+    point_count: int
+    comparison_over_reference: float
+    scale_comparison_to_reference: float
+    scale_uncertainty: float
+    reduced_chi_square: float
+
+
+@dataclass(frozen=True)
+class NativeFluxOverlapDiagnostics:
+    """Separate native sample/OB fits and their implied transmission scale."""
+
+    reference_name: str
+    comparison_name: str
+    energy_min_eV: float
+    energy_max_eV: float
+    sample: FluxScaleDiagnostics
+    ob: FluxScaleDiagnostics
+    transmission_scale_comparison_to_reference: float
+    transmission_scale_uncertainty: float
 
 
 def _path_signature(path: Path | None) -> dict[str, Any] | None:
@@ -2466,6 +2573,294 @@ def calculate_overlap_diagnostics(
         scale_uncertainty=scale_uncertainty,
         reduced_chi_square=reduced_chi_square,
     )
+
+
+def calculate_native_flux_overlap_diagnostics(
+    reference: RebinnedFramePreview,
+    comparison: RebinnedFramePreview,
+    energy_window_eV: tuple[float, float] | None = None,
+    *,
+    reference_sample_scale: float = 1.0,
+    reference_ob_scale: float = 1.0,
+) -> NativeFluxOverlapDiagnostics:
+    """Fit native sample and OB flux scales before deriving a transmission scale.
+
+    The native profiles are already corrected and proton-charge normalized by
+    :meth:`MultiFramePreviewEngine.load_frame`. Each fit maps the unscaled
+    comparison channel onto the globally scaled reference channel. The ratio of
+    those two fitted channel scales is therefore the absolute multiplier for the
+    comparison transmission.
+    """
+    for label, scale in (
+        ("reference sample", reference_sample_scale),
+        ("reference OB", reference_ob_scale),
+    ):
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError(f"The {label} scale must be positive and finite.")
+
+    sample = _fit_native_flux_channel(
+        reference,
+        comparison,
+        channel="sample",
+        energy_window_eV=energy_window_eV,
+        reference_scale=float(reference_sample_scale),
+    )
+    ob = _fit_native_flux_channel(
+        reference,
+        comparison,
+        channel="ob",
+        energy_window_eV=energy_window_eV,
+        reference_scale=float(reference_ob_scale),
+    )
+    transmission_scale = (
+        sample.scale_comparison_to_reference / ob.scale_comparison_to_reference
+    )
+    relative_variance = (
+        (sample.scale_uncertainty / sample.scale_comparison_to_reference) ** 2
+        + (ob.scale_uncertainty / ob.scale_comparison_to_reference) ** 2
+    )
+    transmission_uncertainty = abs(transmission_scale) * np.sqrt(relative_variance)
+    return NativeFluxOverlapDiagnostics(
+        reference_name=reference.name,
+        comparison_name=comparison.name,
+        energy_min_eV=max(sample.energy_min_eV, ob.energy_min_eV),
+        energy_max_eV=min(sample.energy_max_eV, ob.energy_max_eV),
+        sample=sample,
+        ob=ob,
+        transmission_scale_comparison_to_reference=float(transmission_scale),
+        transmission_scale_uncertainty=float(transmission_uncertainty),
+    )
+
+
+def native_flux_overlap_arrays(
+    reference: RebinnedFramePreview,
+    comparison: RebinnedFramePreview,
+    channel: str,
+    energy_window_eV: tuple[float, float] | None = None,
+    *,
+    reference_scale: float = 1.0,
+    comparison_scale: float = 1.0,
+) -> tuple[np.ndarray, ...]:
+    """Return aligned native flux arrays for overlap-scaling diagnostics.
+
+    Returned arrays are comparison-grid energy, scaled interpolated reference
+    flux and uncertainty, raw comparison flux and uncertainty, and scaled
+    comparison flux and uncertainty.
+    """
+    for label, scale in (
+        ("reference", reference_scale),
+        ("comparison", comparison_scale),
+    ):
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError(f"The {label} flux scale must be positive and finite.")
+
+    energy, reference_flux, reference_variance, comparison_flux, comparison_variance = (
+        _aligned_native_flux_arrays(
+            reference,
+            comparison,
+            channel=channel,
+            energy_window_eV=energy_window_eV,
+        )
+    )
+    valid = (
+        np.isfinite(reference_flux)
+        & np.isfinite(reference_variance)
+        & np.isfinite(comparison_flux)
+        & np.isfinite(comparison_variance)
+        & (reference_flux > 0)
+        & (comparison_flux > 0)
+        & (reference_variance >= 0)
+        & (comparison_variance >= 0)
+    )
+    energy = energy[valid]
+    reference_flux = reference_flux[valid]
+    reference_uncertainty = np.sqrt(reference_variance[valid])
+    comparison_flux = comparison_flux[valid]
+    comparison_uncertainty = np.sqrt(comparison_variance[valid])
+    return (
+        energy,
+        reference_flux * reference_scale,
+        reference_uncertainty * abs(reference_scale),
+        comparison_flux,
+        comparison_uncertainty,
+        comparison_flux * comparison_scale,
+        comparison_uncertainty * abs(comparison_scale),
+    )
+
+
+def _fit_native_flux_channel(
+    reference: RebinnedFramePreview,
+    comparison: RebinnedFramePreview,
+    *,
+    channel: str,
+    energy_window_eV: tuple[float, float] | None,
+    reference_scale: float,
+) -> FluxScaleDiagnostics:
+    energy, reference_flux, reference_variance, comparison_flux, comparison_variance = (
+        _aligned_native_flux_arrays(
+            reference,
+            comparison,
+            channel=channel,
+            energy_window_eV=energy_window_eV,
+        )
+    )
+    reference_flux = reference_flux * reference_scale
+    reference_variance = reference_variance * reference_scale**2
+    valid = (
+        np.isfinite(reference_flux)
+        & np.isfinite(reference_variance)
+        & np.isfinite(comparison_flux)
+        & np.isfinite(comparison_variance)
+        & (reference_flux > 0)
+        & (comparison_flux > 0)
+        & (reference_variance >= 0)
+        & (comparison_variance >= 0)
+    )
+    energy = energy[valid]
+    reference_flux = reference_flux[valid]
+    reference_variance = reference_variance[valid]
+    comparison_flux = comparison_flux[valid]
+    comparison_variance = comparison_variance[valid]
+    if len(energy) < 2:
+        raise ValueError(
+            f"Native {channel} flux overlap needs at least two positive finite points."
+        )
+
+    log_ratio = np.log(comparison_flux) - np.log(reference_flux)
+    log_ratio_variance = (
+        comparison_variance / comparison_flux**2
+        + reference_variance / reference_flux**2
+    )
+    weighted = np.isfinite(log_ratio_variance) & (log_ratio_variance > 0)
+    if np.sum(weighted) >= 2:
+        energy = energy[weighted]
+        log_ratio = log_ratio[weighted]
+        weights = 1.0 / log_ratio_variance[weighted]
+        mean_log_ratio = float(np.sum(weights * log_ratio) / np.sum(weights))
+        log_ratio_uncertainty = float(np.sqrt(1.0 / np.sum(weights)))
+        chi_square = float(np.sum(weights * (log_ratio - mean_log_ratio) ** 2))
+        reduced_chi_square = chi_square / max(len(log_ratio) - 1, 1)
+    else:
+        mean_log_ratio = float(np.mean(log_ratio))
+        log_ratio_uncertainty = float(
+            np.std(log_ratio, ddof=1) / np.sqrt(len(log_ratio))
+        )
+        reduced_chi_square = float("nan")
+
+    comparison_over_reference = float(np.exp(mean_log_ratio))
+    scale = float(np.exp(-mean_log_ratio))
+    scale_uncertainty = float(scale * log_ratio_uncertainty)
+    return FluxScaleDiagnostics(
+        channel=channel,
+        energy_min_eV=float(np.min(energy)),
+        energy_max_eV=float(np.max(energy)),
+        point_count=len(energy),
+        comparison_over_reference=comparison_over_reference,
+        scale_comparison_to_reference=scale,
+        scale_uncertainty=scale_uncertainty,
+        reduced_chi_square=float(reduced_chi_square),
+    )
+
+
+def _aligned_native_flux_arrays(
+    reference: RebinnedFramePreview,
+    comparison: RebinnedFramePreview,
+    *,
+    channel: str,
+    energy_window_eV: tuple[float, float] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ref_e, ref_flux, ref_variance = _finite_sorted_native_flux(reference, channel)
+    cmp_e, cmp_flux, cmp_variance = _finite_sorted_native_flux(comparison, channel)
+    overlap_min = max(float(np.min(ref_e)), float(np.min(cmp_e)))
+    overlap_max = min(float(np.max(ref_e)), float(np.max(cmp_e)))
+    if energy_window_eV is not None:
+        overlap_min = max(overlap_min, float(min(energy_window_eV)))
+        overlap_max = min(overlap_max, float(max(energy_window_eV)))
+    if overlap_min >= overlap_max:
+        raise ValueError(
+            f"{reference.name} and {comparison.name} have no common native {channel} "
+            "flux coverage."
+        )
+
+    mask = (cmp_e >= overlap_min) & (cmp_e <= overlap_max)
+    energy = cmp_e[mask]
+    comparison_flux = cmp_flux[mask]
+    comparison_variance = cmp_variance[mask]
+    reference_flux, reference_variance = _interpolate_with_variance(
+        energy,
+        ref_e,
+        ref_flux,
+        ref_variance,
+    )
+    return (
+        energy,
+        reference_flux,
+        reference_variance,
+        comparison_flux,
+        comparison_variance,
+    )
+
+
+def _finite_sorted_native_flux(
+    preview: RebinnedFramePreview,
+    channel: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    normalized_channel = str(channel).strip().lower()
+    if normalized_channel == "sample":
+        values = preview.native.sample_counts
+        variance = preview.native.sample_variance
+    elif normalized_channel in {"ob", "open beam", "open-beam"}:
+        values = preview.native.ob_counts
+        variance = preview.native.ob_variance
+    else:
+        raise ValueError("Native flux channel must be 'sample' or 'ob'.")
+
+    energy = np.asarray(preview.native.energy_eV, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    variance = np.asarray(variance, dtype=np.float64)
+    valid = (
+        np.isfinite(energy)
+        & (energy > 0)
+        & np.isfinite(values)
+        & np.isfinite(variance)
+        & (variance >= 0)
+    )
+    order = np.argsort(energy[valid])
+    energy = energy[valid][order]
+    values = values[valid][order]
+    variance = variance[valid][order]
+    unique_energy, unique_indices = np.unique(energy, return_index=True)
+    return unique_energy, values[unique_indices], variance[unique_indices]
+
+
+def _interpolate_with_variance(
+    target: np.ndarray,
+    source_x: np.ndarray,
+    source_y: np.ndarray,
+    source_variance: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Linearly interpolate values and propagate independent endpoint variances."""
+    target = np.asarray(target, dtype=np.float64)
+    if len(source_x) < 2:
+        raise ValueError("Native flux interpolation needs at least two reference points.")
+    upper = np.searchsorted(source_x, target, side="right")
+    upper = np.clip(upper, 1, len(source_x) - 1)
+    lower = upper - 1
+    span = source_x[upper] - source_x[lower]
+    fraction = np.divide(
+        target - source_x[lower],
+        span,
+        out=np.zeros_like(target),
+        where=span > 0,
+    )
+    fraction = np.clip(fraction, 0.0, 1.0)
+    lower_weight = 1.0 - fraction
+    values = lower_weight * source_y[lower] + fraction * source_y[upper]
+    variance = (
+        lower_weight**2 * source_variance[lower]
+        + fraction**2 * source_variance[upper]
+    )
+    return values, variance
 
 
 def overlap_ratio_arrays(

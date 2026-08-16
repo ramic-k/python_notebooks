@@ -11,6 +11,7 @@ import ipywidgets as widgets
 import numpy as np
 import plotly.graph_objects as go
 from IPython.display import HTML, clear_output, display
+from plotly.subplots import make_subplots
 
 from __code.ipywe.fileselector import FileSelectorPanel
 from __code.normalization_tof import (
@@ -22,18 +23,25 @@ from __code.normalization_tof import (
 from __code.normalization_tof.multiple_frames import (
     AutoRoiConfig,
     BlackFilterBackgroundConfig,
+    FRAME_SCALING_HYBRID_NATIVE_FLUX,
+    FRAME_SCALING_TRANSMISSION,
+    PAIR_SCALING_NATIVE_FLUX,
+    PAIR_SCALING_TRANSMISSION,
     FrameConfig,
     MeasuredBackgroundConfig,
     MultiFramePreviewEngine,
     MultiFrameRecipe,
     OverlapWindowConfig,
+    PairScalingConfig,
     RebinnedFramePreview,
     RebinConfig,
     RoiConfig,
     RunSpec,
     calculate_overlap_diagnostics,
+    calculate_native_flux_overlap_diagnostics,
     convert_tof_schedule_to_energy_schedule,
     load_integrated_image_preview,
+    native_flux_overlap_arrays,
     overlap_ratio_arrays,
     parse_run_numbers,
     propose_roi_from_nexus,
@@ -1964,10 +1972,31 @@ class MultiFrameNormalizationTof:
         )
         self.overlap_window_widgets: dict[tuple[str, str], dict[str, Any]] = {}
         self._overlap_window_state_cache: dict[
-            tuple[str, str], tuple[bool, float, float]
+            tuple[str, str], tuple[bool, float, float, str]
         ] = {}
         self.overlap_window_box = widgets.VBox()
+        self.frame_scaling_mode = widgets.Dropdown(
+            options=(
+                ("Set all pairs to transmission", FRAME_SCALING_TRANSMISSION),
+                (
+                    "Preset: highest pair transmission, lower pairs native flux",
+                    FRAME_SCALING_HYBRID_NATIVE_FLUX,
+                ),
+            ),
+            value=FRAME_SCALING_TRANSMISSION,
+            description="Pair-method preset",
+            layout=_layout("680px"),
+        )
+        self.show_hybrid_flux_plots = widgets.Checkbox(
+            value=True,
+            description="Show native sample/OB flux scaling plots",
+            indent=False,
+            disabled=True,
+            layout=_layout("380px"),
+        )
         self.frame_scale_widgets: dict[str, widgets.BoundedFloatText] = {}
+        self.frame_sample_flux_multipliers: dict[str, float] = {}
+        self.frame_ob_flux_multipliers: dict[str, float] = {}
         self.frame_scale_box = widgets.HBox(layout=_wrapping_row_layout())
         self.reset_frame_scales_button = widgets.Button(
             description="Reset preview scales",
@@ -1977,7 +2006,7 @@ class MultiFrameNormalizationTof:
             description="Auto-scale from highest energy",
             icon="magic",
             button_style="info",
-            layout=_layout("280px"),
+            layout=_layout("340px"),
         )
         self.frame_scale_status = widgets.HTML()
         self.frame_output_range_box = widgets.VBox()
@@ -2071,7 +2100,8 @@ class MultiFrameNormalizationTof:
                 widgets.HTML(
                     "<span style='font-size:12px'>Each row applies to one adjacent frame pair. "
                     "Leave <b>Auto</b> checked to use their full common energy coverage, or "
-                    "uncheck it and enter the fit limits in eV.</span>"
+                    "uncheck it and enter the fit limits in eV. Choose the scaling estimator "
+                    "independently for every pair.</span>"
                 ),
                 self.overlap_window_box,
                 widgets.HBox(
@@ -2082,6 +2112,16 @@ class MultiFrameNormalizationTof:
                         self.force_reload,
                     ],
                     layout=_wrapping_row_layout(),
+                ),
+                widgets.HTML("<b>Frame scaling</b>"),
+                self.frame_scaling_mode,
+                self.show_hybrid_flux_plots,
+                widgets.HTML(
+                    "<span style='font-size:12px'>The preset only initializes the per-pair "
+                    "selectors above. Native-flux pairs fit corrected, proton-charge-normalized "
+                    "sample and OB fluxes separately before rebinning; their scale ratio sets "
+                    "the transmission multiplier. The anchor is always the frame with the "
+                    "highest measured energy coverage, regardless of its name.</span>"
                 ),
                 widgets.HTML("<b>Frame multipliers</b>"),
                 self.frame_scale_box,
@@ -2157,7 +2197,20 @@ class MultiFrameNormalizationTof:
                 for frame in frames
                 if frame.enabled
             },
+            frame_scaling_mode=self.frame_scaling_mode.value,
+            frame_sample_flux_multipliers={
+                name: float(multiplier)
+                for name, multiplier in self.frame_sample_flux_multipliers.items()
+                if name in names
+            },
+            frame_ob_flux_multipliers={
+                name: float(multiplier)
+                for name, multiplier in self.frame_ob_flux_multipliers.items()
+                if name in names
+            },
+            show_hybrid_flux_plots=self.show_hybrid_flux_plots.value,
             overlap_windows=self._manual_overlap_window_configs(),
+            pair_scaling_methods=self._pair_scaling_configs(),
             show_prompt_flash_lines=self.show_prompt_flash_lines.value,
         )
 
@@ -2180,6 +2233,8 @@ class MultiFrameNormalizationTof:
         self.show_native.observe(self._plot_setting_changed, names="value")
         self.show_errors.observe(self._plot_setting_changed, names="value")
         self.show_prompt_flash_lines.observe(self._plot_setting_changed, names="value")
+        self.frame_scaling_mode.observe(self._frame_scaling_mode_changed, names="value")
+        self.show_hybrid_flux_plots.observe(self._plot_setting_changed, names="value")
         self.same_rois_all_frames.observe(self._same_rois_all_frames_changed, names="value")
         self.enable_spectrum_only_all_button.on_click(
             lambda _button: self._set_all_spectrum_only(True)
@@ -2337,7 +2392,21 @@ class MultiFrameNormalizationTof:
                 bool(controls["auto"].value),
                 float(controls["minimum"].value),
                 float(controls["maximum"].value),
+                str(controls["scaling_method"].value),
             )
+
+    def _preset_pair_scaling_method(
+        self,
+        pair_index: int,
+        pair_count: int,
+    ) -> str:
+        if self.frame_scaling_mode.value == FRAME_SCALING_TRANSMISSION:
+            return PAIR_SCALING_TRANSMISSION
+        return (
+            PAIR_SCALING_TRANSMISSION
+            if pair_index == pair_count - 1
+            else PAIR_SCALING_NATIVE_FLUX
+        )
 
     def _refresh_overlap_window_controls(self, names: list[str]) -> None:
         self._cache_overlap_window_states()
@@ -2345,10 +2414,19 @@ class MultiFrameNormalizationTof:
         rows = []
         self._updating_overlap_windows = True
         try:
-            for frame_a, frame_b in zip(names[:-1], names[1:]):
+            pairs = list(zip(names[:-1], names[1:]))
+            for pair_index, (frame_a, frame_b) in enumerate(pairs):
                 key = self._overlap_pair_key(frame_a, frame_b)
-                automatic, minimum_value, maximum_value = (
-                    self._overlap_window_state_cache.get(key, (True, 0.0, 0.0))
+                automatic, minimum_value, maximum_value, scaling_method = (
+                    self._overlap_window_state_cache.get(
+                        key,
+                        (
+                            True,
+                            0.0,
+                            0.0,
+                            self._preset_pair_scaling_method(pair_index, len(pairs)),
+                        ),
+                    )
                 )
                 automatic_control = widgets.Checkbox(
                     value=automatic,
@@ -2368,12 +2446,25 @@ class MultiFrameNormalizationTof:
                     disabled=automatic,
                     layout=_layout("230px"),
                 )
+                scaling_method_control = widgets.Dropdown(
+                    options=(
+                        ("Transmission", PAIR_SCALING_TRANSMISSION),
+                        ("Native sample/OB flux", PAIR_SCALING_NATIVE_FLUX),
+                    ),
+                    value=scaling_method,
+                    description="scale with",
+                    layout=_layout("300px"),
+                )
                 automatic_control.observe(
                     self._overlap_window_setting_changed,
                     names="value",
                 )
                 minimum_control.observe(self._overlap_window_setting_changed, names="value")
                 maximum_control.observe(self._overlap_window_setting_changed, names="value")
+                scaling_method_control.observe(
+                    self._pair_scaling_setting_changed,
+                    names="value",
+                )
                 row = widgets.HBox(
                     [
                         widgets.HTML(
@@ -2383,6 +2474,7 @@ class MultiFrameNormalizationTof:
                         automatic_control,
                         minimum_control,
                         maximum_control,
+                        scaling_method_control,
                     ],
                     layout=_wrapping_row_layout(),
                 )
@@ -2392,12 +2484,14 @@ class MultiFrameNormalizationTof:
                     "auto": automatic_control,
                     "minimum": minimum_control,
                     "maximum": maximum_control,
+                    "scaling_method": scaling_method_control,
                 }
                 rows.append(row)
         finally:
             self._updating_overlap_windows = False
         self.overlap_window_widgets = controls_by_pair
         self.overlap_window_box.children = tuple(rows)
+        self._update_native_flux_plot_control()
 
     def _overlap_window_setting_changed(self, _change=None) -> None:
         for controls in self.overlap_window_widgets.values():
@@ -2411,6 +2505,20 @@ class MultiFrameNormalizationTof:
             self._manual_overlap_window_configs()
         except ValueError:
             return
+        self._plot_setting_changed()
+
+    def _pair_scaling_setting_changed(self, _change=None) -> None:
+        self._cache_overlap_window_states()
+        if self._updating_overlap_windows:
+            return
+        self.frame_sample_flux_multipliers.clear()
+        self.frame_ob_flux_multipliers.clear()
+        self._update_native_flux_plot_control()
+        self.frame_scale_status.value = (
+            "<span style='font-size:12px; color:#7a5200'>"
+            "A pair scaling method changed; run automatic scaling to refresh the "
+            "frame multipliers and native-flux diagnostics.</span>"
+        )
         self._plot_setting_changed()
 
     def _manual_overlap_window_configs(self) -> tuple[OverlapWindowConfig, ...]:
@@ -2428,6 +2536,18 @@ class MultiFrameNormalizationTof:
             windows.append(window)
         return tuple(windows)
 
+    def _pair_scaling_configs(self) -> tuple[PairScalingConfig, ...]:
+        configs = []
+        for controls in self.overlap_window_widgets.values():
+            config = PairScalingConfig(
+                frame_a=str(controls["frame_a"]),
+                frame_b=str(controls["frame_b"]),
+                method=str(controls["scaling_method"].value),
+            )
+            config.validate()
+            configs.append(config)
+        return tuple(configs)
+
     def _restore_overlap_windows(
         self,
         windows: tuple[OverlapWindowConfig, ...],
@@ -2441,6 +2561,12 @@ class MultiFrameNormalizationTof:
                     False,
                     float(window.energy_min_eV),
                     float(window.energy_max_eV),
+                    str(
+                        self._overlap_window_state_cache.get(
+                            key,
+                            (True, 0.0, 0.0, PAIR_SCALING_TRANSMISSION),
+                        )[3]
+                    ),
                 )
                 controls = self.overlap_window_widgets.get(key)
                 if controls is None:
@@ -2454,7 +2580,47 @@ class MultiFrameNormalizationTof:
             self._updating_overlap_windows = False
         self._cache_overlap_window_states()
 
+    def _restore_pair_scaling_methods(
+        self,
+        configs: tuple[PairScalingConfig, ...],
+    ) -> None:
+        self._updating_overlap_windows = True
+        try:
+            for config in configs:
+                config.validate()
+                key = self._overlap_pair_key(config.frame_a, config.frame_b)
+                automatic, minimum, maximum, _method = (
+                    self._overlap_window_state_cache.get(
+                        key,
+                        (True, 0.0, 0.0, PAIR_SCALING_TRANSMISSION),
+                    )
+                )
+                self._overlap_window_state_cache[key] = (
+                    automatic,
+                    minimum,
+                    maximum,
+                    config.method,
+                )
+                controls = self.overlap_window_widgets.get(key)
+                if controls is not None:
+                    controls["scaling_method"].value = config.method
+        finally:
+            self._updating_overlap_windows = False
+        self._cache_overlap_window_states()
+        self._update_native_flux_plot_control()
+
     def _refresh_frame_scale_controls(self, names: list[str]) -> None:
+        active_names = set(names)
+        self.frame_sample_flux_multipliers = {
+            name: multiplier
+            for name, multiplier in self.frame_sample_flux_multipliers.items()
+            if name in active_names
+        }
+        self.frame_ob_flux_multipliers = {
+            name: multiplier
+            for name, multiplier in self.frame_ob_flux_multipliers.items()
+            if name in active_names
+        }
         if tuple(self.frame_scale_widgets) == tuple(names):
             return
         old_values = {
@@ -2473,10 +2639,27 @@ class MultiFrameNormalizationTof:
                 layout=_layout("230px"),
             )
             control.style.description_width = "initial"
-            control.observe(self._plot_setting_changed, names="value")
+            control.observe(self._frame_scale_changed, names="value")
             controls[name] = control
         self.frame_scale_widgets = controls
         self.frame_scale_box.children = tuple(controls.values())
+
+    def _pair_scaling_method(self, frame_a: str, frame_b: str) -> str:
+        controls = self.overlap_window_widgets.get(
+            self._overlap_pair_key(frame_a, frame_b)
+        )
+        if controls is None:
+            return PAIR_SCALING_TRANSMISSION
+        return str(controls["scaling_method"].value)
+
+    def _has_native_flux_pairs(self) -> bool:
+        return any(
+            controls["scaling_method"].value == PAIR_SCALING_NATIVE_FLUX
+            for controls in self.overlap_window_widgets.values()
+        )
+
+    def _update_native_flux_plot_control(self) -> None:
+        self.show_hybrid_flux_plots.disabled = not self._has_native_flux_pairs()
 
     def _reset_frame_scales(self, _button=None) -> None:
         self._updating_frame_scales = True
@@ -2486,9 +2669,47 @@ class MultiFrameNormalizationTof:
                 control.disabled = False
         finally:
             self._updating_frame_scales = False
+        self.frame_sample_flux_multipliers.clear()
+        self.frame_ob_flux_multipliers.clear()
         self.frame_scale_status.value = ""
         if self.engine is not None and self.engine.previews:
             self._draw_plot()
+
+    def _frame_scaling_mode_changed(self, _change=None) -> None:
+        controls = list(self.overlap_window_widgets.values())
+        self._updating_overlap_windows = True
+        try:
+            for pair_index, pair_controls in enumerate(controls):
+                pair_controls["scaling_method"].value = (
+                    self._preset_pair_scaling_method(pair_index, len(controls))
+                )
+        finally:
+            self._updating_overlap_windows = False
+        self._cache_overlap_window_states()
+        self._update_native_flux_plot_control()
+        self.auto_frame_scales_button.description = "Auto-scale selected pair methods"
+        self.frame_sample_flux_multipliers.clear()
+        self.frame_ob_flux_multipliers.clear()
+        self.frame_scale_status.value = (
+            "<span style='font-size:12px; color:#7a5200'>"
+            "Pair-method preset applied; adjust any pair selector if needed, then "
+            "run automatic scaling to refresh the fitted "
+            "frame multipliers.</span>"
+        )
+        self._plot_setting_changed()
+
+    def _frame_scale_changed(self, _change=None) -> None:
+        if self._updating_frame_scales:
+            return
+        if self._has_native_flux_pairs():
+            self.frame_sample_flux_multipliers.clear()
+            self.frame_ob_flux_multipliers.clear()
+            self.frame_scale_status.value = (
+                "<span style='font-size:12px; color:#7a5200'>"
+                "A frame multiplier changed; rerun automatic scaling to refresh "
+                "the native sample/OB flux factors and plots.</span>"
+            )
+        self._plot_setting_changed()
 
     @staticmethod
     def _maximum_usable_energy(preview: RebinnedFramePreview) -> float:
@@ -2528,11 +2749,42 @@ class MultiFrameNormalizationTof:
                     "positive and finite."
                 )
 
+            native_pair_names = {
+                name
+                for frame_a, frame_b in zip(names[:-1], names[1:])
+                if self._pair_scaling_method(frame_a, frame_b)
+                == PAIR_SCALING_NATIVE_FLUX
+                for name in (frame_a, frame_b)
+            }
+            if native_pair_names:
+                configs_by_name = {
+                    editor.name.value: editor.to_config()
+                    for editor in self.frame_editors
+                    if editor.enabled.value and editor.name.value
+                }
+                for name in sorted(native_pair_names):
+                    config = self.loaded_frame_configs.get(name, configs_by_name.get(name))
+                    if config is None:
+                        raise ValueError(f"Could not resolve the loaded settings for {name}.")
+                    if not config.use_proton_charge:
+                        raise ValueError(
+                            f"{name}: native-flux pair scaling requires proton-charge "
+                            "normalization."
+                        )
+                    if config.container_roi is not None or config.container_roi_file:
+                        raise ValueError(
+                            f"{name}: container correction is not present in the fast native "
+                            "ROI preview, so native-flux pair scaling is unavailable."
+                        )
+
             fitted_scales = {anchor_name: anchor_scale}
+            sample_flux_scales = {anchor_name: anchor_scale}
+            ob_flux_scales = {anchor_name: 1.0}
             result_lines = [
                 f"{anchor_name} x{anchor_scale:.7g} (editable highest-energy anchor; "
                 f"Emax={maximum_energy[anchor_name]:.6g} eV)"
             ]
+            reference_name = anchor_name
             reference = self._scaled_preview_for_plot(
                 self.engine.previews[anchor_name],
                 anchor_scale,
@@ -2540,26 +2792,71 @@ class MultiFrameNormalizationTof:
             for comparison_name in reversed(names[:-1]):
                 comparison = self.engine.previews[comparison_name]
                 fit_window = self._overlap_window_for_pair(
-                    reference.name,
+                    reference_name,
                     comparison_name,
                     manual_window=None,
                 )
-                diagnostics = calculate_overlap_diagnostics(
+                transmission_diagnostics = calculate_overlap_diagnostics(
                     reference,
                     comparison,
                     fit_window,
                 )
-                scale = float(diagnostics.scale_comparison_to_reference)
+                pair_method = self._pair_scaling_method(
+                    reference_name,
+                    comparison_name,
+                )
+                if pair_method == PAIR_SCALING_NATIVE_FLUX:
+                    flux_diagnostics = calculate_native_flux_overlap_diagnostics(
+                        self.engine.previews[reference_name],
+                        comparison,
+                        fit_window,
+                        reference_sample_scale=sample_flux_scales[reference_name],
+                        reference_ob_scale=ob_flux_scales[reference_name],
+                    )
+                    sample_flux_scales[comparison_name] = float(
+                        flux_diagnostics.sample.scale_comparison_to_reference
+                    )
+                    ob_flux_scales[comparison_name] = float(
+                        flux_diagnostics.ob.scale_comparison_to_reference
+                    )
+                    scale = float(
+                        flux_diagnostics.transmission_scale_comparison_to_reference
+                    )
+                    result_lines.append(
+                        f"{comparison_name} x{scale:.7g} from native fluxes: "
+                        f"sample x{sample_flux_scales[comparison_name]:.7g} "
+                        f"({flux_diagnostics.sample.point_count} overlap points, chi2r="
+                        f"{flux_diagnostics.sample.reduced_chi_square:.3g}); "
+                        f"OB x{ob_flux_scales[comparison_name]:.7g} "
+                        f"({flux_diagnostics.ob.point_count} overlap points, chi2r="
+                        f"{flux_diagnostics.ob.reduced_chi_square:.3g}); "
+                        f"direct-transmission comparison x"
+                        f"{transmission_diagnostics.scale_comparison_to_reference:.7g} "
+                        f"(chi2r={transmission_diagnostics.reduced_chi_square:.3g})"
+                    )
+                else:
+                    scale = float(
+                        transmission_diagnostics.scale_comparison_to_reference
+                    )
+                    # A transmission multiplier does not uniquely determine two
+                    # channel factors. Preserve the reference OB gauge and assign
+                    # the sample factor needed to reproduce the fitted transmission
+                    # multiplier. This keeps a following native-flux fit chainable.
+                    ob_flux_scales[comparison_name] = ob_flux_scales[reference_name]
+                    sample_flux_scales[comparison_name] = (
+                        scale * ob_flux_scales[comparison_name]
+                    )
+                    result_lines.append(
+                        f"{comparison_name} x{scale:.7g} from transmission "
+                        f"({transmission_diagnostics.point_count} overlap points, chi2r="
+                        f"{transmission_diagnostics.reduced_chi_square:.3g})"
+                    )
                 if not np.isfinite(scale) or scale <= 0:
                     raise ValueError(
                         f"Could not determine a positive finite scale for {comparison_name}."
                     )
                 fitted_scales[comparison_name] = scale
-                result_lines.append(
-                    f"{comparison_name} x{scale:.7g} "
-                    f"({diagnostics.point_count} overlap points, "
-                    f"reduced chi2={diagnostics.reduced_chi_square:.3g})"
-                )
+                reference_name = comparison_name
                 reference = self._scaled_preview_for_plot(comparison, scale)
 
             self._updating_frame_scales = True
@@ -2570,6 +2867,12 @@ class MultiFrameNormalizationTof:
                         control.value = fitted_scales[name]
             finally:
                 self._updating_frame_scales = False
+            if native_pair_names:
+                self.frame_sample_flux_multipliers = sample_flux_scales
+                self.frame_ob_flux_multipliers = ob_flux_scales
+            else:
+                self.frame_sample_flux_multipliers.clear()
+                self.frame_ob_flux_multipliers.clear()
             self.frame_scale_status.value = (
                 "<span style='font-size:12px; color:#176b36'>"
                 + "<br>".join(_escape(line) for line in result_lines)
@@ -2602,6 +2905,194 @@ class MultiFrameNormalizationTof:
             uncertainty=np.asarray(preview.uncertainty) * abs(scale),
             native=scaled_native,
         )
+
+    def _hybrid_flux_scaling_figures(
+        self,
+        selected_names: list[str],
+        color_by_name: dict[str, str],
+    ) -> list[go.Figure]:
+        if (
+            not self.show_hybrid_flux_plots.value
+            or len(selected_names) < 2
+        ):
+            return []
+        if not self.frame_sample_flux_multipliers or not self.frame_ob_flux_multipliers:
+            return []
+
+        input_order = {name: index for index, name in enumerate(selected_names)}
+        maximum_energy = {
+            name: self._maximum_usable_energy(self.engine.previews[name])
+            for name in selected_names
+        }
+        names = sorted(
+            selected_names,
+            key=lambda name: (maximum_energy[name], input_order[name]),
+        )
+        figures = []
+        for comparison_name, reference_name in zip(names[:-1], names[1:]):
+            if (
+                self._pair_scaling_method(reference_name, comparison_name)
+                != PAIR_SCALING_NATIVE_FLUX
+            ):
+                continue
+            if (
+                comparison_name not in self.frame_sample_flux_multipliers
+                or reference_name not in self.frame_sample_flux_multipliers
+                or comparison_name not in self.frame_ob_flux_multipliers
+                or reference_name not in self.frame_ob_flux_multipliers
+            ):
+                continue
+            fit_window = self._overlap_window_for_pair(
+                reference_name,
+                comparison_name,
+                manual_window=None,
+            )
+            figure = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.11,
+                subplot_titles=("Sample native ROI flux", "Open-beam native ROI flux"),
+            )
+            channel_settings = (
+                (
+                    "sample",
+                    self.frame_sample_flux_multipliers[reference_name],
+                    self.frame_sample_flux_multipliers[comparison_name],
+                    1,
+                ),
+                (
+                    "ob",
+                    self.frame_ob_flux_multipliers[reference_name],
+                    self.frame_ob_flux_multipliers[comparison_name],
+                    2,
+                ),
+            )
+            overlap_min = None
+            overlap_max = None
+            for channel, reference_scale, comparison_scale, row in channel_settings:
+                (
+                    energy,
+                    reference_flux,
+                    reference_uncertainty,
+                    comparison_flux,
+                    comparison_uncertainty,
+                    scaled_comparison_flux,
+                    scaled_comparison_uncertainty,
+                ) = native_flux_overlap_arrays(
+                    self.engine.previews[reference_name],
+                    self.engine.previews[comparison_name],
+                    channel,
+                    fit_window,
+                    reference_scale=reference_scale,
+                    comparison_scale=comparison_scale,
+                )
+                if len(energy) < 2:
+                    continue
+                overlap_min = float(np.min(energy)) if overlap_min is None else min(
+                    overlap_min, float(np.min(energy))
+                )
+                overlap_max = float(np.max(energy)) if overlap_max is None else max(
+                    overlap_max, float(np.max(energy))
+                )
+                reference_error = (
+                    dict(
+                        type="data",
+                        array=reference_uncertainty,
+                        visible=True,
+                        thickness=0.8,
+                        width=0,
+                    )
+                    if self.show_errors.value
+                    else None
+                )
+                raw_error = (
+                    dict(
+                        type="data",
+                        array=comparison_uncertainty,
+                        visible=True,
+                        thickness=0.6,
+                        width=0,
+                    )
+                    if self.show_errors.value
+                    else None
+                )
+                scaled_error = (
+                    dict(
+                        type="data",
+                        array=scaled_comparison_uncertainty,
+                        visible=True,
+                        thickness=0.8,
+                        width=0,
+                    )
+                    if self.show_errors.value
+                    else None
+                )
+                figure.add_trace(
+                    go.Scattergl(
+                        x=energy,
+                        y=reference_flux,
+                        mode="lines",
+                        line=dict(color=color_by_name[reference_name], width=2),
+                        error_y=reference_error,
+                        name=(
+                            f"{reference_name} {channel} x{reference_scale:.7g}"
+                        ),
+                        legendgroup=f"{channel}-reference",
+                    ),
+                    row=row,
+                    col=1,
+                )
+                figure.add_trace(
+                    go.Scattergl(
+                        x=energy,
+                        y=comparison_flux,
+                        mode="lines",
+                        line=dict(color="#777", width=1, dash="dot"),
+                        opacity=0.55,
+                        error_y=raw_error,
+                        name=f"{comparison_name} {channel} unscaled",
+                        legendgroup=f"{channel}-comparison-raw",
+                    ),
+                    row=row,
+                    col=1,
+                )
+                figure.add_trace(
+                    go.Scattergl(
+                        x=energy,
+                        y=scaled_comparison_flux,
+                        mode="lines",
+                        line=dict(color=color_by_name[comparison_name], width=2),
+                        error_y=scaled_error,
+                        name=(
+                            f"{comparison_name} {channel} x{comparison_scale:.7g}"
+                        ),
+                        legendgroup=f"{channel}-comparison-scaled",
+                    ),
+                    row=row,
+                    col=1,
+                )
+            figure.update_xaxes(type="log", title_text="Incident neutron energy (eV)", row=2, col=1)
+            figure.update_yaxes(type="log", title_text="counts / C", row=1, col=1)
+            figure.update_yaxes(type="log", title_text="counts / C", row=2, col=1)
+            figure.update_layout(
+                title=(
+                    f"Native-flux pair scaling: {comparison_name} onto {reference_name}"
+                    + (
+                        f"<br><sup>fit window={overlap_min * 1e3:.5g}-"
+                        f"{overlap_max * 1e3:.5g} meV</sup>"
+                        if overlap_min is not None and overlap_max is not None
+                        else ""
+                    )
+                ),
+                template="plotly_white",
+                height=720,
+                hovermode="closest",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                margin=dict(l=80, r=30, t=120, b=65),
+            )
+            figures.append(figure)
+        return figures
 
     def _frame_changed(self, change=None) -> None:
         if self.same_rois_all_frames.value and not self._syncing_frame_rois and change is not None:
@@ -2854,6 +3345,8 @@ class MultiFrameNormalizationTof:
             name: palette[index % len(palette)]
             for index, name in enumerate(self.engine.previews)
         }
+        hybrid_flux_figures: list[go.Figure] = []
+        hybrid_flux_error: Exception | None = None
         for name in selected_names:
             preview = scaled_previews[name]
             scale = scales[name]
@@ -2999,11 +3492,27 @@ class MultiFrameNormalizationTof:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
             margin=dict(l=70, r=30, t=100, b=60),
         )
+        try:
+            hybrid_flux_figures = self._hybrid_flux_scaling_figures(
+                selected_names,
+                color_by_name,
+            )
+        except Exception as error:
+            hybrid_flux_error = error
         with self.plot_output:
             clear_output(wait=True)
             transmission_figure.show()
             for ratio_figure in overlap_figures:
                 ratio_figure.show()
+            for flux_figure in hybrid_flux_figures:
+                flux_figure.show()
+            if hybrid_flux_error is not None:
+                display(
+                    HTML(
+                        "<span style='color:#b00020'>Hybrid native-flux plot "
+                        f"unavailable: {_escape(hybrid_flux_error)}</span>"
+                    )
+                )
 
     def _preview_output_spectra(self, _button=None) -> None:
         with self.output_spectra_plot_output:
@@ -3165,15 +3674,47 @@ class MultiFrameNormalizationTof:
             window.validate()
             return window.energy_min_eV, window.energy_max_eV
 
-        normalized_names = {
-            reference_name.strip().lower(),
-            comparison_name.strip().lower(),
-        }
-        is_resonance_0p3_pair = (
-            any("resonance" in name for name in normalized_names)
-            and any(name.startswith("0.3") for name in normalized_names)
-        )
-        return (0.0, 0.2) if is_resonance_0p3_pair else None
+        if self.engine is not None and self.engine.previews:
+            loaded_names = [
+                name
+                for name in self._selected_frame_names()
+                if name in self.engine.previews
+            ]
+            if loaded_names:
+                highest_energy_name = max(
+                    loaded_names,
+                    key=lambda name: self._maximum_usable_energy(
+                        self.engine.previews[name]
+                    ),
+                )
+                if highest_energy_name in {reference_name, comparison_name}:
+                    other_name = (
+                        comparison_name
+                        if reference_name == highest_energy_name
+                        else reference_name
+                    )
+                    highest_energy = np.asarray(
+                        self.engine.previews[highest_energy_name].energy_eV,
+                        dtype=np.float64,
+                    )
+                    other_energy = np.asarray(
+                        self.engine.previews[other_name].energy_eV,
+                        dtype=np.float64,
+                    )
+                    highest_valid = highest_energy[
+                        np.isfinite(highest_energy) & (highest_energy > 0)
+                    ]
+                    other_valid = other_energy[
+                        np.isfinite(other_energy) & (other_energy > 0)
+                    ]
+                    if (
+                        highest_valid.size
+                        and other_valid.size
+                        and np.min(highest_valid) <= 0.2 <= np.max(highest_valid)
+                        and np.min(other_valid) <= 0.2 <= np.max(other_valid)
+                    ):
+                        return (0.0, 0.2)
+        return None
 
     def _selected_frame_names(self) -> list[str]:
         selected = set(self.inspect_frames.value)
@@ -3212,10 +3753,13 @@ class MultiFrameNormalizationTof:
                 self.same_rois_all_frames.value = recipe.same_rois_all_frames
                 self.export_scaled_spectra.value = recipe.export_scaled_spectra
                 self.show_prompt_flash_lines.value = recipe.show_prompt_flash_lines
+                self.frame_scaling_mode.value = recipe.frame_scaling_mode
+                self.show_hybrid_flux_plots.value = recipe.show_hybrid_flux_plots
                 self._overlap_window_state_cache.clear()
                 self.overlap_window_widgets = {}
                 self._set_frames(recipe.frames)
                 self._restore_overlap_windows(recipe.overlap_windows)
+                self._restore_pair_scaling_methods(recipe.pair_scaling_methods)
                 self._updating_frame_scales = True
                 try:
                     for name, multiplier in recipe.frame_multipliers.items():
@@ -3224,6 +3768,12 @@ class MultiFrameNormalizationTof:
                             control.value = float(multiplier)
                 finally:
                     self._updating_frame_scales = False
+                self.frame_sample_flux_multipliers = dict(
+                    recipe.frame_sample_flux_multipliers
+                )
+                self.frame_ob_flux_multipliers = dict(
+                    recipe.frame_ob_flux_multipliers
+                )
                 self.engine = None
                 self.loaded_frame_configs = {}
                 with self.plot_output:
