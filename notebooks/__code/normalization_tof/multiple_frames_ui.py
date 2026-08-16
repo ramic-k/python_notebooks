@@ -2031,6 +2031,34 @@ class MultiFrameNormalizationTof:
         self.replot_button = widgets.Button(description="Rebin cached profiles", icon="refresh")
         self.save_button = widgets.Button(description="Save recipe", icon="save")
         self.load_button = widgets.Button(description="Load recipe", icon="folder-open")
+        self.confirm_recipe_overwrite_yes = widgets.Button(
+            description="Yes, overwrite",
+            icon="check",
+            button_style="danger",
+        )
+        self.confirm_recipe_overwrite_no = widgets.Button(
+            description="No, cancel",
+            icon="times",
+        )
+        self.recipe_overwrite_message = widgets.HTML()
+        self.recipe_overwrite_box = widgets.VBox(
+            [
+                self.recipe_overwrite_message,
+                widgets.HBox(
+                    [
+                        self.confirm_recipe_overwrite_yes,
+                        self.confirm_recipe_overwrite_no,
+                    ],
+                    layout=_wrapping_row_layout(),
+                ),
+            ],
+            layout=widgets.Layout(
+                display="none",
+                border="1px solid #c88700",
+                padding="8px",
+                margin="4px 0 0 0",
+            ),
+        )
         self.run_button = widgets.Button(description="Run full normalization", icon="play", button_style="warning")
         self.arm_full_run = widgets.Checkbox(value=False, description="Enable full run", indent=False)
         self.status_output = widgets.Output()
@@ -2042,6 +2070,7 @@ class MultiFrameNormalizationTof:
         self._syncing_frame_rois = False
         self._updating_frame_scales = False
         self._updating_overlap_windows = False
+        self._pending_recipe_overwrite: Path | None = None
 
         _show_full_descriptions(
             [
@@ -2078,6 +2107,7 @@ class MultiFrameNormalizationTof:
                 ),
                 self.path_browser_output,
                 widgets.HBox([self.save_button, self.load_button]),
+                self.recipe_overwrite_box,
             ]
         )
         overlap_controls = widgets.VBox(
@@ -2209,6 +2239,8 @@ class MultiFrameNormalizationTof:
         self.replot_button.on_click(self._replot)
         self.save_button.on_click(self._save_recipe)
         self.load_button.on_click(self._load_recipe)
+        self.confirm_recipe_overwrite_yes.on_click(self._confirm_recipe_overwrite)
+        self.confirm_recipe_overwrite_no.on_click(self._cancel_recipe_overwrite)
         self.output_root_browse.on_click(self._browse_output_root)
         self.cache_dir_browse.on_click(self._browse_cache_dir)
         self.recipe_file_browse.on_click(self._browse_recipe_file)
@@ -3655,16 +3687,94 @@ class MultiFrameNormalizationTof:
         if self.engine is not None and self.engine.previews:
             self._draw_plot()
 
-    def _save_recipe(self, _button) -> None:
+    def _recipe_target_path(self) -> Path:
+        value = self.recipe_file.value.strip()
+        if not value:
+            raise ValueError("Recipe JSON path is required.")
+        return Path(value).expanduser().absolute()
+
+    def _dismiss_recipe_overwrite_confirmation(self) -> None:
+        self._pending_recipe_overwrite = None
+        self.recipe_overwrite_message.value = ""
+        self.recipe_overwrite_box.layout.display = "none"
+
+    def _write_recipe(self, target: Path) -> None:
         with self.status_output:
             clear_output(wait=True)
             try:
-                output = self.recipe().save(self.recipe_file.value)
+                output = self.recipe().save(target)
                 display(HTML(f"Saved recipe: <code>{_escape(output)}</code>"))
             except Exception as error:
                 display(HTML(f"<span style='color:#b00020'>Save failed: {_escape(error)}</span>"))
+            finally:
+                self._dismiss_recipe_overwrite_confirmation()
+
+    def _save_recipe(self, _button) -> None:
+        try:
+            target = self._recipe_target_path()
+        except Exception as error:
+            with self.status_output:
+                clear_output(wait=True)
+                display(HTML(f"<span style='color:#b00020'>Save failed: {_escape(error)}</span>"))
+            return
+
+        if not target.exists():
+            self._write_recipe(target)
+            return
+
+        self._pending_recipe_overwrite = target
+        self.recipe_overwrite_message.value = (
+            "<b>Overwrite existing recipe?</b><br>"
+            f"The file <code>{_escape(target)}</code> already exists. "
+            "Choose <b>Yes, overwrite</b> to replace it or <b>No, cancel</b> "
+            "to leave it unchanged."
+        )
+        self.recipe_overwrite_box.layout.display = "flex"
+        with self.status_output:
+            clear_output(wait=True)
+
+    def _confirm_recipe_overwrite(self, _button) -> None:
+        target = self._pending_recipe_overwrite
+        if target is None:
+            self._dismiss_recipe_overwrite_confirmation()
+            return
+        try:
+            current_target = self._recipe_target_path()
+        except Exception as error:
+            self._dismiss_recipe_overwrite_confirmation()
+            with self.status_output:
+                clear_output(wait=True)
+                display(HTML(f"<span style='color:#b00020'>Save failed: {_escape(error)}</span>"))
+            return
+        if current_target != target:
+            self._dismiss_recipe_overwrite_confirmation()
+            with self.status_output:
+                clear_output(wait=True)
+                display(
+                    HTML(
+                        "<span style='color:#b00020'>Recipe path changed after the overwrite "
+                        "confirmation opened. Press <b>Save recipe</b> again to confirm the "
+                        "current path.</span>"
+                    )
+                )
+            return
+        self._write_recipe(target)
+
+    def _cancel_recipe_overwrite(self, _button) -> None:
+        target = self._pending_recipe_overwrite
+        self._dismiss_recipe_overwrite_confirmation()
+        with self.status_output:
+            clear_output(wait=True)
+            if target is not None:
+                display(
+                    HTML(
+                        "Recipe save cancelled; existing file was not changed: "
+                        f"<code>{_escape(target)}</code>"
+                    )
+                )
 
     def _load_recipe(self, _button) -> None:
+        self._dismiss_recipe_overwrite_confirmation()
         with self.status_output:
             clear_output(wait=True)
             try:

@@ -2034,6 +2034,84 @@ def test_ui_header_path_browsers_select_directories_and_recipe(tmp_path, monkeyp
     assert ui.recipe_file.value == str(recipe)
 
 
+def test_ui_save_recipe_writes_new_file_without_confirmation(tmp_path):
+    target = tmp_path / "new_recipe.json"
+    ui = MultiFrameNormalizationTof(str(tmp_path))
+    ui.recipe_file.value = str(target)
+
+    ui._save_recipe(None)
+
+    assert target.exists()
+    assert json.loads(target.read_text(encoding="utf-8"))["working_dir"] == str(tmp_path)
+    assert ui._pending_recipe_overwrite is None
+    assert ui.recipe_overwrite_box.layout.display == "none"
+
+
+def test_ui_save_recipe_requires_confirmation_before_overwrite(tmp_path):
+    target = tmp_path / "existing_recipe.json"
+    target.write_text("do not replace yet", encoding="utf-8")
+    ui = MultiFrameNormalizationTof(str(tmp_path))
+    ui.recipe_file.value = str(target)
+
+    ui._save_recipe(None)
+
+    assert target.read_text(encoding="utf-8") == "do not replace yet"
+    assert ui._pending_recipe_overwrite == target.absolute()
+    assert ui.recipe_overwrite_box.layout.display == "flex"
+    assert str(target.absolute()) in ui.recipe_overwrite_message.value
+
+    ui._confirm_recipe_overwrite(None)
+
+    assert json.loads(target.read_text(encoding="utf-8"))["working_dir"] == str(tmp_path)
+    assert ui._pending_recipe_overwrite is None
+    assert ui.recipe_overwrite_box.layout.display == "none"
+
+
+def test_ui_save_recipe_cancel_preserves_existing_file(tmp_path):
+    target = tmp_path / "existing_recipe.json"
+    target.write_text("keep this recipe", encoding="utf-8")
+    ui = MultiFrameNormalizationTof(str(tmp_path))
+    ui.recipe_file.value = str(target)
+
+    ui._save_recipe(None)
+    ui._cancel_recipe_overwrite(None)
+
+    assert target.read_text(encoding="utf-8") == "keep this recipe"
+    assert ui._pending_recipe_overwrite is None
+    assert ui.recipe_overwrite_box.layout.display == "none"
+
+
+def test_ui_save_recipe_rejects_confirmation_after_path_changes(tmp_path):
+    original = tmp_path / "original_recipe.json"
+    replacement = tmp_path / "replacement_recipe.json"
+    original.write_text("keep original", encoding="utf-8")
+    ui = MultiFrameNormalizationTof(str(tmp_path))
+    ui.recipe_file.value = str(original)
+
+    ui._save_recipe(None)
+    ui.recipe_file.value = str(replacement)
+    ui._confirm_recipe_overwrite(None)
+
+    assert original.read_text(encoding="utf-8") == "keep original"
+    assert not replacement.exists()
+    assert ui._pending_recipe_overwrite is None
+    assert ui.recipe_overwrite_box.layout.display == "none"
+
+
+def test_ui_load_recipe_does_not_require_overwrite_confirmation(tmp_path):
+    source = MultiFrameNormalizationTof(str(tmp_path))
+    recipe_path = source.recipe().save(tmp_path / "recipe.json")
+    ui = MultiFrameNormalizationTof(str(tmp_path))
+    ui.recipe_file.value = str(recipe_path)
+    ui._pending_recipe_overwrite = recipe_path.absolute()
+    ui.recipe_overwrite_box.layout.display = "flex"
+
+    ui._load_recipe(None)
+
+    assert ui._pending_recipe_overwrite is None
+    assert ui.recipe_overwrite_box.layout.display == "none"
+
+
 def test_overlap_diagnostic_reports_scale_without_applying_it():
     reference = _preview("reference", [1, 2, 3, 4], [0.5, 0.6, 0.7, 0.8], [0.01] * 4)
     comparison = _preview("comparison", [1.5, 2.5, 3.5], [0.605, 0.715, 0.825], [0.01] * 3)
