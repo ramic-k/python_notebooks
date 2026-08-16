@@ -1697,7 +1697,9 @@ def test_hybrid_auto_scale_uses_transmission_then_native_flux_and_draws_flux_plo
         "low": _flux_preview("low", energy, [20.0] * 4, [25.0] * 4),
     }
     monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
-    ui.frame_scaling_mode.value = FRAME_SCALING_HYBRID_NATIVE_FLUX
+    pair_controls = list(ui.overlap_window_widgets.values())
+    for controls in pair_controls[:-1]:
+        controls["scaling_method"].value = PAIR_SCALING_NATIVE_FLUX
     ui.engine = SimpleNamespace(previews=previews)
     for controls in ui.overlap_window_widgets.values():
         controls["auto"].value = False
@@ -1734,11 +1736,13 @@ def test_hybrid_auto_scale_uses_transmission_then_native_flux_and_draws_flux_plo
     monkeypatch.setattr(go.Figure, "show", lambda figure: captured.append(figure))
     ui._draw_plot()
 
-    assert len(captured) == 6
-    flux_figures = captured[-2:]
-    assert all("Native-flux pair scaling" in figure.layout.title.text for figure in flux_figures)
-    assert all(len(figure.data) == 6 for figure in flux_figures)
-    assert all(figure.layout.yaxis.type == "log" for figure in flux_figures)
+    assert len(captured) == 5
+    flux_figure = captured[1]
+    assert "Selected frame native sample/open-beam flux" in flux_figure.layout.title.text
+    assert len(flux_figure.data) == 8
+    assert len(flux_figure.layout.shapes) == 4
+    assert flux_figure.layout.yaxis.type == "log"
+    assert flux_figure.layout.yaxis2.type == "log"
 
 
 def test_hybrid_auto_scale_requires_proton_charge_normalization(monkeypatch):
@@ -1749,7 +1753,9 @@ def test_hybrid_auto_scale_requires_proton_charge_normalization(monkeypatch):
     ]
     ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914", frames=frames)
     monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
-    ui.frame_scaling_mode.value = FRAME_SCALING_HYBRID_NATIVE_FLUX
+    ui.overlap_window_widgets[
+        ui._overlap_pair_key("low", "middle")
+    ]["scaling_method"].value = PAIR_SCALING_NATIVE_FLUX
     ui.engine = SimpleNamespace(
         previews={
             "low": _flux_preview("low", [1, 2, 3], [1, 1, 1], [2, 2, 2]),
@@ -1816,11 +1822,13 @@ def test_pair_scaling_selectors_support_mixed_methods_without_named_resonance(
     assert "next x2 from native fluxes" in ui.frame_scale_status.value
     assert "middle x2 from transmission" in ui.frame_scale_status.value
     assert "low x1 from native fluxes" in ui.frame_scale_status.value
-    figures = ui._hybrid_flux_scaling_figures(
+    figure = ui._combined_native_flux_scaling_figure(
         names,
         {name: "#123456" for name in names},
     )
-    assert len(figures) == 2
+    assert figure is not None
+    assert len(figure.data) == 8
+    assert len(figure.layout.shapes) == 4
 
 
 def test_hybrid_two_frame_case_remains_transmission_only(monkeypatch):
@@ -1830,7 +1838,6 @@ def test_hybrid_two_frame_case_remains_transmission_only(monkeypatch):
     ]
     ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914", frames=frames)
     monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
-    ui.frame_scaling_mode.value = FRAME_SCALING_HYBRID_NATIVE_FLUX
     ui.engine = SimpleNamespace(
         previews={
             "low": _flux_preview("low", [1, 2, 3], [1, 1, 1], [2, 2, 2]),
@@ -1844,13 +1851,12 @@ def test_hybrid_two_frame_case_remains_transmission_only(monkeypatch):
     np.testing.assert_allclose(ui.frame_scale_widgets["low"].value, 2.0)
     assert "low x2 from transmission" in ui.frame_scale_status.value
     assert "requires proton-charge normalization" not in ui.frame_scale_status.value
-    assert ui._hybrid_flux_scaling_figures(["low", "high"], {}) == []
+    assert ui._combined_native_flux_scaling_figure(["low", "high"], {}) is None
 
 
 def test_ui_recipe_captures_scaled_spectrum_export_settings():
     ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
     ui.export_scaled_spectra.value = True
-    ui.frame_scaling_mode.value = FRAME_SCALING_HYBRID_NATIVE_FLUX
     ui.show_hybrid_flux_plots.value = False
     ui.frame_editors[0].output_energy_min.value = 0.0012
     ui.frame_editors[0].output_energy_max.value = 0.0021
@@ -1902,7 +1908,6 @@ def test_ui_recipe_captures_scaled_spectrum_export_settings():
 def test_ui_load_recipe_restores_frame_multipliers(tmp_path):
     ui = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
     ui.export_scaled_spectra.value = True
-    ui.frame_scaling_mode.value = FRAME_SCALING_HYBRID_NATIVE_FLUX
     ui.show_hybrid_flux_plots.value = False
     ui.frame_scale_widgets["6.3 A"].value = 1.06
     ui.frame_scale_widgets["4.5 A"].value = 1.01
@@ -1928,7 +1933,7 @@ def test_ui_load_recipe_restores_frame_multipliers(tmp_path):
     restored._load_recipe(None)
 
     assert restored.export_scaled_spectra.value is True
-    assert restored.frame_scaling_mode.value == FRAME_SCALING_HYBRID_NATIVE_FLUX
+    assert restored._legacy_frame_scaling_mode() == FRAME_SCALING_HYBRID_NATIVE_FLUX
     assert restored.frame_sample_flux_multipliers == {
         "0.3 A": 1.02,
         "resonance": 0.98,
@@ -1955,6 +1960,28 @@ def test_ui_load_recipe_restores_frame_multipliers(tmp_path):
     assert restored_pair["minimum"].value == 0.11
     assert restored_pair["maximum"].value == 0.19
     assert restored_pair["scaling_method"].value == PAIR_SCALING_NATIVE_FLUX
+
+
+def test_ui_load_migrates_legacy_hybrid_preset_to_pair_methods(tmp_path):
+    recipe = MultiFrameRecipe(
+        working_dir="/SNS/VENUS/IPTS-36914",
+        frames=[
+            _empty_frame("low", DetectorType.tpx1),
+            _empty_frame("middle", DetectorType.tpx1),
+            _empty_frame("high", DetectorType.tpx3),
+        ],
+        frame_scaling_mode=FRAME_SCALING_HYBRID_NATIVE_FLUX,
+        pair_scaling_methods=(),
+    )
+    recipe_path = recipe.save(tmp_path / "legacy_hybrid_recipe.json")
+
+    restored = MultiFrameNormalizationTof("/SNS/VENUS/IPTS-36914")
+    restored.recipe_file.value = str(recipe_path)
+    restored._load_recipe(None)
+
+    assert not hasattr(restored, "frame_scaling_mode")
+    assert restored._pair_scaling_method("low", "middle") == PAIR_SCALING_NATIVE_FLUX
+    assert restored._pair_scaling_method("middle", "high") == PAIR_SCALING_TRANSMISSION
 
 
 def test_ui_header_path_browsers_select_directories_and_recipe(tmp_path, monkeypatch):
@@ -2077,6 +2104,46 @@ def test_native_flux_overlap_fits_sample_and_ob_before_taking_scale_ratio():
     np.testing.assert_allclose(reference_flux, [150.0, 250.0, 350.0])
     np.testing.assert_allclose(raw_comparison, [75.0, 125.0, 175.0])
     np.testing.assert_allclose(scaled_comparison, reference_flux)
+
+
+def test_native_flux_overlap_uses_robust_equal_native_bin_center():
+    energy = [1.0, 2.0, 3.0, 4.0, 5.0]
+    reference = _flux_preview(
+        "reference",
+        energy,
+        [100.0] * 5,
+        [100.0] * 5,
+        variance=1.0,
+    )
+    comparison = _flux_preview(
+        "comparison",
+        energy,
+        [200.0, 200.0, 200.0, 200.0, 2000.0],
+        [100.0] * 5,
+        variance=1.0,
+    )
+
+    result = calculate_native_flux_overlap_diagnostics(reference, comparison)
+
+    # The high-count final point is a frame-shape outlier. A Poisson-weighted
+    # fit would let it dominate; the equal-native-bin median recovers the central
+    # multiplicative mismatch across the overlap.
+    np.testing.assert_allclose(
+        result.sample.scale_comparison_to_reference,
+        0.5,
+        rtol=1e-12,
+    )
+    np.testing.assert_allclose(
+        result.ob.scale_comparison_to_reference,
+        1.0,
+        rtol=1e-12,
+    )
+    np.testing.assert_allclose(
+        result.transmission_scale_comparison_to_reference,
+        0.5,
+        rtol=1e-12,
+    )
+    assert result.sample.reduced_chi_square > 1.0
 
 
 def test_full_normalization_uses_separate_campaign_folders_and_snapshot(tmp_path, monkeypatch):

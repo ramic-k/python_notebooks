@@ -2726,24 +2726,39 @@ def _fit_native_flux_channel(
             f"Native {channel} flux overlap needs at least two positive finite points."
         )
 
+    # Frame-to-frame flux shapes are not expected to agree to counting
+    # statistics across an entire overlap. Center the multiplicative mismatch
+    # with an equal-native-bin robust estimator so the highest-count bins do not
+    # dominate the sample and OB fits differently. The propagated variances are
+    # retained for the uncertainty floor and reduced-chi-square diagnostic.
     log_ratio = np.log(comparison_flux) - np.log(reference_flux)
     log_ratio_variance = (
         comparison_variance / comparison_flux**2
         + reference_variance / reference_flux**2
     )
+    mean_log_ratio = float(np.median(log_ratio))
+    median_absolute_deviation = float(
+        np.median(np.abs(log_ratio - mean_log_ratio))
+    )
+    robust_standard_error = (
+        1.4826 * median_absolute_deviation / np.sqrt(len(log_ratio))
+    )
     weighted = np.isfinite(log_ratio_variance) & (log_ratio_variance > 0)
     if np.sum(weighted) >= 2:
-        energy = energy[weighted]
-        log_ratio = log_ratio[weighted]
         weights = 1.0 / log_ratio_variance[weighted]
-        mean_log_ratio = float(np.sum(weights * log_ratio) / np.sum(weights))
-        log_ratio_uncertainty = float(np.sqrt(1.0 / np.sum(weights)))
-        chi_square = float(np.sum(weights * (log_ratio - mean_log_ratio) ** 2))
-        reduced_chi_square = chi_square / max(len(log_ratio) - 1, 1)
+        counting_standard_error = float(np.sqrt(1.0 / np.sum(weights)))
+        log_ratio_uncertainty = max(
+            robust_standard_error,
+            counting_standard_error,
+        )
+        chi_square = float(
+            np.sum(weights * (log_ratio[weighted] - mean_log_ratio) ** 2)
+        )
+        reduced_chi_square = chi_square / max(int(np.sum(weighted)) - 1, 1)
     else:
-        mean_log_ratio = float(np.mean(log_ratio))
-        log_ratio_uncertainty = float(
-            np.std(log_ratio, ddof=1) / np.sqrt(len(log_ratio))
+        log_ratio_uncertainty = max(
+            robust_standard_error,
+            float(np.std(log_ratio, ddof=1) / np.sqrt(len(log_ratio))),
         )
         reduced_chi_square = float("nan")
 
