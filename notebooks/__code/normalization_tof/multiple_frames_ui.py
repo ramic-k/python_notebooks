@@ -2805,11 +2805,6 @@ class MultiFrameNormalizationTof:
                     comparison_name,
                     manual_window=None,
                 )
-                transmission_diagnostics = calculate_overlap_diagnostics(
-                    reference,
-                    comparison,
-                    fit_window,
-                )
                 pair_method = self._pair_scaling_method(
                     reference_name,
                     comparison_name,
@@ -2831,6 +2826,22 @@ class MultiFrameNormalizationTof:
                     scale = float(
                         flux_diagnostics.transmission_scale_comparison_to_reference
                     )
+                    try:
+                        transmission_diagnostics = calculate_overlap_diagnostics(
+                            reference,
+                            comparison,
+                            fit_window,
+                        )
+                        transmission_comparison = (
+                            "direct-transmission comparison x"
+                            f"{transmission_diagnostics.scale_comparison_to_reference:.7g} "
+                            f"(chi2r={transmission_diagnostics.reduced_chi_square:.3g})"
+                        )
+                    except ValueError:
+                        transmission_comparison = (
+                            "direct-transmission comparison unavailable on the "
+                            "rebinned grid"
+                        )
                     result_lines.append(
                         f"{comparison_name} x{scale:.7g} from native fluxes: "
                         f"sample x{sample_flux_scales[comparison_name]:.7g} "
@@ -2839,11 +2850,14 @@ class MultiFrameNormalizationTof:
                         f"OB x{ob_flux_scales[comparison_name]:.7g} "
                         f"({flux_diagnostics.ob.point_count} overlap points, chi2r="
                         f"{flux_diagnostics.ob.reduced_chi_square:.3g}); "
-                        f"direct-transmission comparison x"
-                        f"{transmission_diagnostics.scale_comparison_to_reference:.7g} "
-                        f"(chi2r={transmission_diagnostics.reduced_chi_square:.3g})"
+                        f"{transmission_comparison}"
                     )
                 else:
+                    transmission_diagnostics = calculate_overlap_diagnostics(
+                        reference,
+                        comparison,
+                        fit_window,
+                    )
                     scale = float(
                         transmission_diagnostics.scale_comparison_to_reference
                     )

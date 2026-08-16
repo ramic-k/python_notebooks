@@ -1745,6 +1745,66 @@ def test_hybrid_auto_scale_uses_transmission_then_native_flux_and_draws_flux_plo
     assert flux_figure.layout.yaxis2.type == "log"
 
 
+def test_native_flux_auto_scale_uses_native_window_when_rebinned_window_is_empty(
+    monkeypatch,
+):
+    names = ["low", "high"]
+    ui = MultiFrameNormalizationTof(
+        "/SNS/VENUS/IPTS-36914",
+        frames=[_empty_frame(name, DetectorType.tpx1) for name in names],
+    )
+    native_energy = [0.02, 0.024, 0.028, 0.032]
+    high = _flux_preview("high", native_energy, [80.0] * 4, [100.0] * 4)
+    low = _flux_preview("low", native_energy, [40.0] * 4, [100.0] * 4)
+
+    # The manual fit window contains several native bins but no output-bin
+    # centers. Native-flux scaling must not depend on rebinned coverage.
+    high = replace(
+        high,
+        tof_s=np.asarray([0.0, 1.0]),
+        lambda_a=np.ones(2),
+        energy_eV=np.asarray([0.015, 1.0]),
+        sample_counts=np.asarray([80.0, 80.0]),
+        sample_variance=np.ones(2),
+        ob_counts=np.asarray([100.0, 100.0]),
+        ob_variance=np.ones(2),
+        transmission=np.asarray([0.8, 0.8]),
+        uncertainty=np.asarray([0.01, 0.01]),
+        source_frame_count=np.ones(2, dtype=int),
+    )
+    low = replace(
+        low,
+        tof_s=np.asarray([0.0, 1.0]),
+        lambda_a=np.ones(2),
+        energy_eV=np.asarray([0.01, 0.5]),
+        sample_counts=np.asarray([40.0, 40.0]),
+        sample_variance=np.ones(2),
+        ob_counts=np.asarray([100.0, 100.0]),
+        ob_variance=np.ones(2),
+        transmission=np.asarray([0.4, 0.4]),
+        uncertainty=np.asarray([0.01, 0.01]),
+        source_frame_count=np.ones(2, dtype=int),
+    )
+    ui.engine = SimpleNamespace(previews={"low": low, "high": high})
+    controls = ui.overlap_window_widgets[
+        ui._overlap_pair_key("low", "high")
+    ]
+    controls["auto"].value = False
+    controls["minimum"].value = 0.021
+    controls["maximum"].value = 0.03
+    controls["scaling_method"].value = PAIR_SCALING_NATIVE_FLUX
+    monkeypatch.setattr(go.Figure, "show", lambda _figure: None)
+
+    ui._auto_scale_from_highest_energy()
+
+    np.testing.assert_allclose(ui.frame_scale_widgets["high"].value, 1.0)
+    np.testing.assert_allclose(ui.frame_scale_widgets["low"].value, 2.0)
+    assert "low x2 from native fluxes" in ui.frame_scale_status.value
+    assert "direct-transmission comparison unavailable on the rebinned grid" in (
+        ui.frame_scale_status.value
+    )
+
+
 def test_hybrid_auto_scale_requires_proton_charge_normalization(monkeypatch):
     frames = [
         replace(_empty_frame("low", DetectorType.tpx1), use_proton_charge=False),
